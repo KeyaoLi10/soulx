@@ -14,9 +14,10 @@ infer_config:
   seed: 42
   device: cuda
   precision: bf16
-  max_wait_num: 8
+  # benchmark config from the README: max_wait_num 5, far_field_threshold 0
+  max_wait_num: 5
   max_mistake_num: 3
-  far_field_threshold: 0.02
+  far_field_threshold: 0
   developer_mode: false
 
   input:

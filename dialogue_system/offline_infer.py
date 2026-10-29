@@ -88,6 +88,7 @@ class OfflineDuplexSimulator:
         llm_api,
         tts_api,
         config,
+        response_tail: float = 0.0,
     ):
         self.vad = vad_api
         self.llm = llm_api
@@ -95,6 +96,9 @@ class OfflineDuplexSimulator:
         self.sample_rate = config.infer_config.input.sample_rate
         self.chunk_size = config.infer_config.input.chunk_size
         self.chunk_duration = self.chunk_size / self.sample_rate
+        # seconds of trailing silence appended after the input so the
+        # assistant's response past the input end is kept in the renders
+        self.response_tail = response_tail
         self.lock = threading.Lock()
         self._resamplers = {}
         self.developer_mode = bool(
@@ -150,6 +154,19 @@ class OfflineDuplexSimulator:
         self.time_info = []  # Reset for this file
         result = self._process_file(wav_path)
         self._wait_for_generators()
+
+        if self.response_tail > 0.0 and self.user_audio_with_padding is not None:
+            # the input is a complete user turn, so the assistant's reply
+            # mostly streams past the input end — extend with silence to
+            # keep it in output.wav / dialogue.wav (opt-in: --response_tail)
+            target = self.assistant_end_sample + int(
+                self.response_tail * self.sample_rate
+            )
+            if target > len(self.user_audio_with_padding):
+                self.user_audio_with_padding = np.pad(
+                    self.user_audio_with_padding,
+                    (0, target - len(self.user_audio_with_padding)),
+                )
 
         assistant_wave = self._render_assistant_wave()
         assistant_wave = np.clip(assistant_wave, -1.0, 1.0)
@@ -635,6 +652,14 @@ def parse_args():
         "--streaming_tts", action="store_true", help="Enable streaming TTS"
     )
 
+    parser.add_argument(
+        "--response_tail",
+        type=float,
+        default=0.0,
+        help="Append this many seconds of trailing silence (after the last "
+        "assistant sample) so responses past the input end are kept",
+    )
+
     return parser.parse_args()
 
 
@@ -670,7 +695,11 @@ def main():
         tts_api = None
 
     simulator = OfflineDuplexSimulator(
-        vad_api=vad_api, llm_api=llm_api, tts_api=tts_api, config=config
+        vad_api=vad_api,
+        llm_api=llm_api,
+        tts_api=tts_api,
+        config=config,
+        response_tail=args.response_tail,
     )
 
     for wav_path in wav_files:

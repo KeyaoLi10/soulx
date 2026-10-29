@@ -106,7 +106,7 @@ conda activate dialogue-system
 bash deploy.sh
 ```
 
-Visit `http://localhost:55556` to chat with the full-duplex spoken dialogue system.
+Visit `http://localhost:8090` to chat with the full-duplex spoken dialogue system.
 
 You can also replace the LLM+TTS component with any other half-duplex spoken dialogue model according to your needs.
 

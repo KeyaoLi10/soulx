@@ -66,18 +66,37 @@ class TurnTaking:
             print(f"[VadClient] transcription callback failed: {exc}")
 
     def connect(self):
-        self.ws = websocket.create_connection(self.server_url)
+        # Hard timeout: without it a stuck turn server blocks the web app's
+        # event loop forever inside create_connection.
+        self.ws = websocket.create_connection(self.server_url, timeout=5.0)
         self.ws.settimeout(self.timeout)
 
     def reset(self, client_id=None):
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+            except Exception:
+                pass
         self.client_id = client_id or uuid.uuid4().hex
-        self.connect()
+        self.ws = None
+        try:
+            self.connect()
+        except Exception as exc:
+            # Leave ws=None: process() reconnects lazily on first use, so
+            # this instance can still return to the pool instead of leaking.
+            print(
+                f"[VadClient] reset reconnect failed ({type(exc).__name__}: {exc}); "
+                f"will retry on next process()",
+                flush=True,
+            )
 
     def process(self, audio_chunk: np.ndarray):
         if audio_chunk is None:
             return None
+        t0 = time.time()
+        if self.ws is None:
+            # First use after pool init, or a reset whose reconnect failed
+            self.connect()
         payload = {
             "type": "audio",
             "session_id": self.client_id,
@@ -88,13 +107,25 @@ class TurnTaking:
         try:
             self.ws.send(json.dumps(payload))
             response = self.ws.recv()
-            # print(response)
             data = json.loads(response)
-        except:
+        except Exception as exc:
+            # Never swallow the reason silently: log it, it is the key
+            # diagnostic when the turn pipeline degrades.
+            print(
+                f"[VadClient] recv/send failed after {time.time()-t0:.2f}s "
+                f"({type(exc).__name__}: {exc}); reconnecting and resending",
+                flush=True,
+            )
             self.connect()
             self.ws.send(json.dumps(payload))
             response = self.ws.recv()
             data = json.loads(response)
+        if time.time() - t0 > 0.5:
+            print(
+                f"[VadClient] slow process(): {time.time()-t0:.2f}s "
+                f"(session {self.client_id[:8]})",
+                flush=True,
+            )
 
         assert isinstance(data, dict), ValueError(
             f"Unexpected response type: {type(data)}"

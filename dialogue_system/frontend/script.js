@@ -1,12 +1,22 @@
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const voiceCircle = document.getElementById('voiceCircle');
+const orbWrap = document.getElementById('orbWrap');
 const circleStatusEl = document.getElementById('circleStatus');
 const waveformCanvas = document.getElementById('waveformCanvas');
 const ctx = waveformCanvas.getContext('2d');
+const sessionTimerEl = document.getElementById('sessionTimer');
 
-waveformCanvas.width = waveformCanvas.clientWidth;
-waveformCanvas.height = 100;
+// Canvas backing store follows the CSS box (device-pixel aware); the layout
+// is now full-width, so a resize must re-fit instead of measuring once.
+function fitCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const rect = waveformCanvas.getBoundingClientRect();
+  waveformCanvas.width = Math.max(1, Math.round(rect.width * dpr));
+  waveformCanvas.height = Math.max(1, Math.round(rect.height * dpr));
+}
+fitCanvas();
+window.addEventListener('resize', fitCanvas);
 
 let audioContext, analyser, dataArray, source, stream, processor;
 let animationId = null;
@@ -21,28 +31,144 @@ let ttsStates = null; // Int32Array [writeIndex, readIndex]
 // Buffer size: capacity for ~120 seconds at 24k
 const TTS_BUFFER_SIZE = 24000 * 120;
 
-// ==================== Native WebSocket ====================
+// ==================== Session timer ====================
+let sessionStart = null;
+let timerId = null;
+
+function fmtDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function startTimer() {
+  sessionStart = Date.now();
+  sessionTimerEl.textContent = '00:00';
+  timerId = setInterval(() => {
+    sessionTimerEl.textContent = fmtDuration(Date.now() - sessionStart);
+  }, 1000);
+}
+
+function stopTimer() {
+  if (timerId) { clearInterval(timerId); timerId = null; }
+  sessionStart = null;
+  sessionTimerEl.textContent = '00:00';
+}
+
+// ==================== Native WebSocket (with auto-reconnect) ====================
 // Determine protocol (ws or wss)
 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${protocol}//${window.location.host}/ws`;
 
-let socket = new WebSocket(wsUrl);
-socket.binaryType = 'arraybuffer'; // Important for receiving audio
+// Reconnect policy: exponential backoff, capped at 5s. A dead socket must
+// never leave the page silent: every feature (transcription, VAD status,
+// TTS audio) rides on this one connection.
+const HEARTBEAT_INTERVAL_MS = 8000;  // app-level ping cadence
+const HEARTBEAT_STALE_MS = 25000;    // no server traffic for this long => force reconnect
 
-socket.onopen = () => {
-  console.log('[WebSocket] connected');
-};
+let socket = null;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let heartbeatTimer = null;
+let lastServerMsgTime = Date.now();
+let loadingConfirmedOnce = false;
 
-socket.onclose = () => {
-  console.log('[WebSocket] disconnected');
-};
+function setConnState(state, label) {
+  const pill = document.getElementById('connPill');
+  const dot = document.getElementById('brandDot');
+  if (pill) { pill.dataset.state = state; pill.textContent = label; }
+  if (dot) { dot.dataset.state = state; }
+}
 
-socket.onerror = (error) => {
-  console.error('[WebSocket] error:', error);
-};
+function connectSocket() {
+  setConnState('connecting', 'Connecting…');
+  socket = new WebSocket(wsUrl);
+  socket.binaryType = 'arraybuffer'; // Important for receiving audio
+
+  socket.onopen = () => {
+    console.log('[WebSocket] connected');
+    reconnectAttempts = 0;
+    lastServerMsgTime = Date.now();
+    hideConnBanner();
+    setConnState('online', 'Connected');
+    startHeartbeat();
+    // Session state lives on the server per-connection: re-announce the
+    // audio format and drop stale TTS playback from the previous session.
+    if (listening && audioContext) {
+      socket.send(JSON.stringify({
+        event: 'config_audio',
+        data: { sample_rate: audioContext.sampleRate }
+      }));
+    }
+    if (ttsNode) ttsNode.port.postMessage({ type: 'abort' });
+    // A reconnect means a brand-new server session: settings (persona, TTS
+    // params...) were reset server-side. Re-apply whatever the UI holds.
+    sendCurrentSettings();
+  };
+
+  socket.onclose = () => {
+    console.log('[WebSocket] disconnected');
+    stopHeartbeat();
+    setConnState('offline', 'Reconnecting…');
+    scheduleReconnect();
+  };
+
+  socket.onerror = (error) => {
+    // onclose always follows; reconnection is handled there
+    console.error('[WebSocket] error:', error);
+  };
+
+  socket.onmessage = onSocketMessage;
+}
+
+function scheduleReconnect() {
+  showConnBanner();
+  if (reconnectTimer) return;
+  const delay = Math.min(5000, 500 * Math.pow(2, reconnectAttempts++));
+  console.log(`[WebSocket] reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectSocket();
+  }, delay);
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ event: 'ping' }));
+    }
+    if (Date.now() - lastServerMsgTime > HEARTBEAT_STALE_MS) {
+      // Half-dead TCP: send() succeeds but nothing ever comes back, and the
+      // browser keeps readyState OPEN. Force-close so onclose can reconnect.
+      console.warn('[WebSocket] no server traffic for ' +
+        (HEARTBEAT_STALE_MS / 1000) + 's, forcing reconnect');
+      try { socket.close(); } catch (e) { /* already closing */ }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+
+function showConnBanner() {
+  const el = document.getElementById('connBanner');
+  if (el) el.classList.remove('hidden');
+}
+
+function hideConnBanner() {
+  const el = document.getElementById('connBanner');
+  if (el) el.classList.add('hidden');
+}
+
+connectSocket();
 
 // Handle incoming messages
-socket.onmessage = (event) => {
+function onSocketMessage(event) {
+  // Any traffic proves the connection is alive (see heartbeat)
+  lastServerMsgTime = Date.now();
+
   const data = event.data;
 
   // Check if data is binary (Audio Chunk)
@@ -61,8 +187,20 @@ socket.onmessage = (event) => {
       case 'connect_ack':
         console.log('Connection confirmed:', payload);
         break;
+      case 'pong':
+        // heartbeat reply; liveness already recorded above
+        break;
       case 'text_response':
         console.log('[LLM]', payload.text);
+        appendAssistantText(payload.text);
+        break;
+      case 'turn_start':
+        // Server starts a new reply pipeline: open a fresh assistant bubble
+        startAssistantMessage();
+        break;
+      case 'config_applied':
+        flashSavedFlag();
+        console.log('[Config] applied:', payload);
         break;
       case 'vad_loading':
         handleVadLoading(payload);
@@ -92,6 +230,12 @@ socket.onmessage = (event) => {
         if (ttsNode) ttsNode.port.postMessage({ type: 'resume' });
         updateCircleState('SPEAKING');
         break;
+      case 'pvad_status':
+        handlePvadStatus(payload);
+        break;
+      case 'pvad_reject':
+        handlePvadReject(payload);
+        break;
       default:
         console.log('Unknown event:', eventName);
     }
@@ -103,7 +247,6 @@ socket.onmessage = (event) => {
 
 // DOM elements
 const vadStatusEl = document.getElementById("vadStatus");
-const userTranscriptionEl = document.getElementById("userTranscription");
 
 // Loading Overlay Elements
 const loadingOverlay = document.getElementById("loadingOverlay");
@@ -113,6 +256,15 @@ const loadingSpinner = document.querySelector(".loading-spinner");
 const loadingSuccess = document.querySelector(".loading-success");
 
 function handleVadLoading({ state, message }) {
+  // After the first confirmed session, reconnects must be transparent:
+  // the server re-emits vad_loading for the new session, but making the
+  // user click "Start Experience" again mid-conversation would look
+  // exactly like the "page went dead" bug this fixes.
+  if (loadingConfirmedOnce) {
+    loadingOverlay.classList.add("hidden");
+    return;
+  }
+
   loadingOverlay.classList.remove("hidden");
   loadingMessage.textContent = message;
 
@@ -129,6 +281,7 @@ function handleVadLoading({ state, message }) {
 
 // Close loading overlay
 loadingConfirmBtn.addEventListener("click", async () => {
+  loadingConfirmedOnce = true;
   loadingOverlay.classList.add("hidden");
   updateCircleState("READY");
 
@@ -138,28 +291,76 @@ loadingConfirmBtn.addEventListener("click", async () => {
   }
 });
 
-function handleUserTranscription({ text }) {
-  if (!userTranscriptionEl) return;
+// ==================== Chat log (right rail transcript) ====================
+// The server sends `user_transcription` with the *growing* ASR buffer while
+// the user speaks (VAD callback), plus the final text right before
+// `turn_start` (pipeline). So: keep one live user bubble that is updated in
+// place, and open a fresh assistant bubble on each `turn_start`.
+const chatLog = document.getElementById('chatLog');
+const MAX_LOG_MESSAGES = 200;
+let lastMsg = null; // { role: 'user'|'assistant', body: HTMLElement }
 
-  // Truncate logic: keep last N chars if too long
-  const MAX_LEN = 20;
-  let displayText = text || "No transcription yet";
-  if (displayText.length > MAX_LEN) {
-    let tail = displayText.slice(-MAX_LEN);
+function scrollLog() {
+  // Stick to bottom unless the user scrolled up to read
+  const nearBottom =
+    chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight < 60;
+  if (nearBottom) chatLog.scrollTop = chatLog.scrollHeight;
+}
 
-    // Ensure we don't cut off in the middle of a word
-    const match = tail.match(/^[a-zA-Z]+/);
-    if (match) {
-      const extraLen = match[0].length;
-      tail = displayText.slice(-(MAX_LEN + extraLen));
-    }
+function addMessage(role, text) {
+  const empty = chatLog.querySelector('.log-empty');
+  if (empty) empty.remove();
 
-    displayText = "..." + tail;
+  const msg = document.createElement('div');
+  msg.className = 'msg msg-' + role;
+
+  const roleEl = document.createElement('span');
+  roleEl.className = 'msg-role';
+  roleEl.textContent = role === 'user' ? 'YOU' : 'AI';
+
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+  body.textContent = text;
+
+  msg.append(roleEl, body);
+  chatLog.appendChild(msg);
+  while (chatLog.children.length > MAX_LOG_MESSAGES) {
+    chatLog.firstElementChild.remove();
   }
+  scrollLog();
+  return body;
+}
 
-  userTranscriptionEl.textContent = displayText;
-  userTranscriptionEl.classList.add("updated");
-  window.setTimeout(() => userTranscriptionEl.classList.remove("updated"), 400);
+function flashBody(body) {
+  body.classList.add('updated');
+  window.setTimeout(() => body.classList.remove('updated'), 400);
+}
+
+function handleUserTranscription({ text }) {
+  if (!text) return;
+  if (lastMsg && lastMsg.role === 'user') {
+    // Live update of the bubble being spoken into
+    lastMsg.body.textContent = text;
+  } else {
+    lastMsg = { role: 'user', body: addMessage('user', text) };
+  }
+  flashBody(lastMsg.body);
+}
+
+function startAssistantMessage() {
+  lastMsg = { role: 'assistant', body: addMessage('assistant', '…') };
+}
+
+function appendAssistantText(text) {
+  if (!text) return;
+  if (!lastMsg || lastMsg.role !== 'assistant') {
+    startAssistantMessage();
+  }
+  const body = lastMsg.body;
+  if (body.textContent === '…') body.textContent = '';
+  body.textContent += text;
+  flashBody(body);
+  scrollLog();
 }
 
 // ==================== TTS Engine (SharedArrayBuffer + AudioWorklet) ====================
@@ -245,12 +446,23 @@ startBtn.addEventListener('click', async () => {
   try {
     listening = true;
     updateCircleState("LISTENING");
+    startTimer();
 
     // Ensure TTS Engine is ready
     if (!ttsContext) await initTTSAudioEngine();
     if (ttsContext.state === 'suspended') ttsContext.resume();
 
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Browser WebRTC processing chain (same as the FireRedChat demo):
+    // AEC uses the tab's TTS playout as the echo reference, plus noise
+    // suppression and AGC. This is the echo/denoise layer — the server
+    // receives a cleaned stream and the pvad gate sees the same audio.
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
 
     // Separate context for recording to avoid sample rate mess
     audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
@@ -296,6 +508,7 @@ startBtn.addEventListener('click', async () => {
 
     startBtn.disabled = true;
     stopBtn.disabled = false;
+    fitCanvas();
     drawUserWaveform();
     pulseAssistantCircle();
 
@@ -303,12 +516,14 @@ startBtn.addEventListener('click', async () => {
     console.error('Cannot access microphone:', err);
     alert("Cannot access microphone! Please check browser permissions.");
     updateCircleState("READY");
+    stopTimer();
     startBtn.disabled = false;
   }
 });
 
 stopBtn.addEventListener('click', () => {
   listening = false;
+  stopTimer();
 
   // Send Stop signal via JSON
   if (socket.readyState === WebSocket.OPEN) {
@@ -323,38 +538,54 @@ stopBtn.addEventListener('click', () => {
   if (processor) processor.disconnect();
   if (source) source.disconnect();
   voiceCircle.style.transform = 'scale(1)';
-  ctx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+  ctx.fillStyle = '#080b10';
+  ctx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
   startBtn.disabled = false;
   stopBtn.disabled = true;
   updateCircleState("READY");
 });
 
-// ==================== Draw Waveform ====================
+// ==================== Draw Waveform (neon on dark) ====================
 function drawUserWaveform() {
   if (!listening) return;
   animationId = requestAnimationFrame(drawUserWaveform);
 
-  analyser.getByteTimeDomainData(dataArray);
-  ctx.fillStyle = '#0f172a';
-  ctx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+  const w = waveformCanvas.width;
+  const h = waveformCanvas.height;
 
+  analyser.getByteTimeDomainData(dataArray);
+  ctx.fillStyle = '#080b10';
+  ctx.fillRect(0, 0, w, h);
+
+  // Center hairline
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.12)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
+  ctx.stroke();
+
+  // Neon trace
   ctx.lineWidth = 2;
-  ctx.strokeStyle = '#38bdf8';
+  ctx.strokeStyle = '#22d3ee';
+  ctx.shadowColor = 'rgba(34, 211, 238, 0.75)';
+  ctx.shadowBlur = 8;
   ctx.beginPath();
 
-  const sliceWidth = waveformCanvas.width / dataArray.length;
+  const sliceWidth = w / dataArray.length;
   let x = 0;
-  let lastY = waveformCanvas.height / 2;
+  let lastY = h / 2;
 
   for (let i = 0; i < dataArray.length; i++) {
     const v = dataArray[i] / 128.0;
-    const y = lastY + (v * waveformCanvas.height / 2 - lastY) * 0.2;
+    const y = lastY + (v * h / 2 - lastY) * 0.2;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
     lastY = y;
     x += sliceWidth;
   }
   ctx.stroke();
+  ctx.shadowBlur = 0;
 }
 
 // ==================== Assistant Circle Animation ====================
@@ -377,24 +608,28 @@ function pulseAssistantCircle() {
 
 // ==================== Update Circle State ====================
 function updateCircleState(state) {
-  // Reset classes
+  // Reset classes (orb + sonar-ring wrapper stay in sync)
   voiceCircle.classList.remove('state-speaking', 'state-listening', 'state-processing');
+  orbWrap.classList.remove('listening', 'processing', 'speaking');
 
   let statusText = "READY";
 
   switch (state) {
     case 'LISTENING':
       voiceCircle.classList.add('state-listening');
+      orbWrap.classList.add('listening');
       statusText = "LISTENING";
       break;
 
     case 'THINKING':
       voiceCircle.classList.add('state-processing');
+      orbWrap.classList.add('processing');
       statusText = "THINKING";
       break;
 
     case 'SPEAKING':
       voiceCircle.classList.add('state-speaking');
+      orbWrap.classList.add('speaking');
       statusText = "SPEAKING";
       break;
 
@@ -405,4 +640,189 @@ function updateCircleState(state) {
   }
 
   if (circleStatusEl) circleStatusEl.textContent = statusText;
+}
+
+// ==================== Live Settings Panel ====================
+// Mirrors backend DEFAULT_SETTINGS (app.py). Sent via `update_config`;
+// the server merges per-session and echoes back `config_applied`.
+const DEFAULT_PERSONA =
+  "You are a gentle and natural voice conversation assistant. " +
+  "Your name is Elva. " +
+  "You are communicating with the user via speech; please respond in a natural, brief, and colloquial manner. " +
+  "Do not output extra explanations, do not use lists or markdown format. " +
+  "Keep the conversation coherent, just like talking in reality. " +
+  "If the user shows agreement, affirmation or backchannels, continue speaking naturally based on the previous context. " +
+  "If the user asks you to stop, output nothing.";
+
+const PERSONA_PRESETS = {
+  default: DEFAULT_PERSONA,
+  concise:
+    "You are a voice assistant who answers as briefly as possible — one or two short sentences at most. " +
+    "Speak naturally and colloquially, never use lists or markdown. " +
+    "If the user agrees or backchannels, continue with the key point only.",
+  storyteller:
+    "You are a warm storyteller talking with the user over voice. " +
+    "Tell vivid, immersive little stories or anecdotes, 3-5 sentences per turn, ending with a small hook that invites the user to respond. " +
+    "Keep language spoken-style and simple; no lists or markdown.",
+  tutor:
+    "You are a patient tutor explaining things over voice. " +
+    "Break every explanation into small spoken steps, use simple everyday analogies, and check understanding with one short question at the end of each turn. " +
+    "Never use lists or markdown; keep each turn under five sentences.",
+};
+
+const settingsEls = {
+  persona: document.getElementById('personaPrompt'),
+  preset: document.getElementById('personaPreset'),
+  applyBtn: document.getElementById('applyPersonaBtn'),
+  resetBtn: document.getElementById('resetPersonaBtn'),
+  saved: document.getElementById('personaSaved'),
+  ttsEngine: document.getElementById('ttsEngine'),
+  ttsCfg: document.getElementById('ttsCfg'),
+  ttsCfgVal: document.getElementById('ttsCfgVal'),
+  ttsSteps: document.getElementById('ttsSteps'),
+  ttsStepsVal: document.getElementById('ttsStepsVal'),
+  ttsVoiceDesc: document.getElementById('ttsVoiceDesc'),
+  maxHistory: document.getElementById('maxHistory'),
+  maxHistoryVal: document.getElementById('maxHistoryVal'),
+  minSegLen: document.getElementById('minSegLen'),
+  minSegLenVal: document.getElementById('minSegLenVal'),
+  pvadMode: document.getElementById('pvadMode'),
+  pvadThreshold: document.getElementById('pvadThreshold'),
+  pvadThresholdVal: document.getElementById('pvadThresholdVal'),
+  pvadEnrollBtn: document.getElementById('pvadEnrollBtn'),
+  pvadEnrolled: document.getElementById('pvadEnrolled'),
+  pvadProb: document.getElementById('pvadProb'),
+  pvadNote: document.getElementById('pvadNote'),
+};
+
+function currentSettings() {
+  return {
+    system_prompt: settingsEls.persona.value.trim() || DEFAULT_PERSONA,
+    max_history: parseInt(settingsEls.maxHistory.value, 10) || 5,
+    min_seg_len: parseInt(settingsEls.minSegLen.value, 10) || 10,
+    tts_engine: settingsEls.ttsEngine.value,
+    tts_cfg: parseFloat(settingsEls.ttsCfg.value) || 2.0,
+    tts_timesteps: parseInt(settingsEls.ttsSteps.value, 10) || 10,
+    tts_voice_desc: settingsEls.ttsVoiceDesc.value.trim(),
+    pvad_mode: settingsEls.pvadMode.value,
+    pvad_threshold: parseFloat(settingsEls.pvadThreshold.value) || 0.5,
+  };
+}
+
+function sendConfig(partial) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ event: 'update_config', data: partial }));
+  }
+}
+
+function sendCurrentSettings() {
+  sendConfig(currentSettings());
+}
+
+function flashSavedFlag() {
+  if (!settingsEls.saved) return;
+  settingsEls.saved.classList.remove('hidden');
+  window.setTimeout(() => settingsEls.saved.classList.add('hidden'), 1500);
+}
+
+// --- persona textarea / presets ---
+settingsEls.persona.value = DEFAULT_PERSONA;
+settingsEls.preset.addEventListener('change', () => {
+  const key = settingsEls.preset.value;
+  if (key && PERSONA_PRESETS[key]) {
+    settingsEls.persona.value = PERSONA_PRESETS[key];
+    sendConfig({ system_prompt: PERSONA_PRESETS[key] });
+  }
+});
+settingsEls.applyBtn.addEventListener('click', () => {
+  sendConfig({ system_prompt: settingsEls.persona.value.trim() || DEFAULT_PERSONA });
+});
+settingsEls.resetBtn.addEventListener('click', () => {
+  settingsEls.persona.value = DEFAULT_PERSONA;
+  settingsEls.preset.value = 'default';
+  sendConfig({ system_prompt: DEFAULT_PERSONA });
+});
+
+// --- debounced live sliders / selects ---
+let configDebounce = null;
+function debouncedSend() {
+  if (configDebounce) clearTimeout(configDebounce);
+  configDebounce = setTimeout(() => {
+    const s = currentSettings();
+    sendConfig({
+      tts_engine: s.tts_engine,
+      tts_cfg: s.tts_cfg,
+      tts_timesteps: s.tts_timesteps,
+      tts_voice_desc: s.tts_voice_desc,
+      max_history: s.max_history,
+      min_seg_len: s.min_seg_len,
+      pvad_mode: s.pvad_mode,
+      pvad_threshold: s.pvad_threshold,
+    });
+  }, 400);
+}
+
+settingsEls.ttsEngine.addEventListener('change', debouncedSend);
+settingsEls.ttsCfg.addEventListener('input', () => {
+  settingsEls.ttsCfgVal.textContent = parseFloat(settingsEls.ttsCfg.value).toFixed(1);
+  debouncedSend();
+});
+settingsEls.ttsSteps.addEventListener('input', () => {
+  settingsEls.ttsStepsVal.textContent = settingsEls.ttsSteps.value;
+  debouncedSend();
+});
+settingsEls.ttsVoiceDesc.addEventListener('change', debouncedSend);
+settingsEls.maxHistory.addEventListener('input', () => {
+  settingsEls.maxHistoryVal.textContent = settingsEls.maxHistory.value;
+  debouncedSend();
+});
+settingsEls.minSegLen.addEventListener('input', () => {
+  settingsEls.minSegLenVal.textContent = settingsEls.minSegLen.value;
+  debouncedSend();
+});
+
+// ==================== Speaker Gate (pvad sidecar) ====================
+settingsEls.pvadMode.addEventListener('change', debouncedSend);
+settingsEls.pvadThreshold.addEventListener('input', () => {
+  settingsEls.pvadThresholdVal.textContent =
+    parseFloat(settingsEls.pvadThreshold.value).toFixed(2);
+  debouncedSend();
+});
+settingsEls.pvadEnrollBtn.addEventListener('click', () => {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ event: 'pvad_enroll' }));
+    flashGateNote('Re-enrollment requested…');
+  }
+});
+
+let gateNoteTimer = null;
+
+function flashGateNote(text, sticky = false) {
+  if (!settingsEls.pvadNote) return;
+  settingsEls.pvadNote.textContent = text;
+  settingsEls.pvadNote.classList.remove('hidden');
+  if (gateNoteTimer) clearTimeout(gateNoteTimer);
+  if (!sticky) {
+    gateNoteTimer = setTimeout(() => settingsEls.pvadNote.classList.add('hidden'), 3000);
+  }
+}
+
+function handlePvadStatus({ enrolled, prob, mode, threshold }) {
+  if (settingsEls.pvadEnrolled) {
+    settingsEls.pvadEnrolled.dataset.state = enrolled ? 'enrolled' : 'off';
+    settingsEls.pvadEnrolled.textContent = enrolled ? 'enrolled' : 'not enrolled';
+  }
+  if (settingsEls.pvadProb) {
+    settingsEls.pvadProb.textContent = prob == null ? '–' : prob.toFixed(2);
+  }
+}
+
+function handlePvadReject({ kind, cos, threshold, shadow }) {
+  const what = kind === 'bargein' ? 'Barge-in' : 'Turn';
+  flashGateNote(
+    `${what} ignored — not the main speaker (similarity ${cos.toFixed(2)} < ${threshold})` +
+    (shadow ? ' [shadow]' : ''),
+    !shadow
+  );
+  console.log('[pvad] rejected', kind, { cos, threshold, shadow });
 }

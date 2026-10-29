@@ -1,6 +1,8 @@
 import os
 import base64
+import faulthandler
 import json
+import signal
 import time
 import asyncio
 from typing import Dict
@@ -12,6 +14,9 @@ from contextlib import asynccontextmanager
 from service.engine import TurnTakingEngine
 from service.session import TurnSession
 from service.model import load_turn_model
+
+# kill -USR1 <pid> dumps all thread tracebacks (goes to turn.log)
+faulthandler.register(signal.SIGUSR1)
 
 SESSION_TTL_SEC = 60  # Recycle if no audio for 60 seconds
 GC_INTERVAL_SEC = 10  # Session GC interval
@@ -84,7 +89,15 @@ async def turn_ws(ws: WebSocket):
             except Exception:
                 continue
 
+            t_feed = time.time()
             state = session.feed_audio(audio)
+            dt_feed = time.time() - t_feed
+            if dt_feed > 0.5:
+                print(
+                    f"[TurnTaking] SLOW feed_audio {dt_feed:.2f}s "
+                    f"session {session_id}",
+                    flush=True,
+                )
 
             if state is not None:
                 await ws.send_text(
