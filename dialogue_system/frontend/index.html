@@ -114,6 +114,14 @@
           <h2>Voice Engine</h2>
         </div>
         <div class="field">
+          <label for="turnEngine">Turn engine</label>
+          <select id="turnEngine" class="input">
+            <option value="soulx">SoulX-Duplug</option>
+            <option value="frc">FireRedChat (dual EOT)</option>
+          </select>
+          <span class="block-hint">Turn-taking architecture: SoulX semantic turn server, or the FireRedChat pipeline (pVAD endpointing + ultraVAD/Qwen dual end-of-turn). LLM and voice are the same either way.</span>
+        </div>
+        <div class="field">
           <label for="ttsEngine">Engine</label>
           <select id="ttsEngine" class="input">
             <option value="voxcpm">VoxCPM2</option>
@@ -129,12 +137,6 @@
           <input id="ttsSteps" type="range" min="4" max="40" step="1" value="10">
           <span class="block-hint">More steps = higher quality, slower synthesis. (VoxCPM2 only)</span>
         </div>
-        <div class="field">
-          <label for="ttsVoiceDesc">Voice description</label>
-          <input id="ttsVoiceDesc" class="input" type="text"
-            placeholder="e.g. (young female, warm and gentle, medium pace)">
-          <span class="block-hint">Empty = server default. (VoxCPM2 only)</span>
-        </div>
       </section>
 
       <!-- Speaker Gate (pvad sidecar) -->
@@ -146,9 +148,9 @@
         <div class="field">
           <label for="pvadMode">Mode</label>
           <select id="pvadMode" class="input">
-            <option value="enforce">Enforce · block others</option>
+            <option value="off">Off · direct (default)</option>
             <option value="shadow">Shadow · observe only</option>
-            <option value="off">Off</option>
+            <option value="enforce">Enforce · block others</option>
           </select>
         </div>
         <div class="field">
@@ -162,6 +164,23 @@
         </div>
         <p id="pvadNote" class="gate-note hidden"></p>
         <p class="block-hint">First gate-passed turn auto-enrolls the main speaker. Unknown signal never blocks the conversation (fail-open).</p>
+      </section>
+
+      <!-- Background Tasks (fast/slow brain agent) -->
+      <section class="rail-block">
+        <div class="block-head">
+          <h2>Background Tasks</h2>
+          <span id="taskCount" class="gate-badge" data-state="off">0</span>
+        </div>
+        <div class="field">
+          <label for="agentEnabled" class="toggle-row">
+            <input id="agentEnabled" type="checkbox" checked>
+            <span>Agent mode (slow brain)</span>
+          </label>
+          <span class="block-hint">Complex requests are delegated to a background reasoning agent; results are spoken at the next natural pause.</span>
+        </div>
+        <div id="taskList" class="task-list"></div>
+        <p id="taskEmpty" class="task-empty">No background tasks.</p>
       </section>
 
       <!-- Conversation -->

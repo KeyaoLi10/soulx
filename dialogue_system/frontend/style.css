@@ -783,3 +783,110 @@ input[type="range"] {
 }
 
 .gate-note.hidden { display: none; }
+
+/* ===== Background Tasks (fast/slow brain agent) ===== */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.toggle-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.task-empty {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+  margin: 10px 0 0;
+}
+
+.task-card {
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(34, 211, 238, 0.03);
+}
+
+.task-card[data-status="running"],
+.task-card[data-status="queued"] {
+  border-color: rgba(34, 211, 238, 0.35);
+}
+
+.task-card[data-status="completed"],
+.task-card[data-status="delivered"] {
+  border-color: rgba(52, 211, 153, 0.4);
+}
+
+.task-card[data-status="failed"],
+.task-card[data-status="canceled"] {
+  opacity: 0.65;
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.task-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.task-status {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.task-status[data-s="running"] { color: var(--accent); border-color: rgba(34, 211, 238, 0.4); }
+.task-status[data-s="completed"], .task-status[data-s="delivered"] { color: var(--green); border-color: rgba(52, 211, 153, 0.4); }
+.task-status[data-s="failed"] { color: var(--amber); border-color: rgba(245, 158, 11, 0.4); }
+
+.task-goal {
+  font-size: 12px;
+  color: var(--text);
+  margin: 5px 0 0;
+  line-height: 1.45;
+}
+
+.task-progress {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+  margin: 4px 0 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-result {
+  font-size: 12px;
+  color: var(--text);
+  margin: 6px 0 0;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border-strong);
+  line-height: 1.5;
+  max-height: 120px;
+  overflow-y: auto;
+}

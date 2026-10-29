@@ -106,7 +106,7 @@ class FireRedTTS:
 
     def synthesize(self, text: str, sample_rate: int = 24000, streaming=None,
                    options=None):
-        # options (VoxCPM live-tuning: cfg/timesteps/voice_desc) is ignored
+        # options (VoxCPM live-tuning: cfg/timesteps) is ignored
         # by FireRedTTS — kept in the signature so both engines are
         # drop-in interchangeable per session.
         text = _clean_tts_text(text)
@@ -153,8 +153,9 @@ class VoxCPM_TTS:
     at 24 kHz mono. The server already resamples VoxCPM2's 48 kHz output and
     streams RAW pcm — no WAV header to strip, unlike the FireRedTTS wire
     format. `options` carries live-tunable params through to the server:
-    {"cfg_value": float, "inference_timesteps": int, "voice_desc": str}
-    (empty/missing fields fall back to the server's env defaults).
+    {"cfg_value": float, "inference_timesteps": int}
+    (voice is fixed server-side by the anchor reference — not a request
+    option since 2026-10-29).
     """
 
     def __init__(self, api_url: str = "http://127.0.0.1:8085/synthesize"):

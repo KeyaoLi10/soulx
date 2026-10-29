@@ -51,3 +51,5 @@ venv.bak/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# local weights symlink (absolute machine path)
+pretrained_models

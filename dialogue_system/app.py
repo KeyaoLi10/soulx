@@ -1,6 +1,8 @@
 import re
 import os
 import time
+import wave
+import difflib
 import soxr
 import queue
 import base64
@@ -11,6 +13,7 @@ import threading
 import uuid
 import json
 import asyncio
+from pathlib import Path
 import numpy as np
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -77,6 +80,8 @@ from clients.llm_client import QwenLLM_stream
 from clients.vad_client import TurnTaking
 from clients.pvad_client import PVADSession
 from modules.utils.backchannel_utils import check_backchannel
+from agent.runtime import AgentRuntime, AGENT_SYSTEM_ADDON, FAST_TOOLS
+from frc_engine import FrcEngine, services_available as frc_services_available
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -147,6 +152,80 @@ class ChatSession:
         # session.lock is held across vad.process and must not be contended.
         self.ring_lock = threading.Lock()
         self.mic_ring = []                 # [(ts, np.ndarray)]
+        # Enrollment speech bank: speech audio accumulated across turns.
+        # The 8s mic ring alone never reaches the 3s enroll floor when the
+        # user speaks in short bursts, so the session stays unenrolled and
+        # the barge-in gate fail-opens forever (the choppiness bug of
+        # 2026-10-29: every nonidle blip interrupted playback).
+        self.pvad_speech_bank = None       # np.ndarray or None (ring_lock)
+        # Whether THIS turn's gate pass was identity-VERIFIED (scored
+        # cos >= threshold). Gate passes are not all equal: fail-open
+        # passes (unenrolled / unscoreable window) are exactly the
+        # unverified ones, and banking/re-enrolling them lets echo-class
+        # audio displace the enrolled speaker — measured 2026-10-30
+        # (session b63c185f): one fail-open phantom turn re-enrolled,
+        # after which the real user scored 0.348 -> 0.013 -> -0.017 and
+        # every later turn of theirs was rejected while phantoms passed.
+        # Set by _pvad_turn_gate, read by the bank/enroll calls of the
+        # same pipeline_worker run.
+        self.pvad_turn_verified = False
+        # Gate-decision audio dumps written for this session (forensics
+        # cap; see _pvad_dump_forensics)
+        self.pvad_forensics_n = 0
+        # Barge-in hysteresis: consecutive nonidle chunks. A 1-2 chunk
+        # nonidle blip (noise / AEC residue the turn server misclassified)
+        # must not stop playback — only sustained nonidle (real speech)
+        # may interrupt. Any idle/speak result resets the streak.
+        self.bargein_streak = 0
+        # The nonidle audio itself (rolling ~2.5 s). The barge-in identity
+        # check scores THIS, not the mic ring: the ring's recent-speech
+        # window can still hold the user's just-finished turn, which made
+        # the first echo/noise onset score as the main speaker.
+        self.bargein_audio = []
+        # One barge-in episode interrupts once: without this, continuous
+        # overlapping speech re-triggers interrupt() every _BARGEIN_MIN_CHUNKS
+        # chunks (a stop_audio storm measured at 4x per 2s barge-in).
+        # Re-armed by reset_interrupt() at the start of each new turn.
+        self.bargein_done = False
+        # Contiguous nonidle chunks in the CURRENT voice episode — unlike
+        # bargein_streak this is NOT reset when the barge-in trigger fires,
+        # so at complete-turn time it measures the whole episode. Blip turns
+        # (< _BARGEIN_MIN_CHUNKS of voice before "completing") are echo/noise
+        # that paraformer hallucinates short fragments onto ("怎么样""平时"
+        # class phantoms, 2026-10-30) — dropped in the websocket loop.
+        self.voice_run = 0
+        # Wall-clock of the last SUSTAINED voice (>= _BARGEIN_MIN_CHUNKS
+        # consecutive nonidle chunks — the same evidence the barge-in
+        # hysteresis trusts). The turn server often emits a complete turn's
+        # text only AFTER the audio has gone idle (voice_run already reset
+        # to 0; measured 2026-10-30: real first turns and split-utterance
+        # trailing segments dropped as 0-2-chunk blips), so acceptance
+        # falls back to "sustained voice happened moments ago". Echo/noise
+        # blips never sustain 3 consecutive chunks, so they never open
+        # this window.
+        self.last_sustained_voice_ts = 0.0
+        # Estimated wall-clock end of assistant playback (audio chunks are
+        # buffered client-side ahead of real time). Used to suppress the
+        # LISTENING circle flip while the assistant is still talking.
+        self.playback_end = 0.0
+        # Fast/slow brain: True while a speech generation (user turn OR
+        # background-result delivery) is running in this session. The
+        # delivery arbiter polls it to pick a speaking slot.
+        self.gen_in_progress = False
+        # Wall-clock of the last user voice activity (barge-in chunks or a
+        # completed turn) — the delivery arbiter waits for a quiet gap.
+        self.last_voice_ts = 0.0
+        # AgentRuntime (task mgmt + delivery arbiter). Created in the
+        # websocket endpoint once the session is registered.
+        self.agent_runtime = None
+        # FrcEngine (FireRedChat-architecture turn engine, only fed audio
+        # while settings turn_engine == "frc"). Created in the websocket
+        # endpoint alongside the agent runtime.
+        self.frc = None
+        # Recent assistant text segments (the LLM chunks that get spoken),
+        # newest last, capped. The self-talk check compares a turn's ASR
+        # text against these: echo turns transcribe OUR OWN words.
+        self.assistant_chunks = []
 
     @property
     def stop_event(self):
@@ -155,6 +234,7 @@ class ChatSession:
     def interrupt(self):
         """Interrupts current inference or audio playback."""
         self._stop_event.set()
+        self.playback_end = 0.0
         emit_to_room(self.client_id, "stop_audio", {"message": "interrupt"})
         emit_to_room(self.client_id, "circle_status", {"status": "LISTENING"})
 
@@ -166,6 +246,7 @@ class ChatSession:
     def reset_interrupt(self):
         """Creates a new stop event for the next processing cycle, leaving the old one set."""
         self._stop_event = threading.Event()
+        self.bargein_done = False
 
 
 class SessionManager:
@@ -247,13 +328,33 @@ DEFAULT_SETTINGS = {
     "tts_engine": TTS_ENGINE,  # voxcpm | firered
     "tts_cfg": 2.0,            # VoxCPM2 expressiveness
     "tts_timesteps": 10,       # VoxCPM2 quality steps
-    "tts_voice_desc": "",      # "" = server default voice
-    # Main-speaker gate (pvad sidecar :8086). off = ignore; shadow = evaluate
-    # and report but never block; enforce = reject non-main-speaker turns.
-    "pvad_mode": "enforce",
+    # (voice: fixed by the TTS server's anchor reference, not a setting —
+    # the voice_desc text-design knob was removed 2026-10-29)
+    # Main-speaker gate (pvad sidecar :8086). off = ignore (direct SoulX
+    # turn decisions, no pvad work at all); shadow = evaluate and report
+    # but never block; enforce = reject non-main-speaker turns.
+    # DEFAULT off since 2026-10-30: measured on real browser-WebRTC audio
+    # (forensics session 4600b3b4), the same speaker scores 0.15-0.57 vs
+    # their own enrollment — the 0.5 threshold (calibrated on clean
+    # eot-bench audio: same 0.59-0.80 / different 0.06-0.44) sits inside
+    # the real-user band, so enforce chronically rejects the enrolled
+    # user (the "30 秒后一直不说话" incident); and the anti-pollution
+    # verified-only banking means a thin enrollment can never recover.
+    "pvad_mode": "off",
     "pvad_threshold": 0.50,    # ECAPA cosine vs enrolled speaker must be
                                # above this (measured: same 0.59-0.80,
                                # different 0.06-0.44)
+    # Fast/slow brain agent (delegate_task → background slow brain on
+    # :6008, results delivered at the next quiet gap)
+    "agent_enabled": True,
+    # Voice frontend processing mode. "soulx" = SoulX-Duplug turn server
+    # (:8000, the default this system was built around). "frc" =
+    # FireRedChat architecture (frc_engine.py): pvad speech-activity
+    # endpointing + dual EOT (ultraVAD audio + Qwen first-token 是/否) +
+    # FireRedASR — same LLMs and TTS, different turn-taking. TTS/LLM
+    # services are shared, the FRC-only services (ultraVAD :8082,
+    # FireRedASR :8010) must be running for "frc".
+    "turn_engine": "soulx",
 }
 
 print("System initialized: VAD Pool, LLM client, TTS clients ready.")
@@ -295,11 +396,85 @@ def emit_to_room(client_id, event, data):
 # prob itself is kept as live activity telemetry only). Unknown signal
 # (not enrolled / service down / too little audio) => fail open.
 
+
+def _pvad_enabled(session) -> bool:
+    """Single switch for the whole pvad path (feed / ring / enrollment /
+    bank / telemetry / both gates). mode=off => the app runs purely on
+    SoulX turn decisions and does ZERO pvad work per audio chunk; the
+    code stays reachable so Settings can flip it back live per session."""
+    return session.settings.get("pvad_mode", DEFAULT_SETTINGS["pvad_mode"]) != "off"
+
+
 _PVAD_RING_MAX_S = 30.0   # mic ring retention
-_PVAD_SEARCH_S = 8.0      # how far back to look for speech
-_PVAD_CHUNK_RMS = 0.015   # a 160 ms chunk counts as speech above this
-_PVAD_MAX_SPEECH_S = 5.0  # cap on the speech audio sent for embedding
-_PVAD_MIN_SPEECH_S = 1.0  # less speech than this => nothing to identify
+# All ECAPA windows below use RAW CONTIGUOUS audio (ring tail / streak
+# chunks), never speech-chunk concatenation. Measured (scripts/
+# ecapa_window_calib.py, 2026-10-29): with a natural 6s enrollment the
+# same speaker scores 0.55-0.70 on 1s windows vs different-speaker
+# 0.30-0.47 and assistant-echo 0.26-0.47 — threshold 0.5 sits in that
+# gap. Chunk-concatenated enrollment (the old bank format) collapses the
+# same-speaker band to 0.17-0.56 and overlaps everything. 0.5s windows
+# are useless (same 0.20-0.37); 1s is the minimum usable window.
+# gap (measured, /tmp probes 2026-10-29): a 2.5s window of pure speech
+# scores 0.57, but 1.0s speech + 1.5s trailing silence scores 0.23 and
+# pure silence -0.08 — silence-PADDED windows garbage-score. Hence
+# _pvad_ring_tail trims silence from the EDGES (interior pauses stay).
+_PVAD_SIL_RMS = 0.005     # 160 ms chunk RMS floor for that edge-trim.
+                          # Sits below echo/AEC-residual level (~0.01) so
+                          # echo stays visible to the gate.
+_PVAD_TURN_TAIL_S = 2.5   # speech-bounded ring tail scored at turn
+                          # decisions (longer tails let similar-voiced
+                          # strangers drift over threshold)
+_PVAD_TURN_MIN_S = 1.2    # turn gate: shorter tail => fail-open
+_PVAD_BARGEIN_MIN_S = 0.9 # barge-in gate: streak audio below this is
+                          # unscoreable (1s is where ECAPA separates;
+                          # 0.5s does not separate at all)
+_PVAD_ENROLL_TAIL_S = 6.0 # speech-bounded ring tail banked per turn
+_PVAD_ENROLL_MIN_S = 2.5  # less banked audio than this => defer enroll
+_PVAD_BANK_MAX_S = 12.0   # enrollment bank retention
+_PVAD_FORENSICS_MAX = 200 # gate-decision audio dumps per session (disk
+                          # guard; ~50KB/s of wav each)
+_PVAD_FORENSICS_CONTEXT_S = 6.0
+                          # raw mic context dumped around a gate decision
+_BARGEIN_MIN_CHUNKS = 3   # consecutive nonidle chunks before a barge-in
+# Premature-turn grace (2026-10-30 抢话修复): a "complete"-triggered turn
+# boundary fires the reply instantly with zero silence confirmation, so
+# mid-sentence pauses get misread as finished turns. The reply generation
+# starts immediately but is HELD for this long — if the user resumes
+# speech it is dropped silently and their continuation merges with the
+# original user message (llm_client groupby). The LLM's first segment
+# takes ~1s anyway, so the hold costs almost no perceived latency.
+# "wait"-triggered turns need no grace (already silence-verified by
+# max_wait_num idle chunks on the turn server).
+_TURN_GRACE_S = 0.9
+# Mention gate for the Agent Runtime task view (2026-10-30 闲聊不汇报):
+# the fast brain only sees "当前后台任务：…" when the user's turn actually
+# references the background work. Deliberately broad — a false positive
+# merely injects an (accurate) status note, while a false negative has the
+# model answering "查得怎么样了" with no idea a task exists.
+_TASK_MENTION_RE = re.compile(
+    r"查|任务|进度|结果|好了吗|好了没|出来|多久|搞定|完成|办好|弄好|找到|怎么样"
+)
+_SUSTAINED_VOICE_WINDOW_S = 6.0
+                          # a complete turn is accepted if sustained voice
+                          # (>= _BARGEIN_MIN_CHUNKS consecutive chunks)
+                          # happened within this window — the turn server
+                          # often emits the turn text only after the audio
+                          # went idle, so voice_run alone reads 0-2 for
+                          # real speech
+# 2026-10-30 晚：毛刺话轮过滤**整体下线**。实测（logs/web.log 01:31 会话）
+# 两条判据全部失效：① 真人麦克风语音经浏览器 WebRTC 处理后，turn server
+# 的状态逐块 nonidle/idle 交替（约 50% 占空比，永远没有 3 连续 chunk），
+# 任何"连续/近期 chunk 计数"判据都会误杀真话轮（用户整句"喂，你怎么
+# 不说话了？"被丢）；② 幻听碎片（"这个怎么样？""平时。"）前的 episode
+# 与真实语音同形态（5-6 个 1-chunk / 秒），计数无法区分。防幻听须另找
+# 判据（pvad 身份门控方向或音频取证），代码保留待判据成立后启用。
+_BLIPTURN_FILTER = False
+                          # acts (3 x 160 ms = 480 ms of sustained speech)
+_PVAD_PLAYBACK_GRACE_S = 1.5  # turn-gate playback leniency extends this
+                          # far past playback_end: the turn decision lags
+                          # the speech by ~0.8 s, so a turn completing just
+                          # after playback ended was still spoken INTO the
+                          # AEC-active window
 
 
 def _pvad_ring_append(session, wav) -> None:
@@ -311,114 +486,451 @@ def _pvad_ring_append(session, wav) -> None:
             del session.mic_ring[: len(session.mic_ring) - max_chunks]
 
 
-def _pvad_ring_speech(session):
-    """Speech-only audio from the mic ring: the 160 ms chunks above the
-    RMS floor within the last 8 s, concatenated (up to ~5 s). Returns
-    (wav, speech_seconds); (None, 0.0) when the ring holds no speech.
-
-    A plain max-RMS window is not enough: a decision landing in a silence
-    gap yields a window of 4.5 s zeros + a speech sliver — RMS passes any
-    sane floor, but ECAPA on silence-dominated audio is garbage (measured:
-    the main speaker scored 0.16). Speech-chunk concatenation gives the
-    embedding real voice or nothing."""
+def _pvad_ring_tail(session, seconds, search_s=None, split_gap_s=0.6):
+    """Speech-bounded raw mic audio for ECAPA: take the last `search_s`
+    (default seconds + 1.5) of the ring, trim silence from the EDGES, cut
+    at the last interior silence gap >= `split_gap_s` (keeping the final
+    segment = the CURRENT utterance — without this, a turn completing
+    right after the user's previous utterance scores a window mixing both,
+    which let the echo following a user turn pass AS the user and poison
+    the enrollment), then keep the last `seconds`. Natural contiguous
+    audio (interior pauses < split_gap_s included) embeds far better than
+    concatenated speech chunks; edge-trimming keeps ECAPA off
+    silence-padded windows, which garbage-score (see the calibration
+    notes above). Returns None when the window holds nothing above the
+    RMS floor (turn gate fail-opens; such turns are blips whose ASR text
+    is empty anyway)."""
     with session.ring_lock:
         if not session.mic_ring:
-            return None, 0.0
+            return None
         wav = np.concatenate([c for _, c in session.mic_ring])
-    recent = wav[-int(_PVAD_SEARCH_S * Config.SAMPLE_RATE):]
-    n = (recent.shape[0] // 2560) * 2560
+    search = seconds + 1.5 if search_s is None else search_s
+    n = int(search * Config.SAMPLE_RATE)
+    wav = wav[-n:] if wav.shape[0] > n else wav
+    n = (wav.shape[0] // 2560) * 2560
     if n == 0:
-        return None, 0.0
-    chunks = recent[:n].reshape(-1, 2560)
+        return None
+    chunks = wav[:n].reshape(-1, 2560)
     rms = np.sqrt(np.mean(chunks * chunks, axis=1))
-    speech = chunks[rms >= _PVAD_CHUNK_RMS]
-    if speech.shape[0] == 0:
+    loud = rms >= _PVAD_SIL_RMS
+    idx = np.where(loud)[0]
+    if idx.size == 0:
+        return None
+    wav = wav[idx[0] * 2560: (idx[-1] + 1) * 2560]
+    if split_gap_s:
+        # cut at the last interior silence run >= split_gap_s: everything
+        # before it belongs to a previous utterance
+        gap_chunks = max(2, int(-(-split_gap_s // 0.16)))  # ceil, not 0.16 short
+        cut = 0
+        run = 0
+        for i, is_loud in enumerate(loud[idx[0]: idx[-1] + 1]):
+            if is_loud:
+                if run >= gap_chunks:
+                    cut = i
+                run = 0
+            else:
+                run += 1
+        if cut:
+            wav = wav[cut * 2560:]
+    n = int(seconds * Config.SAMPLE_RATE)
+    return wav[-n:] if wav.shape[0] > n else wav
+
+
+def _pvad_bank_turn_audio(session) -> None:
+    """Bank the raw audio of a gate-passed, ASR-confirmed turn (called from
+    pipeline_worker after the text check, so noise-only turns never enter
+    the bank). The enrollment reference must be natural contiguous audio;
+    short turns accumulate across turns so enrollment still completes —
+    which arms the ECAPA barge-in gate, the actual defense against
+    noise/echo interruptions.
+
+    Once enrolled, only identity-VERIFIED turns bank (scored cos >=
+    threshold): a fail-open pass is by definition unverified, and banking
+    it is how echo-class audio displaces the enrolled speaker (measured
+    2026-10-30 — see the pvad_turn_verified field note)."""
+    if session.pvad.enrolled and not session.pvad_turn_verified:
+        logger.info(
+            f"[{session.client_id}] pvad bank skipped: gate pass was not "
+            f"identity-verified (fail-open) — reference stays put"
+        )
+        return
+    wav = _pvad_ring_tail(session, _PVAD_ENROLL_TAIL_S)
+    if wav is None or wav.shape[0] < int(1.0 * Config.SAMPLE_RATE):
+        return
+    with session.ring_lock:
+        bank = session.pvad_speech_bank
+        bank = wav if bank is None else np.concatenate([bank, wav])
+        max_n = int(_PVAD_BANK_MAX_S * Config.SAMPLE_RATE)
+        if bank.shape[0] > max_n:
+            bank = bank[-max_n:]
+        session.pvad_speech_bank = bank
+
+
+def _pvad_enroll_audio(session):
+    """Enrollment audio: banked turn audio plus the current raw tail (bank
+    first, tail last, so the sidecar's tail-5s embed is mostly the most
+    recent turn). Returns (wav, seconds)."""
+    tail = _pvad_ring_tail(session, _PVAD_ENROLL_TAIL_S)
+    with session.ring_lock:
+        bank = session.pvad_speech_bank
+    parts, total = [], 0.0
+    if bank is not None and bank.shape[0] >= Config.SAMPLE_RATE:
+        parts.append(bank)
+        total += bank.shape[0] / Config.SAMPLE_RATE
+    if tail is not None and tail.shape[0] >= Config.SAMPLE_RATE:
+        parts.append(tail)
+        total += tail.shape[0] / Config.SAMPLE_RATE
+    if not parts:
         return None, 0.0
-    keep = int(_PVAD_MAX_SPEECH_S / 0.16)
-    return np.concatenate(speech[-keep:]), speech.shape[0] * 0.16
+    return (np.concatenate(parts) if len(parts) > 1 else parts[0], total)
 
 
 def _pvad_score(session):
-    """Blocking ECAPA identity check — worker threads only. Returns
-    (cos, threshold); cos is None when unusable (fail-open): unenrolled,
-    service down, or less than ~1 s of speech in the recent ring."""
+    """Turn-gate identity check — worker threads only. Scores the raw ring
+    tail; returns (cos, threshold), cos None when unusable (fail-open):
+    unenrolled, service down, or too little audio."""
     threshold = session.settings.get(
         "pvad_threshold", DEFAULT_SETTINGS["pvad_threshold"]
     )
     if not session.pvad.enrolled:
         return None, threshold
-    wav, speech_s = _pvad_ring_speech(session)
-    if wav is None or speech_s < _PVAD_MIN_SPEECH_S:
+    wav = _pvad_ring_tail(session, _PVAD_TURN_TAIL_S)
+    if wav is None or wav.shape[0] < int(_PVAD_TURN_MIN_S * Config.SAMPLE_RATE):
         return None, threshold
     return session.pvad.score(wav), threshold
 
 
-def _pvad_turn_gate(session) -> bool:
-    """First thing in pipeline_worker: a rejected turn must not touch the
-    ongoing playback or LLM history. Runs in the worker thread, so the
-    ~150 ms ECAPA forward never blocks the audio receive loop."""
+def _pvad_forensics_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "logs" / "pvad_forensics"
+
+
+def _pvad_write_wav(path: Path, wav: np.ndarray) -> None:
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(Config.SAMPLE_RATE)
+        w.writeframes((np.clip(wav, -1.0, 1.0) * 32767.0).astype("<i2").tobytes())
+
+
+def _pvad_dump_forensics(session, asr_text, cos, reason) -> None:
+    """Audio forensics for gate decisions (2026-10-30): dump the mic audio
+    around every turn-gate REJECT plus suspicious passes, so phantom
+    fragments can be LISTENED to instead of guessed at. Each event writes
+    to logs/pvad_forensics/<session8>/<HHMMSSmmm>_<reason>/:
+      context.wav — last _PVAD_FORENSICS_CONTEXT_S of raw mic ring (what
+                    was actually in the room, untrimmed)
+      window.wav  — the exact ECAPA scoring window, when one existed
+      meta.json   — text, cos, threshold, mode, playing, enrolled, bank
+    Purely diagnostic: capped per session, every failure swallowed, never
+    blocks the pipeline."""
+    try:
+        if session.pvad_forensics_n >= _PVAD_FORENSICS_MAX:
+            return
+        session.pvad_forensics_n += 1
+        ts = time.time()
+        name = time.strftime("%H%M%S", time.localtime(ts)) + f"{int(ts * 1000) % 1000:03d}"
+        edir = (_pvad_forensics_dir() / session.client_id[:8]
+                / f"{name}_{reason}")
+        edir.mkdir(parents=True, exist_ok=True)
+        # raw context: copy the ring under its lock, keep the tail
+        with session.ring_lock:
+            ctx = (np.concatenate([c for _, c in session.mic_ring])
+                   if session.mic_ring else None)
+        if ctx is not None:
+            n = int(_PVAD_FORENSICS_CONTEXT_S * Config.SAMPLE_RATE)
+            _pvad_write_wav(edir / "context.wav",
+                            ctx[-n:] if ctx.shape[0] > n else ctx)
+        # the window the gate actually scored (recomputed — same ring,
+        # microseconds later, deterministic trim/split)
+        win = _pvad_ring_tail(session, _PVAD_TURN_TAIL_S)
+        if win is not None and win.shape[0] > 0:
+            _pvad_write_wav(edir / "window.wav", win)
+        with session.ring_lock:
+            bank_s = (0.0 if session.pvad_speech_bank is None
+                      else session.pvad_speech_bank.shape[0] / Config.SAMPLE_RATE)
+        (edir / "meta.json").write_text(json.dumps({
+            "ts": ts,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+            "session": session.client_id,
+            "reason": reason,
+            "asr_text": asr_text,
+            "cos": None if cos is None else round(cos, 4),
+            "threshold": session.settings.get(
+                "pvad_threshold", DEFAULT_SETTINGS["pvad_threshold"]),
+            "mode": session.settings.get(
+                "pvad_mode", DEFAULT_SETTINGS["pvad_mode"]),
+            "playing": time.time() < session.playback_end + _PVAD_PLAYBACK_GRACE_S,
+            "enrolled": bool(session.pvad.enrolled),
+            "bank_s": round(bank_s, 2),
+        }, ensure_ascii=False, indent=1))
+    except Exception as e:  # diagnostics must never break the pipeline
+        logger.warning(f"pvad forensics dump failed: {type(e).__name__}: {e}")
+
+
+def _pvad_norm_text(s: str) -> str:
+    """Lowercase, punctuation/space-stripped text for fuzzy comparison."""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def _pvad_selftalk_text(session, asr_text: str) -> bool:
+    """Does this turn's ASR text match what the assistant recently SPOKE?
+
+    The echo/self-talk loop's turns are, by definition, transcriptions of
+    our own output — while a real user's words are not. This is the one
+    discriminator that separates assistant echo from an AEC-mangled main
+    speaker during playback (their ECAPA cosines overlap: echo turns
+    0.18-0.39 vs mangled user 0.26-0.46, live-measured 2026-10-29)."""
+    q = _pvad_norm_text(asr_text)
+    if len(q) < 4:
+        return False  # too short to attribute to anyone
+    sources = list(session.assistant_chunks)
+    if session.pending_message:
+        sources.append(session.pending_message)
+    for m in llm.get_session(session.client_id)[-6:]:
+        if m.get("role") == "assistant" and m.get("content"):
+            sources.append(m["content"])
+    for src in sources:
+        s = _pvad_norm_text(src)
+        if len(s) < 4:
+            continue
+        if q in s or s in q:
+            return True
+        # TTS->ASR roundtrip garbles a few chars AND often catches only
+        # part of a segment ("怎么又喊我婉儿呀" <- "怎么又喊我“我儿”呀，
+        # 是不是喊累了"): substring fails on one garbled char and a whole-
+        # string ratio is diluted by the unmatched rest. Score instead the
+        # RECALL of q in s — what fraction of the turn's text appears in
+        # order in our recent output.
+        sm = difflib.SequenceMatcher(None, q, s)
+        matched = sum(b.size for b in sm.get_matching_blocks())
+        if matched / len(q) >= 0.6:
+            return True
+    return False
+
+
+def _pvad_turn_gate(session, asr_text: str) -> bool:
+    """First thing in pipeline_worker after ASR: a rejected turn must not
+    touch the ongoing playback or LLM history. Runs in the worker thread,
+    so the ~150 ms ECAPA forward never blocks the audio receive loop.
+
+    The gate applies the SAME strict threshold whether or not the
+    assistant is playing: below threshold -> reject, unverifiable
+    (unenrolled / too little audio / service down) -> fail-open (a
+    falsely rejected user is the gate's worst failure) — EXCEPT while
+    playing: an unscoreable turn during playback is REJECTED (fail-
+    closed, same policy as the barge-in gate since 2026-10-29).
+    Playback-onset echo is exactly a short unscoreable fragment; a real
+    user talking over playback keeps producing speech and their next
+    turn scores and passes. The self-talk text check survives only as
+    the reject-reason label.
+
+    (History: 2026-10-29 briefly had a playback-leniency branch that
+    passed any non-self-talk below-threshold turn while playing, on the
+    theory that browser AEC mangles the enrolled user mid-playback.
+    Removed the same day by user decision — tests run with headphones,
+    where AEC has nothing to cancel, yet playback-period scores still
+    dropped; the real cause was reference drift toward other voices, and
+    leniency let those voices through: impostor speech during playback
+    got answered by the LLM.)"""
     mode = session.settings.get("pvad_mode", DEFAULT_SETTINGS["pvad_mode"])
-    if mode == "off":
+    if not _pvad_enabled(session):
+        # gate off (the default since 2026-10-30): nothing downstream
+        # consumes pvad_turn_verified while off, but keep it True so a
+        # live mid-session switch to shadow/enforce starts from a clean
+        # "last turn trusted" state
+        session.pvad_turn_verified = True
         return True
     cos, threshold = _pvad_score(session)
-    if cos is not None and cos < threshold:
+    # stash for the bank/re-enroll calls later in this pipeline run: only
+    # a SCORED pass may move the enrollment reference (fail-open passes
+    # must not bank — that is the pollution vector of 2026-10-30)
+    session.pvad_turn_verified = cos is not None and cos >= threshold
+    if cos is not None and cos >= threshold:
+        return True  # strict pass — clean capture of the enrolled speaker
+    playing = time.time() < session.playback_end + _PVAD_PLAYBACK_GRACE_S
+    if playing and cos is None and session.pvad.enrolled:
+        # ENROLLED but unscoreable while playing: REJECT (fail-closed) —
+        # the same policy the barge-in gate has used since 2026-10-29.
+        # Playback onset produces exactly this signature: the ring-tail
+        # split at the last interior silence keeps only the ~0.3 s onset
+        # fragment, ECAPA can't score it, and the old fail-open here is
+        # what let onset-echo turns through (2026-10-30: a TTS-onset
+        # fragment passed as a "turn" one second after the user's real
+        # one, and the LLM answered it). A real user talking over
+        # playback keeps producing speech — their next turn scores
+        # properly and passes ~0.5 s later; an echo blip produces
+        # exactly one unscoreable fragment and stops. NOT applied while
+        # unenrolled: enrollment bootstraps from playback-period turns
+        # (users talk over replies), and an unscoreable onset fragment
+        # is too short to bank anyway, so it can't pollute the bank.
+        # The self-talk text check stays only as the reject-reason label.
+        selftalk = _pvad_selftalk_text(session, asr_text)
+        _pvad_dump_forensics(
+            session, asr_text, cos,
+            "selftalk" if selftalk else "unscoreable-playing")
         emit_to_room(
             session.client_id,
             "pvad_reject",
             {
                 "kind": "turn",
-                "cos": round(cos, 3),
+                "cos": None,
                 "threshold": threshold,
                 "shadow": mode == "shadow",
+                "reason": "selftalk" if selftalk else "unscoreable-playing",
             },
         )
         logger.info(
-            f"[{session.client_id}] pvad rejected turn: "
-            f"cos={cos:.3f} < {threshold} (mode={mode})"
+            f"[{session.client_id}] pvad rejected turn (unscoreable while "
+            f"playing{'/self-talk' if selftalk else ''}): (mode={mode})"
         )
         return mode == "shadow"  # shadow reports but proceeds
-    return True
+    if cos is None:
+        if playing:
+            # unenrolled (or service-blind) while playing: suspicious
+            # pass — capture it for forensics, but let it through
+            # (enrollment bootstraps from playback-period turns)
+            _pvad_dump_forensics(session, asr_text, cos,
+                                 "pass-unenrolled-playing")
+        return True  # fail-open (unenrolled / unscoreable / no service)
+    _pvad_dump_forensics(session, asr_text, cos, "below-threshold")
+    emit_to_room(
+        session.client_id,
+        "pvad_reject",
+        {
+            "kind": "turn",
+            "cos": round(cos, 3),
+            "threshold": threshold,
+            "shadow": mode == "shadow",
+        },
+    )
+    logger.info(
+        f"[{session.client_id}] pvad rejected turn: "
+        f"cos={cos:.3f} < {threshold} (mode={mode})"
+    )
+    return mode == "shadow"  # shadow reports but proceeds
 
 
 def _pvad_do_bargein(session) -> None:
+    # One interrupt per episode: while the user keeps talking, the streak
+    # re-reaches the threshold every ~0.5 s — everything after the first
+    # interrupt is a no-op that only spams stop_audio to the frontend.
+    if session.bargein_done:
+        return
+    session.bargein_done = True
     if session.interruption_time is None:
         session.interruption_time = time.time()
+    logger.info(
+        f"[{session.client_id}] barge-in confirmed: stopping playback/generation"
+    )
     session.interrupt()
 
 
 def _pvad_handle_bargein(session) -> None:
-    """Barge-in decision point. Fail-open paths interrupt inline; when
-    enrolled, the identity check runs in a daemon thread (the receive loop
-    must not wait ~150 ms per barge-in signal — they can fire many times
-    per second during overlapping speech). An in-flight check absorbs
-    duplicate signals: whichever way it resolves, it acts once."""
+    """Barge-in decision point. Runs in a daemon thread when enrolled (the
+    receive loop must not wait ~150 ms per barge-in signal — they can fire
+    many times per second during overlapping speech). An in-flight check
+    absorbs duplicate signals: whichever way it resolves, it acts once.
+
+    Identity is scored on session.bargein_audio — the nonidle chunks that
+    actually triggered the barge-in — NOT on the mic ring: the ring's
+    recent-speech window can still hold the user's just-finished turn,
+    which made the first echo/noise onset score as the main speaker.
+
+    Fail-open is conditional on playback: with nothing playing there is
+    nothing to protect, so unknown signals interrupt as before. While the
+    assistant is playing, an unverifiable barge-in (unenrolled, or less
+    than ~0.9 s of streak audio — ECAPA does not separate speakers on
+    shorter windows, and a short unverifiable onset is exactly what the
+    first blip of echo/noise looks like) is REJECTED: allowing it is the
+    choppiness bug. A genuine user keeps talking, the streak re-crosses
+    the threshold with more audio, and the check passes (~0.5 s later)."""
     mode = session.settings.get("pvad_mode", DEFAULT_SETTINGS["pvad_mode"])
-    if mode == "off" or not session.pvad.enrolled:
+    if not _pvad_enabled(session):
         _pvad_do_bargein(session)
         return
+    playing = time.time() < session.playback_end
+
+    if not session.pvad.enrolled:
+        if playing:
+            emit_to_room(
+                session.client_id,
+                "pvad_reject",
+                {
+                    "kind": "bargein",
+                    "cos": None,
+                    "threshold": session.settings.get(
+                        "pvad_threshold", DEFAULT_SETTINGS["pvad_threshold"]
+                    ),
+                    "shadow": mode == "shadow",
+                    "reason": "unenrolled",
+                },
+            )
+            logger.info(
+                f"[{session.client_id}] pvad rejected barge-in: "
+                f"unenrolled while playing (mode={mode})"
+            )
+            return
+        _pvad_do_bargein(session)
+        return
+
     if session.pvad_checking:
         return
     session.pvad_checking = True
 
+    # snapshot the streak audio under the same loop that appends it
+    streak_wav = (
+        np.concatenate(session.bargein_audio)
+        if session.bargein_audio
+        else None
+    )
+
     def _worker():
         try:
-            cos, threshold = _pvad_score(session)
-            allow = cos is None or cos >= threshold or mode == "shadow"
-            if cos is not None and cos < threshold:
-                emit_to_room(
-                    session.client_id,
-                    "pvad_reject",
-                    {
-                        "kind": "bargein",
-                        "cos": round(cos, 3),
-                        "threshold": threshold,
-                        "shadow": mode == "shadow",
-                    },
-                )
-                logger.info(
-                    f"[{session.client_id}] pvad rejected barge-in: "
-                    f"cos={cos:.3f} < {threshold} (mode={mode})"
-                )
+            threshold = session.settings.get(
+                "pvad_threshold", DEFAULT_SETTINGS["pvad_threshold"]
+            )
+            if (
+                streak_wav is not None
+                and streak_wav.shape[0] >= _PVAD_BARGEIN_MIN_S * Config.SAMPLE_RATE
+            ):
+                cos = session.pvad.score(streak_wav)
+            else:
+                cos = None
+            if cos is None:
+                allow = not playing or mode == "shadow"
+                if not allow:
+                    emit_to_room(
+                        session.client_id,
+                        "pvad_reject",
+                        {
+                            "kind": "bargein",
+                            "cos": None,
+                            "threshold": threshold,
+                            "shadow": mode == "shadow",
+                            "reason": "unscoreable",
+                        },
+                    )
+                    logger.info(
+                        f"[{session.client_id}] pvad rejected barge-in: "
+                        f"unscoreable while playing (mode={mode})"
+                    )
+            else:
+                allow = cos >= threshold or mode == "shadow"
+                if not allow:
+                    emit_to_room(
+                        session.client_id,
+                        "pvad_reject",
+                        {
+                            "kind": "bargein",
+                            "cos": round(cos, 3),
+                            "threshold": threshold,
+                            "shadow": mode == "shadow",
+                        },
+                    )
+                    logger.info(
+                        f"[{session.client_id}] pvad rejected barge-in: "
+                        f"cos={cos:.3f} < {threshold} (mode={mode})"
+                    )
             if allow:
                 _pvad_do_bargein(session)
         finally:
@@ -428,17 +940,20 @@ def _pvad_handle_bargein(session) -> None:
 
 
 def _pvad_try_enroll(session, reason: str) -> None:
-    """Enroll the main speaker from the mic ring tail. Blocking HTTP runs
-    in a daemon thread; defers to the next gate-passed turn if the ring is
-    still too short (<3 s) or the service errors."""
+    """Enroll the main speaker from banked turn audio plus the raw ring
+    tail (natural contiguous speech — chunk-concatenated enrollment
+    collapses ECAPA's same-speaker scores, see the calibration note at
+    the constants). Blocking HTTP runs in a daemon thread; defers to the
+    next gate-passed turn if there is too little audio (<2.5 s) or the
+    service errors."""
 
     def _worker():
-        wav, speech_s = _pvad_ring_speech(session)
-        if wav is None or speech_s < 3.0:
+        wav, total_s = _pvad_enroll_audio(session)
+        if wav is None or total_s < _PVAD_ENROLL_MIN_S:
             session.pvad_enroll_pending = True
             logger.info(
                 f"[{session.client_id}] pvad enroll deferred ({reason}): "
-                f"ring holds {speech_s:.1f}s of speech (need 3s)"
+                f"bank+tail hold {total_s:.1f}s of audio (need {_PVAD_ENROLL_MIN_S}s)"
             )
             return
         ok = session.pvad.enroll(wav)
@@ -446,7 +961,7 @@ def _pvad_try_enroll(session, reason: str) -> None:
             session.pvad_enroll_pending = False
             logger.info(
                 f"[{session.client_id}] pvad enrolled ({reason}, "
-                f"{speech_s:.1f}s speech)"
+                f"{total_s:.1f}s audio)"
             )
         else:
             session.pvad_enroll_pending = True
@@ -455,11 +970,21 @@ def _pvad_try_enroll(session, reason: str) -> None:
 
 
 def _pvad_maybe_auto_enroll(session) -> None:
-    """After a gate-passed turn: enroll if not yet enrolled (first turn
-    wins — the person the system actually conversed with becomes the main
-    speaker) or if a previous enrollment attempt was deferred."""
-    if session.pvad.enrolled and not session.pvad_enroll_pending:
-        return
+    """After every gate-passed turn: enroll (or RE-enroll) the main
+    speaker. First turn wins the initial reference; later turns keep it
+    rolling — measured same-speaker drift (vocal register, distance to
+    the mic) drops later windows to 0.33-0.50 against a stale first-turn
+    reference, right at the reject boundary.
+
+    Once enrolled, re-enrollment requires an identity-VERIFIED pass this
+    turn (scored cos >= threshold). The old claim that "an impostor must
+    already score >= threshold to move the reference" was FALSE for
+    fail-open passes: an unscoreable phantom turn passed the gate, and
+    its echo-class ring tail re-enrolled the reference — after which the
+    real user scored ~0 and was rejected on every later turn while
+    phantoms kept passing (2026-10-30, session b63c185f)."""
+    if session.pvad.enrolled and not session.pvad_turn_verified:
+        return  # unverified (fail-open) pass: never move the reference
     _pvad_try_enroll(session, "auto")
 
 
@@ -483,20 +1008,331 @@ def _pvad_emit_status(session) -> None:
     )
 
 
-def pipeline_worker(client_id, audio_segment, sample_rate):
+def _commit_pending_message(session, client_id):
+    """Commit the previous generation's assistant message into LLM history,
+    truncated to how much of it actually played. Shared by the user-turn
+    path and the background-result delivery path."""
+    with session.lock:
+        if not session.pending_message:
+            session.pending_message = None
+            session.pending_audio_duration = 0.0
+            session.pending_start_time = None
+            session.interruption_time = None
+            return
+        final_msg = session.pending_message
+        if (
+            session.interruption_time
+            and session.pending_start_time
+            and session.pending_audio_duration > 0
+        ):
+            elapsed = max(session.interruption_time - session.pending_start_time, 0)
+            ratio = min(elapsed / session.pending_audio_duration, 1.0)
+            cutoff = int(len(final_msg) * ratio)
+            final_msg = final_msg[:cutoff]
+            logger.info(f"[{client_id}] Previous turn, Ratio: {ratio:.2f}, Truncated: {final_msg}")
+        else:
+            logger.info(f"[{client_id}] Previous turn completed fully.")
+        session.pending_message = None
+        session.pending_audio_duration = 0.0
+        session.pending_start_time = None
+        session.interruption_time = None
+    llm.add_message(client_id, "assistant", final_msg)
+
+
+def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
+                         tts_client, tts_options, grace_until=None):
+    """Stream one LLM generation to the user: text events + TTS audio +
+    pending-message bookkeeping (interruption truncation). Returns True if
+    the generation ran to completion, False if interrupted.
+
+    Used by BOTH speech outlets — the user-turn pipeline and the
+    background-result delivery — so the whole system has exactly one way
+    of speaking (one turn_start, one pending-message lifecycle).
+
+    grace_until: premature-turn hold deadline (monotonic wall clock,
+    time.time()). A "complete"-triggered turn boundary fires the reply the
+    instant the turn model sees fit — no silence confirmation — so a
+    mid-sentence pause gets misread as a finished turn and the assistant
+    barges in ("抢话"). While the grace window is open the LLM keeps
+    streaming into a hold buffer (its first segment takes ~1s anyway, so
+    the hold is nearly free) and NOTHING reaches the user. If the user
+    resumes talking, the whole generation is dropped silently — their
+    continuation arrives as another user message and llm_client's groupby
+    merges the two into one utterance, so the next attempt sees the full
+    sentence. Only when the window passes without resumed speech is the
+    held text flushed through the normal emit path."""
+    holding = grace_until is not None
+    # last_voice_ts at hold start: any later bump means sustained voice
+    # resumed (blips deliberately never move it — see the receive loop)
+    grace_ref_ts = session.last_voice_ts if holding else 0.0
+    premature = False
+    # Segments held back while the grace window is open. Kept in a list —
+    # NOT folded into message_to_add — so a flush speaks each one exactly
+    # once through the normal emit path (an early version appended held
+    # text to message_to_add directly, which meant a reply that finished
+    # inside the window was never spoken yet still entered history).
+    held_chunks = []
+
+    if not holding:
+        # Let the frontend clear the previous assistant line
+        emit_to_room(client_id, "turn_start", {})
+
+    message_to_add = ""
+    interrupted = False
+    first_emit_time = None
+    total_audio_duration = 0.0
+
+    def _speak_chunk(chunk):
+        """Normal emit path for one LLM segment: text event + TTS audio.
+        Returns True if a stop was requested mid-synthesis."""
+        nonlocal message_to_add, first_emit_time, total_audio_duration
+        logger.info(f"[{client_id}] LLM Chunk: {chunk}")
+        emit_to_room(client_id, "text_response", {"text": chunk})
+        message_to_add += chunk
+        # Remember spoken segments for the self-talk (echo) check
+        session.assistant_chunks.append(chunk)
+        if len(session.assistant_chunks) > 12:
+            del session.assistant_chunks[0]
+        for wav_chunk in tts_client.synthesize(
+            chunk, streaming=True, options=tts_options
+        ):
+            if current_stop_event.is_set():
+                return True
+            if first_emit_time is None:
+                first_emit_time = time.time()
+            # Calculate audio duration: bytes / (sample_rate * channels * bytes_per_sample)
+            # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
+            total_audio_duration += len(wav_chunk) / 48000.0
+            emit_to_room(client_id, "audio_chunk", wav_chunk)
+            # Estimated remaining buffered playback: chunks are emitted
+            # as generated while the client plays them back in real
+            # time, so what is left in the buffer is (duration emitted
+            # so far) - (wall time since first chunk). The circle-status
+            # gate uses this to keep blips from flipping the UI.
+            session.playback_end = (
+                time.time()
+                + max(
+                    total_audio_duration - (time.time() - first_emit_time),
+                    0.0,
+                )
+                + 0.5
+            )
+        return current_stop_event.is_set()
+
+    def _flush_held():
+        """The grace window passed with no resumed speech: this was a real
+        end of turn. Release every held segment through the normal emit
+        path, then let the caller continue live. Returns True if a stop
+        landed mid-flush."""
+        nonlocal holding
+        holding = False
+        emit_to_room(client_id, "turn_start", {})
+        for held in held_chunks:
+            if current_stop_event.is_set():
+                return True
+            if _speak_chunk(held):
+                return True
+        return False
+
+    for i, chunk in enumerate(
+        llm_reply_gen
+        if hasattr(llm_reply_gen, "__iter__") and not isinstance(llm_reply_gen, str)
+        else [llm_reply_gen]
+    ):
+        if current_stop_event.is_set():
+            interrupted = True
+            break
+
+        if holding:
+            if session.last_voice_ts > grace_ref_ts:
+                # Sustained voice during the grace window: the turn
+                # boundary was premature, the user is still talking.
+                premature = True
+                break
+            if time.time() >= grace_until:
+                # Window passed with no resumed speech: this was a real
+                # end of turn — flush the held segments and continue live
+                if _flush_held():
+                    interrupted = True
+                    break
+            else:
+                # Still inside the window: keep the LLM streaming but
+                # hold everything back from the user
+                held_chunks.append(chunk)
+                continue
+
+        if _speak_chunk(chunk):
+            interrupted = True
+            break
+
+    if holding and not premature and not interrupted:
+        # The generation finished entirely inside the grace window (short
+        # reply / fast LLM): the window still has to pass before anything
+        # is spoken — the user may still be mid-sentence. Once it does,
+        # the held segments MUST be flushed (they have not been spoken).
+        while time.time() < grace_until:
+            if current_stop_event.is_set():
+                interrupted = True
+                break
+            if session.last_voice_ts > grace_ref_ts:
+                premature = True
+                break
+            time.sleep(0.05)
+        if not premature and not interrupted:
+            if _flush_held():
+                interrupted = True
+
+    if premature:
+        # Nothing was spoken, so nothing enters history — an unspoken
+        # assistant turn would pollute the conversation the user never
+        # heard. The user message is already in llm history and will
+        # merge with their continuation (llm_client groupby).
+        logger.info(
+            f"[{client_id}] premature turn dropped (user resumed during "
+            f"grace window); reply generation abandoned"
+        )
+        try:
+            llm_reply_gen.close()  # runs the generator's finally -> closes HTTP
+        except Exception:
+            pass
+        with session.lock:
+            session.pending_message = None
+            session.pending_audio_duration = 0.0
+            session.pending_start_time = None
+            session.interruption_time = None
+        return False
+
+    if interrupted:
+        # If interrupted mid-stream, calculate truncation immediately using current time
+        if first_emit_time and total_audio_duration > 0:
+            # interruption_time can be None when a NEW TURN (not a
+            # barge-in) stopped this stream — the new pipeline's pending
+            # block cleared it before calling interrupt(). Truncate at
+            # "now" in that case (the turn arrived just moments ago).
+            elapsed_time = max(
+                (session.interruption_time or time.time()) - first_emit_time, 0
+            )
+            ratio = min(elapsed_time / total_audio_duration, 1.0)
+            cutoff_length = int(len(message_to_add) * ratio)
+            message_to_add = message_to_add[:cutoff_length]
+            logger.info(
+                f"[{client_id}] Interrupted mid-stream. Ratio: {ratio:.2f}. Truncated message: {message_to_add}"
+            )
+        else:
+            message_to_add = ""
+
+        # Commit immediately as this pipeline execution is dead
+        # (an empty message means nothing was ever spoken — e.g. a stop
+        # that landed inside the grace hold — and an empty assistant
+        # turn in history is pure noise for the next generation)
+        if message_to_add:
+            llm.add_message(client_id, "assistant", message_to_add)
+
+        # Ensure no pending state is left over
+        with session.lock:
+            session.pending_message = None
+            session.pending_audio_duration = 0.0
+            session.pending_start_time = None
+            session.interruption_time = None
+
+    else:
+        # Pipeline finished successfully, but user might interrupt later while audio is playing.
+        # Do NOT commit to LLM yet. Save to session pending state.
+        with session.lock:
+            session.pending_message = message_to_add
+            session.pending_audio_duration = total_audio_duration
+            session.pending_start_time = first_emit_time
+            session.interruption_time = None
+
+    return not interrupted
+
+
+# ---------------------------------------------------------------------------
+# Fast/slow brain: delivery-timing hook + the delivery speech path
+# ---------------------------------------------------------------------------
+
+def _agent_can_deliver(session):
+    """Is now a natural gap to speak a background result? The user must not
+    be talking, nothing may be playing, and no generation may be running."""
+    now = time.time()
+    with session.lock:
+        if session.gen_in_progress:
+            return False
+    if now < session.playback_end:
+        return False
+    if now - session.last_voice_ts < 1.2:
+        return False
+    return True
+
+
+def _agent_deliver_entry(session, client_id, entry):
+    """Speak one completed background task result through the normal speech
+    pipeline. Returns True if fully spoken, False if interrupted."""
+    _commit_pending_message(session, client_id)
+    session.interrupt()  # stop anything still lingering
+    session.reset_interrupt()
+    current_stop_event = session.stop_event
+    if current_stop_event.is_set():
+        return False
+
+    # The result enters history as a user-role system note (persisted: later
+    # turns can still refer to it within the history window)
+    if entry.get("error") is not None:
+        note = (
+            f"[系统提示：后台任务 {entry['task_id']}（{entry['goal']}）执行失败，"
+            f"失败原因：{entry['error']}。\n"
+            "——请用自然口语向用户致歉并简要说明这个任务没做成，可以主动提出换个方式再试，"
+            "不要编造任何结果，控制在两三句话内。]"
+        )
+    else:
+        note = (
+            f"[系统提示：后台任务 {entry['task_id']}（{entry['goal']}）已完成，以下是真实结果——\n"
+            f"{entry['result']}\n"
+            "——请用自然口语向用户汇报要点：先说结论，关键数字和日期必须准确引用上面的结果，"
+            "不要逐字朗读，不要使用列表格式，控制在几句话内。]"
+        )
+    llm.add_message(client_id, "user", note)
+    logger.info(f"[{client_id}] Delivering background task {entry['task_id']}")
+
+    settings = dict(session.settings)
+    tts_client = TTS_CLIENTS.get(
+        settings.get("tts_engine"), TTS_CLIENTS[DEFAULT_SETTINGS["tts_engine"]]
+    )
+    tts_options = {
+        "cfg_value": settings.get("tts_cfg", 2.0),
+        "inference_timesteps": settings.get("tts_timesteps", 10),
+    }
+    gen = llm.generate_with_history(
+        client_id,
+        stop_event=current_stop_event,
+        system_prompt=settings.get("system_prompt") or None,
+        max_history=settings.get("max_history"),
+        min_seg_len=settings.get("min_seg_len"),
+    )
+    with session.lock:
+        session.gen_in_progress = True
+    try:
+        return _run_speech_pipeline(
+            session, client_id, gen, current_stop_event, tts_client, tts_options
+        )
+    finally:
+        with session.lock:
+            session.gen_in_progress = False
+
+
+def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
     """
     Main processing pipeline: ASR -> LLM -> TTS.
     Runs in a background thread for each detected utterance.
+
+    turn_trigger: how the turn boundary was reached on the turn server
+    ("complete" = <|user_complete|>, instant, unverified; "wait" =
+    silence-verified). Only "complete" turns get the premature-turn grace
+    hold in _run_speech_pipeline — that is the 抢话 fix of 2026-10-30.
     """
     session = session_manager.get_session(client_id)
     if not session:
         return
-
-    # Main-speaker gate FIRST: a rejected turn must not interrupt the
-    # ongoing playback, touch LLM history, or cost any LLM/TTS work.
-    if not _pvad_turn_gate(session):
-        return
-    _pvad_maybe_auto_enroll(session)
 
     try:
         # 1. ASR Phase (Automatic Speech Recognition)
@@ -511,6 +1347,15 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         if not asr_text.strip():
             return
 
+        # Main-speaker gate, AFTER ASR: the self-talk check needs the
+        # turn's text, and blip turns bail at the empty-text check above
+        # for free. A rejected turn must not interrupt the ongoing
+        # playback, touch LLM history, or cost any LLM/TTS work.
+        if not _pvad_turn_gate(session, asr_text):
+            return
+        if _pvad_enabled(session):
+            _pvad_maybe_auto_enroll(session)
+
         # # 2. Backchannel Detection (vad already handles this, but double-check here)
         # # Checks for filler words or short backchannels that shouldn't trigger a full response
         # if check_backchannel(asr_text):
@@ -518,34 +1363,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         #     return
 
         # Process Pending Message from previous turn if any (before adding new user message)
-        with session.lock:
-            if session.pending_message:
-                final_msg = session.pending_message
-                # Check if an interruption occurred during the playback of the previous complete message
-                if (
-                    session.interruption_time
-                    and session.pending_start_time
-                    and session.pending_audio_duration > 0
-                ):
-                    elapsed = max(
-                        session.interruption_time - session.pending_start_time, 0
-                    )
-                    ratio = min(elapsed / session.pending_audio_duration, 1.0)
-                    cutoff = int(len(final_msg) * ratio)
-                    final_msg = final_msg[:cutoff]
-                    logger.info(
-                        f"[{client_id}] Previous turn, Ratio: {ratio:.2f}, Truncated: {final_msg}"
-                    )
-                else:
-                    logger.info(f"[{client_id}] Previous turn completed fully.")
-
-                llm.add_message(client_id, "assistant", final_msg)
-
-            # Clear pending state
-            session.pending_message = None
-            session.pending_audio_duration = 0.0
-            session.pending_start_time = None
-            session.interruption_time = None
+        _commit_pending_message(session, client_id)
 
         # 3. Preparation for Response
         session.interrupt()  # Signal previous threads to stop
@@ -559,8 +1377,11 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
 
         logger.info(f"[{client_id}] ASR result: {asr_text}")
         emit_to_room(client_id, "user_transcription", {"text": asr_text})
-        # Let the frontend clear the previous assistant line
-        emit_to_room(client_id, "turn_start", {})
+        # Bank this turn's speech for cross-turn speaker enrollment (only
+        # reaches here with non-empty ASR text and a gate pass, so noise
+        # and rejected turns never enter the bank)
+        if _pvad_enabled(session):
+            _pvad_bank_turn_audio(session)
 
         # Snapshot live settings for this pipeline run (user may tweak the
         # UI mid-generation; one consistent view per turn is enough)
@@ -571,95 +1392,77 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         tts_options = {
             "cfg_value": settings.get("tts_cfg", 2.0),
             "inference_timesteps": settings.get("tts_timesteps", 10),
-            "voice_desc": settings.get("tts_voice_desc", ""),
         }
 
         llm.add_message(client_id, "user", asr_text)
-        llm_reply_gen = llm.generate_with_history(
-            client_id,
-            stop_event=current_stop_event,
-            system_prompt=settings.get("system_prompt") or None,
-            max_history=settings.get("max_history"),
-            min_seg_len=settings.get("min_seg_len"),
+
+        # 4. Generation. With the agent enabled, the fast brain gets its
+        # delegate/cancel tools (native tool calling via /agent_chat) plus
+        # the Agent Runtime's current task view injected as context. Tool
+        # rounds stay transient — only the final spoken text is persisted.
+        agent_runtime = (
+            session.agent_runtime
+            if settings.get("agent_enabled") and session.agent_runtime
+            else None
         )
-        # logger.info(llm.get_session(client_id))
-
-        # 4. LLM & TTS Streaming Processing
-        # Iterate over LLM response chunks and synthesize audio on the fly
-        message_to_add = ""
-        interrupted = False
-        first_emit_time = None
-        total_audio_duration = 0.0
-
-        for i, chunk in enumerate(
-            llm_reply_gen
-            if hasattr(llm_reply_gen, "__iter__") and not isinstance(llm_reply_gen, str)
-            else [llm_reply_gen]
-        ):
-            if current_stop_event.is_set():
-                interrupted = True
-                break
-
-            logger.info(f"[{client_id}] LLM Chunk: {chunk}")
-
-            # Send LLM text chunk immediately
-            emit_to_room(client_id, "text_response", {"text": chunk})
-
-            # Accumulate text before TTS loop to ensure current chunk is considered
-            message_to_add += chunk
-
-            # Synthesize text chunk to speech (Iterate over int16 pcm chunks)
-            for wav_chunk in tts_client.synthesize(
-                chunk, streaming=True, options=tts_options
-            ):
-                if current_stop_event.is_set():
-                    interrupted = True
-                    break
-
-                if first_emit_time is None:
-                    first_emit_time = time.time()
-
-                # Calculate audio duration: bytes / (sample_rate * channels * bytes_per_sample)
-                # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
-                total_audio_duration += len(wav_chunk) / 48000.0
-
-                emit_to_room(client_id, "audio_chunk", wav_chunk)
-
-            if current_stop_event.is_set():
-                interrupted = True
-                break
-
-        if interrupted:
-            # If interrupted mid-stream, calculate truncation immediately using current time
-            if first_emit_time and total_audio_duration > 0:
-                elapsed_time = max(session.interruption_time - first_emit_time, 0)
-                ratio = min(elapsed_time / total_audio_duration, 1.0)
-                cutoff_length = int(len(message_to_add) * ratio)
-                message_to_add = message_to_add[:cutoff_length]
-                logger.info(
-                    f"[{client_id}] Interrupted mid-stream. Ratio: {ratio:.2f}. Truncated message: {message_to_add}"
+        if agent_runtime:
+            system_prompt = (
+                settings.get("system_prompt") or QwenLLM_stream.SYSTEM_PROMPT
+            ) + "\n\n" + AGENT_SYSTEM_ADDON
+            # deterministic retraction handling: if the user's words clearly
+            # cancel a running task, the Runtime cancels it NOW (the fast
+            # brain understands "算了" but reliably fails to call the tool
+            # itself — see runtime.auto_cancel) and the note grounds its
+            # confirmation in fact.
+            #
+            # Task view is MENTION-GATED (2026-10-30): injected only when
+            # the user's words actually reference the background work (or
+            # a cancel note is being injected). Unconditional injection had
+            # the fast brain narrating task status in every reply while
+            # the slow brain ran — the user wants free chat on other
+            # topics in the meantime, with progress synced only on request.
+            auto_note = agent_runtime.auto_cancel(asr_text)
+            extra_context = None
+            if auto_note or _TASK_MENTION_RE.search(asr_text):
+                extra_context = agent_runtime.task_view()
+            if auto_note:
+                extra_context = (
+                    (extra_context + "\n" + auto_note) if extra_context
+                    else auto_note
                 )
-            else:
-                message_to_add = ""
-
-            # Commit immediately as this pipeline execution is dead
-            llm.add_message(client_id, "assistant", message_to_add)
-
-            # Ensure no pending state is left over
-            with session.lock:
-                session.pending_message = None
-                session.pending_audio_duration = 0.0
-                session.pending_start_time = None
-                session.interruption_time = None
-
+            llm_reply_gen = llm.generate_agent_with_history(
+                client_id,
+                stop_event=current_stop_event,
+                system_prompt=system_prompt,
+                max_history=settings.get("max_history"),
+                min_seg_len=settings.get("min_seg_len"),
+                extra_context=extra_context,
+                tools=FAST_TOOLS,
+                tool_handler=agent_runtime.handle_tool,
+            )
         else:
-            # Pipeline finished successfully, but user might interrupt later while audio is playing.
-            # Do NOT commit to LLM yet. Save to session pending state.
+            llm_reply_gen = llm.generate_with_history(
+                client_id,
+                stop_event=current_stop_event,
+                system_prompt=settings.get("system_prompt") or None,
+                max_history=settings.get("max_history"),
+                min_seg_len=settings.get("min_seg_len"),
+            )
+
+        # 5. LLM & TTS Streaming (shared speech outlet)
+        grace_until = (
+            time.time() + _TURN_GRACE_S if turn_trigger == "complete" else None
+        )
+        with session.lock:
+            session.gen_in_progress = True
+        try:
+            _run_speech_pipeline(
+                session, client_id, llm_reply_gen, current_stop_event,
+                tts_client, tts_options, grace_until=grace_until,
+            )
+        finally:
             with session.lock:
-                session.pending_message = message_to_add
-                session.pending_audio_duration = total_audio_duration
-                session.pending_start_time = first_emit_time
-                session.interruption_time = None
+                session.gen_in_progress = False
 
     except Exception as e:
         logger.error(f"Error in pipeline for {client_id}: {e}", exc_info=True)
@@ -676,11 +1479,11 @@ _SETTING_RULES = {
     "tts_timesteps": (int, 4, 40),
     "tts_cfg": (float, 0.5, 5.0),
     "system_prompt": (str, 0, 4000),
-    "tts_voice_desc": (str, 0, 200),
     "pvad_threshold": (float, 0.3, 0.9),
 }
 _TTS_ENGINES = ("voxcpm", "firered")
 _PVAD_MODES = ("off", "shadow", "enforce")
+_TURN_ENGINES = ("soulx", "frc")
 
 
 def _merge_session_settings(session, data: dict) -> dict:
@@ -710,6 +1513,18 @@ def _merge_session_settings(session, data: dict) -> dict:
     mode = data.get("pvad_mode")
     if mode in _PVAD_MODES:
         session.settings["pvad_mode"] = mode
+
+    engine = data.get("turn_engine")
+    if engine in _TURN_ENGINES:
+        if engine != session.settings.get("turn_engine"):
+            # engine switch mid-session: drop any half-finished FRC
+            # utterance so a stale pending commit can't fire later
+            if session.frc is not None:
+                session.frc.reset()
+        session.settings["turn_engine"] = engine
+
+    if "agent_enabled" in data:
+        session.settings["agent_enabled"] = bool(data["agent_enabled"])
 
     return dict(session.settings)
 
@@ -747,6 +1562,59 @@ async def websocket_endpoint(websocket: WebSocket):
 
         session = session_manager.create_session(client_id, vad_instance, websocket)
 
+        # Rebind the circle callback now that the session exists: while the
+        # assistant's buffered audio is still playing, a nonidle blip's
+        # LISTENING must not flip the UI back and forth with the per-chunk
+        # SPEAKING the frontend sets on every audio_chunk.
+        def _circle_gated(status):
+            if status == "LISTENING" and time.time() < session.playback_end:
+                return
+            emit_to_room(client_id, "circle_status", {"status": status})
+
+        vad_instance.circle_callback = _circle_gated
+
+        # Fast/slow brain runtime: background task management + result
+        # delivery arbitration for this session
+        session.agent_runtime = AgentRuntime(
+            client_id,
+            emit=lambda event, data: emit_to_room(client_id, event, data),
+            can_deliver=lambda: _agent_can_deliver(session),
+            deliver=lambda entry: _agent_deliver_entry(session, client_id, entry),
+        )
+        if session.settings.get("agent_enabled"):
+            session.agent_runtime.start()
+
+        # FireRedChat-architecture turn engine (only fed audio while
+        # settings turn_engine == "frc"; started here so the UI switch is
+        # live without a reconnect)
+        def _frc_last_assistant_text():
+            # what the user just heard: the pending (still-playing) reply
+            # if any, else the last committed assistant message
+            with session.lock:
+                pending = session.pending_message
+            if pending and pending.strip():
+                return pending
+            for m in reversed(llm.get_session(client_id)):
+                if m["role"] == "assistant" and (m.get("content") or "").strip():
+                    return m["content"]
+            return ""
+
+        def _frc_commit(transcript):
+            # same speech pipeline as the SoulX path; no grace window —
+            # the dual-EOT decision already guards against premature turns
+            threading.Thread(
+                target=pipeline_worker,
+                args=(client_id, transcript, Config.SAMPLE_RATE, None),
+                daemon=True,
+            ).start()
+
+        session.frc = FrcEngine(
+            session, client_id,
+            commit_cb=_frc_commit,
+            context_cb=_frc_last_assistant_text,
+        )
+        session.frc.start()
+
         # Now emission works via session_manager lookups
         emit_to_room(client_id, "connect_ack", {"client_id": client_id})
         emit_to_room(
@@ -783,13 +1651,24 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio_chunk, current_sr, Config.SAMPLE_RATE, quality="VHQ"
                     )
 
+                # FireRedChat frontend mode: the chunk goes to the FrcEngine
+                # (pvad speech-activity endpointing → dual EOT → FireRedASR)
+                # and the SoulX turn server is bypassed for this session.
+                # Switching is per-session and live (Settings panel).
+                if session.settings.get("turn_engine") == "frc":
+                    session.frc.feed(audio_chunk)
+                    continue
+
                 # PVAD sidecar: async copy of the mic chunk + enrollment ring.
                 # Both are outside session.lock so the turn-controller path
                 # below is untouched (feed() is a queue put; ring append is
                 # an O(1) list append under its own short-lived lock).
-                session.pvad.feed(audio_chunk)
-                _pvad_ring_append(session, audio_chunk)
-                _pvad_emit_status(session)
+                # Skipped entirely when the gate is off — zero pvad work
+                # on the direct-SoulX path.
+                if _pvad_enabled(session):
+                    session.pvad.feed(audio_chunk)
+                    _pvad_ring_append(session, audio_chunk)
+                    _pvad_emit_status(session)
 
                 t_proc = time.time()
                 with session.lock:
@@ -801,19 +1680,96 @@ async def websocket_endpoint(websocket: WebSocket):
                         f"(expected ~0.03s)"
                     )
 
-                if segment is not None:
-                    if isinstance(segment, list) and segment[0] is None:
-                        # Barge-in — main-speaker gate runs in a worker
-                        # thread (see _pvad_handle_bargein)
+                if segment is None:
+                    if session.bargein_streak:
+                        logger.info(
+                            f"[{client_id}] transient barge-in suppressed "
+                            f"({session.bargein_streak} chunk(s) < "
+                            f"{_BARGEIN_MIN_CHUNKS})"
+                        )
+                    session.bargein_streak = 0
+                    session.bargein_audio = []
+                    session.voice_run = 0
+                elif isinstance(segment, list) and segment[0] is None:
+                    # Barge-in signal — hysteresis first: the turn server
+                    # emits nonidle per chunk, and a 1-2 chunk blip (noise /
+                    # echo residue) must not stop playback. Only sustained
+                    # nonidle (real speech) reaches the main-speaker gate,
+                    # which then runs in a worker thread
+                    # (see _pvad_handle_bargein).
+                    # NOTE: a blip must also NOT push the delivery arbiter's
+                    # quiet-gap boundary (last_voice_ts) — measured 2026-10-30,
+                    # episodic 1-chunk echo blips every few seconds kept
+                    # deferring background-task delivery past every gap.
+                    # Sustained voice (below) and complete turns (line ~1524)
+                    # still push it.
+                    session.bargein_streak += 1
+                    session.voice_run += 1
+                    session.bargein_audio.append(audio_chunk)
+                    if len(session.bargein_audio) > 16:  # ~2.5 s rolling
+                        del session.bargein_audio[0]
+                    if session.bargein_streak >= _BARGEIN_MIN_CHUNKS:
+                        # sustained voice: trusted evidence a human is
+                        # talking — also opens the blip-filter's acceptance
+                        # window (the turn text may arrive a few seconds
+                        # after the audio went idle)
+                        session.last_sustained_voice_ts = time.time()
+                        session.last_voice_ts = time.time()
+                        session.bargein_streak = 0
                         _pvad_handle_bargein(session)
-                    else:
-                        # Complete Utterance — pipeline_worker applies the
-                        # main-speaker gate as its first step
-                        threading.Thread(
-                            target=pipeline_worker,
-                            args=(client_id, segment, Config.SAMPLE_RATE),
-                            daemon=True,
-                        ).start()
+                else:
+                    # Voice activity (complete turn): push the delivery
+                    # arbiter's quiet-gap boundary forward
+                    session.last_voice_ts = time.time()
+                    run, session.voice_run = session.voice_run, 0
+                    session.bargein_streak = 0
+                    session.bargein_audio = []
+                    # Real-speech evidence for this turn: either sustained
+                    # voice is STILL ongoing (run >= 3), or it happened
+                    # moments ago — the turn server often emits the text
+                    # only after the audio went idle (voice_run reads 0-2
+                    # for real first turns and split-utterance trailing
+                    # segments; measured 2026-10-30). Echo/noise blips
+                    # never sustain 3 consecutive chunks, so a turn with
+                    # neither is a hallucinated fragment.
+                    sustained_recent = (
+                        time.time() - session.last_sustained_voice_ts
+                    ) < _SUSTAINED_VOICE_WINDOW_S
+                    if (_BLIPTURN_FILTER
+                            and run < _BARGEIN_MIN_CHUNKS
+                            and not sustained_recent):
+                        # Blip turn: no sustained voice anywhere near this
+                        # "complete utterance" — it is echo/noise residue,
+                        # and its text is a paraformer hallucination (short
+                        # frequent fragments like "怎么样""是不是""平时").
+                        # Never spoken, never banked, never enters history;
+                        # the UI drops the streamed partial via the same
+                        # path as a gate rejection.
+                        logger.info(
+                            f"[{client_id}] blip turn dropped "
+                            f"({run} chunk(s) < {_BARGEIN_MIN_CHUNKS}): "
+                            f"{str(segment)[:40]!r}"
+                        )
+                        emit_to_room(
+                            client_id, "pvad_reject",
+                            {"kind": "blip_turn", "chunks": run,
+                             "text": str(segment)[:40]},
+                        )
+                        continue
+                    # Complete Utterance — pipeline_worker applies the
+                    # main-speaker gate as its first step. Capture the
+                    # trigger NOW, in the receive loop: the worker thread
+                    # may start later than the next vad.process() call,
+                    # which could overwrite last_turn_trigger.
+                    turn_trigger = getattr(
+                        session.vad, "last_turn_trigger", None
+                    )
+                    threading.Thread(
+                        target=pipeline_worker,
+                        args=(client_id, segment, Config.SAMPLE_RATE,
+                              turn_trigger),
+                        daemon=True,
+                    ).start()
 
             elif "text" in message and message["text"]:
                 # JSON Control Message
@@ -832,8 +1788,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         # Manual (re-)enrollment from the UI "Speaker Gate"
                         # panel: uses the mic ring tail if it already has
                         # >= 3 s of audio, else defers to the next turn.
-                        logger.info(f"[{client_id}] pvad re-enroll requested")
-                        _pvad_try_enroll(session, "manual")
+                        if not _pvad_enabled(session):
+                            logger.info(
+                                f"[{client_id}] pvad re-enroll ignored (gate off)"
+                            )
+                        else:
+                            logger.info(f"[{client_id}] pvad re-enroll requested")
+                            _pvad_try_enroll(session, "manual")
 
                     elif event == "ping":
                         # App-level heartbeat from the frontend: a dead or
@@ -858,6 +1819,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         # can confirm what actually landed.
                         data = payload.get("data", {})
                         merged = _merge_session_settings(session, data)
+                        # Fast/slow brain toggle: starting/stopping the
+                        # runtime cancels running tasks on switch-off
+                        if session.agent_runtime:
+                            if merged.get("agent_enabled"):
+                                session.agent_runtime.start()
+                            else:
+                                session.agent_runtime.shutdown()
                         emit_to_room(client_id, "config_applied", {"settings": merged})
                         logger.info(f"[{client_id}] Settings updated: {merged}")
 
@@ -872,6 +1840,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if session:
             session.is_active = False
             session.stop_event.set()
+            if session.agent_runtime:
+                session.agent_runtime.shutdown()
+            if session.frc:
+                session.frc.stop()
             session.pvad.stop()
             vad_pool.release(session.vad)
             session_manager.remove_session(client_id)

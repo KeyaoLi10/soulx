@@ -275,6 +275,11 @@ class TurnModel:
                         self.reset()
                         return {
                             "state": "speak",
+                            "trigger": "wait",
+                            # "wait": the boundary was confirmed by
+                            # max_wait_num consecutive idle chunks after an
+                            # <|user_incomplete|> — silence-verified, the app
+                            # can reply without extra confirmation
                             "text": segment,
                             "asr_segment": delta_text,
                             "asr_buffer": asr_buffer,
@@ -346,6 +351,12 @@ class TurnModel:
                 self.reset()
                 return {
                     "state": "speak",
+                    "trigger": "complete",
+                    # "complete": <|user_complete|> fired the reply the
+                    # instant the model saw fit — zero silence confirmation,
+                    # so a mid-sentence pause can look like a finished turn.
+                    # The app applies a grace window to these (see
+                    # _run_speech_pipeline) to avoid barging in.
                     "text": segment,
                     "asr_segment": delta_text,
                     "asr_buffer": asr_buffer,

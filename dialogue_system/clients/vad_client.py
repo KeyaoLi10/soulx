@@ -27,6 +27,12 @@ class TurnTaking:
         self._last_status = None
         self._last_circle_status = None
         self._last_transcription = None
+        # What ended the last turn: "complete" (the model predicted
+        # <|user_complete|> and the reply fired instantly, no silence
+        # confirmation) or "wait" (silence-verified after an incomplete).
+        # Read by app.py at turn-launch time to decide whether the reply
+        # needs a premature-turn grace window. Only written on "speak".
+        self.last_turn_trigger = None
 
     def _emit_status(self, state, message, force=False):
         if not self.status_callback:
@@ -146,4 +152,5 @@ class TurnTaking:
             asr_buffer = data["state"].get("asr_buffer", "")
             if asr_buffer.strip():
                 self._emit_transcription(asr_buffer)
+            self.last_turn_trigger = data["state"].get("trigger") or "wait"
             return data["state"].get("text", "")

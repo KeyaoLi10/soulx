@@ -236,6 +236,9 @@ function onSocketMessage(event) {
       case 'pvad_reject':
         handlePvadReject(payload);
         break;
+      case 'task_update':
+        handleTaskUpdate(payload);
+        break;
       default:
         console.log('Unknown event:', eventName);
     }
@@ -677,11 +680,11 @@ const settingsEls = {
   resetBtn: document.getElementById('resetPersonaBtn'),
   saved: document.getElementById('personaSaved'),
   ttsEngine: document.getElementById('ttsEngine'),
+  turnEngine: document.getElementById('turnEngine'),
   ttsCfg: document.getElementById('ttsCfg'),
   ttsCfgVal: document.getElementById('ttsCfgVal'),
   ttsSteps: document.getElementById('ttsSteps'),
   ttsStepsVal: document.getElementById('ttsStepsVal'),
-  ttsVoiceDesc: document.getElementById('ttsVoiceDesc'),
   maxHistory: document.getElementById('maxHistory'),
   maxHistoryVal: document.getElementById('maxHistoryVal'),
   minSegLen: document.getElementById('minSegLen'),
@@ -693,6 +696,10 @@ const settingsEls = {
   pvadEnrolled: document.getElementById('pvadEnrolled'),
   pvadProb: document.getElementById('pvadProb'),
   pvadNote: document.getElementById('pvadNote'),
+  agentEnabled: document.getElementById('agentEnabled'),
+  taskList: document.getElementById('taskList'),
+  taskEmpty: document.getElementById('taskEmpty'),
+  taskCount: document.getElementById('taskCount'),
 };
 
 function currentSettings() {
@@ -701,11 +708,12 @@ function currentSettings() {
     max_history: parseInt(settingsEls.maxHistory.value, 10) || 5,
     min_seg_len: parseInt(settingsEls.minSegLen.value, 10) || 10,
     tts_engine: settingsEls.ttsEngine.value,
+    turn_engine: settingsEls.turnEngine.value,
     tts_cfg: parseFloat(settingsEls.ttsCfg.value) || 2.0,
     tts_timesteps: parseInt(settingsEls.ttsSteps.value, 10) || 10,
-    tts_voice_desc: settingsEls.ttsVoiceDesc.value.trim(),
     pvad_mode: settingsEls.pvadMode.value,
     pvad_threshold: parseFloat(settingsEls.pvadThreshold.value) || 0.5,
+    agent_enabled: settingsEls.agentEnabled.checked,
   };
 }
 
@@ -751,18 +759,20 @@ function debouncedSend() {
     const s = currentSettings();
     sendConfig({
       tts_engine: s.tts_engine,
+      turn_engine: s.turn_engine,
       tts_cfg: s.tts_cfg,
       tts_timesteps: s.tts_timesteps,
-      tts_voice_desc: s.tts_voice_desc,
       max_history: s.max_history,
       min_seg_len: s.min_seg_len,
       pvad_mode: s.pvad_mode,
       pvad_threshold: s.pvad_threshold,
+      agent_enabled: s.agent_enabled,
     });
   }, 400);
 }
 
 settingsEls.ttsEngine.addEventListener('change', debouncedSend);
+settingsEls.turnEngine.addEventListener('change', debouncedSend);
 settingsEls.ttsCfg.addEventListener('input', () => {
   settingsEls.ttsCfgVal.textContent = parseFloat(settingsEls.ttsCfg.value).toFixed(1);
   debouncedSend();
@@ -771,7 +781,6 @@ settingsEls.ttsSteps.addEventListener('input', () => {
   settingsEls.ttsStepsVal.textContent = settingsEls.ttsSteps.value;
   debouncedSend();
 });
-settingsEls.ttsVoiceDesc.addEventListener('change', debouncedSend);
 settingsEls.maxHistory.addEventListener('input', () => {
   settingsEls.maxHistoryVal.textContent = settingsEls.maxHistory.value;
   debouncedSend();
@@ -825,4 +834,75 @@ function handlePvadReject({ kind, cos, threshold, shadow }) {
     !shadow
   );
   console.log('[pvad] rejected', kind, { cos, threshold, shadow });
+}
+
+// ==================== Background Tasks (fast/slow brain agent) ====================
+// task_update payloads: {task_id, goal, status, progress, result}
+// status: queued | running | completed | delivered | failed | canceled
+const TASK_STATUS_LABEL = {
+  queued: 'queued', running: 'running', completed: 'done',
+  delivered: 'reported', failed: 'failed', canceled: 'canceled',
+};
+const MAX_TASK_CARDS = 10;
+
+settingsEls.agentEnabled.addEventListener('change', () => {
+  // immediate (not debounced): switching the agent off cancels running
+  // background tasks server-side
+  sendConfig({ agent_enabled: settingsEls.agentEnabled.checked });
+});
+
+function handleTaskUpdate({ task_id, goal, status, progress, result }) {
+  if (!settingsEls.taskList) return;
+  let card = settingsEls.taskList.querySelector(`[data-task="${task_id}"]`);
+  if (!card) {
+    card = document.createElement('div');
+    card.className = 'task-card';
+    card.dataset.task = task_id;
+
+    const head = document.createElement('div');
+    head.className = 'task-head';
+    const id = document.createElement('span');
+    id.className = 'task-id';
+    id.textContent = task_id;
+    const st = document.createElement('span');
+    st.className = 'task-status';
+    head.append(id, st);
+
+    const g = document.createElement('p');
+    g.className = 'task-goal';
+
+    const pr = document.createElement('p');
+    pr.className = 'task-progress';
+
+    const res = document.createElement('p');
+    res.className = 'task-result';
+
+    card.append(head, g, pr, res);
+    settingsEls.taskList.prepend(card);
+    // oldest cards fall off the bottom
+    while (settingsEls.taskList.children.length > MAX_TASK_CARDS) {
+      settingsEls.taskList.lastElementChild.remove();
+    }
+  }
+
+  card.dataset.status = status;
+  card.querySelector('.task-status').dataset.s = status;
+  card.querySelector('.task-status').textContent =
+    TASK_STATUS_LABEL[status] || status;
+  card.querySelector('.task-goal').textContent = goal || '';
+  const pr = card.querySelector('.task-progress');
+  pr.textContent = progress || '';
+  pr.style.display = progress ? '' : 'none';
+  const res = card.querySelector('.task-result');
+  res.textContent = result || '';
+  res.style.display = result ? '' : 'none';
+
+  const n = settingsEls.taskList.children.length;
+  if (settingsEls.taskCount) {
+    settingsEls.taskCount.textContent = String(n);
+    settingsEls.taskCount.dataset.state = n ? 'enrolled' : 'off';
+  }
+  if (settingsEls.taskEmpty) {
+    settingsEls.taskEmpty.style.display = n ? 'none' : '';
+  }
 }
