@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+venv/
+venv-voxcpm/
+
+# 模型与缓存（体积巨大，不入库）
+pretrained_models/
+modelscope_cache/
+
+# 数据与运行产物
+data/
+logs/
+results/
+*.wav
+*.zip
+
+# 上游克隆（独立 git 仓库，不作为子目录跟踪）
+repo/
+
+# 证书 / 私钥
+services/certs/
+*.pem
+*.key
+
+# 本地杂项
+.DS_Store
+nohup.out
