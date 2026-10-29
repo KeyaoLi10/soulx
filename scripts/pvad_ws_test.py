@@ -129,16 +129,34 @@ def main():
     ws.send(json.dumps({"event": "config_audio", "data": {"sample_rate": SR}}))
     threading.Thread(target=reader, args=(ws,), daemon=True).start()
 
-    # ---- phase 0: hostile settings are clamped/ignored ----
+    # ---- phase 0: opt into enforce, then hostile settings are clamped/ignored ----
+    # (pvad_mode defaults to "off" since 2026-10-30 — the direct-SoulX
+    # default — so a gate test must switch the gate on explicitly)
+    ws.send(json.dumps({
+        "event": "update_config",
+        "data": {"pvad_mode": "enforce"},
+    }))
+    wait_for(
+        lambda ev, d: ev == "config_applied"
+        and d.get("settings", {}).get("pvad_mode") == "enforce",
+        5, "config_applied (enforce)",
+    )
     ws.send(json.dumps({
         "event": "update_config",
         "data": {"pvad_threshold": 99, "pvad_mode": "bogus"},
     }))
-    got = wait_for(
-        lambda ev, d: ev == "config_applied", 5, "config_applied"
+    # wait for THIS echo by content — the enforce opt-in above also emits
+    # config_applied, so waiting on the event type alone races
+    wait_for(
+        lambda ev, d: ev == "config_applied"
+        and d.get("settings", {}).get("pvad_threshold") == 0.9,
+        5, "config_applied (hostile clamped)",
     )
     applied = next(
-        (d for _, ev, d in snapshot() if ev == "config_applied"), {}
+        (d for _, ev, d in reversed(snapshot())
+         if ev == "config_applied"
+         and d.get("settings", {}).get("pvad_threshold") == 0.9),
+        {},
     ).get("settings", {})
     check("threshold clamped to 0.9", applied.get("pvad_threshold") == 0.9,
           str(applied.get("pvad_threshold")))
@@ -148,18 +166,19 @@ def main():
     # Restore the sane threshold — the clamp test must not poison the
     # remaining phases (first run of this test left it at 0.9 and every
     # later gate evaluation rejected *everyone*).
-    t_restore = time.time()
     ws.send(json.dumps({
         "event": "update_config", "data": {"pvad_threshold": 0.5},
     }))
     wait_for(
         lambda ev, d: ev == "config_applied"
-        and any(ts > t_restore for ts, e, _ in snapshot() if e == "config_applied"),
+        and d.get("settings", {}).get("pvad_threshold") == 0.5,
         5, "config restore",
     )
     applied = next(
-        (d for ts, ev, d in snapshot()
-         if ev == "config_applied" and ts > t_restore), {}
+        (d for _, ev, d in reversed(snapshot())
+         if ev == "config_applied"
+         and d.get("settings", {}).get("pvad_threshold") == 0.5),
+        {},
     ).get("settings", {})
     check("threshold restored to 0.5", applied.get("pvad_threshold") == 0.5,
           str(applied.get("pvad_threshold")))
@@ -200,7 +219,15 @@ def main():
     check("different speaker rejected (enforce)", ok_reject)
     # give the reject a moment to (not) spawn a pipeline
     time.sleep(4.0)
-    turns = [1 for _, ev, _ in phase_window(t3) if ev == "turn_start"]
+    # turns BEFORE the first reject may exist: while unenrolled the gate
+    # fails open, and early impostor speech can complete a turn before
+    # enrollment finishes. What must hold: after the gate has actually
+    # rejected a turn, no further pipeline runs for speaker-B.
+    reject_ts = next((ts for ts, ev, d in phase_window(t3)
+                      if ev == "pvad_reject" and d.get("kind") == "turn"
+                      and not d.get("shadow")), None)
+    turns = [1 for ts, ev, _ in phase_window(t3)
+             if ev == "turn_start" and ts > reject_ts]
     check("no pipeline for the rejected turn", not turns, f"{len(turns)} turn_start")
 
     # ---- phase 4: different speaker, shadow ----

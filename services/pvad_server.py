@@ -59,7 +59,10 @@ from pydantic import BaseModel
 SAMPLE_RATE = 16000
 FRAME = 160                 # 10 ms @ 16 kHz — VadProcessor's fixed window
 ENROLL_MIN_SAMPLES = 32000  # 2 s minimum for a usable ECAPA embedding
-SCORE_MIN_SAMPLES = 16000   # 1 s minimum for a scoring embedding
+SCORE_MIN_SAMPLES = 8000    # 0.5 s minimum for a scoring embedding — the
+                            # barge-in gate scores at the first hysteresis
+                            # crossing (~0.5s of speech); requiring 1s there
+                            # fail-opens exactly when echo/noise starts
 ENROLL_WINDOW = 80000       # 5 s tail, mirrors the plugin's ecapa_window_size
 SESSION_IDLE_S = 120        # janitor: drop sessions idle longer than this
 

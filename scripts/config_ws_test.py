@@ -112,14 +112,13 @@ s = send_update(ws, {
     "tts_engine": "voxcpm",
     "tts_cfg": 3.5,
     "tts_timesteps": 20,
-    "tts_voice_desc": "(mature male, deep voice)",
 })
 check("config_applied persona", s.get("system_prompt") == "You are a pirate captain. Answer in one short sentence.")
 check("config_applied max_history=12", s.get("max_history") == 12)
 check("config_applied min_seg_len=6", s.get("min_seg_len") == 6)
 check("config_applied cfg=3.5", s.get("tts_cfg") == 3.5)
 check("config_applied steps=20", s.get("tts_timesteps") == 20)
-check("config_applied voice_desc", s.get("tts_voice_desc") == "(mature male, deep voice)")
+check("removed key tts_voice_desc ignored", "tts_voice_desc" not in s)
 check("config_applied engine", s.get("tts_engine") == "voxcpm")
 
 # --- 2. hostile update: clamp + ignore bad types ---
