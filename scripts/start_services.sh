@@ -7,6 +7,10 @@
 #                                       FRC agent and as TTS_ENGINE=firered rollback)
 #   GPU 7  VoxCPM2 TTS         :8085   (soulx/venv-voxcpm; web app default TTS)
 #   -      web app             :8090   (soulx/venv; TTS_ENGINE=voxcpm|firered)
+#   -      pvad sidecar        :8086   (CPU; full_duplex/venv-frc — the only env
+#                                       with the fireredchat-pvad plugin's
+#                                       speechbrain/onnxruntime stack; cross-venv
+#                                       pattern like ultraVAD in eot_bench)
 #
 # Logs under /home/research/krisl/soulx/logs/
 set -u
@@ -30,8 +34,13 @@ tmux send-keys -t soulx:llm "CUDA_VISIBLE_DEVICES=6 $FD/venv-frc-llm/bin/python 
 tmux new-window -t soulx -n turn
 tmux send-keys -t soulx:turn "cd $SOULX/repo && CUDA_VISIBLE_DEVICES=5 MODELSCOPE_CACHE=$SOULX/modelscope_cache $SOULX/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1 2>&1 | tee $LOGS/turn.log" C-m
 
+tmux new-window -t soulx -n pvad
+# HF_HUB_OFFLINE: the plugin's ECAPA weights resolve from the local
+# resources dir; going online makes speechbrain try an HF fetch.
+tmux send-keys -t soulx:pvad "HF_HUB_OFFLINE=1 $FD/venv-frc/bin/python $SOULX/services/pvad_server.py --port 8086 2>&1 | tee $LOGS/pvad.log" C-m
+
 tmux new-window -t soulx -n web
 tmux send-keys -t soulx:web "cd $SOULX/repo/dialogue_system && $SOULX/venv/bin/python app.py 2>&1 | tee $LOGS/web.log" C-m
 
-echo "started tmux session 'soulx' (windows: tts voxtts llm turn web)"
-echo "wait for models to load, then check: curl -s localhost:8081/health; curl -s localhost:8085/health; curl -s localhost:6007/health"
+echo "started tmux session 'soulx' (windows: tts voxtts llm turn pvad web)"
+echo "wait for models to load, then check: curl -s localhost:8081/health; curl -s localhost:8085/health; curl -s localhost:6007/health; curl -s localhost:8086/health"

@@ -39,6 +39,7 @@
    ws 客户端池)+SessionManager+             打断模拟/音频对齐渲染，
    pipeline_worker                          产出对话音频与状态时间线
    每段回复 → VoxCPM2 TTS(:8085) → 24kHz PCM
+   mic 旁路 → PVAD sidecar(:8086,CPU)     ← 异步 feed,不进轮次路径
 ```
 
 ## 2. 目录结构
@@ -93,6 +94,7 @@ soulx/
 | `voxtts` | **VoxCPM2 TTS（web 对话默认 TTS，`services/voxcpm_tts_server.py`）** | 7 | 8085 | `soulx/venv-voxcpm` |
 | `llm` | 融合 LLM 服务（`services/qwen35_fused_server.py`） | 6 | 6007 | `full_duplex/venv-frc-llm` |
 | `turn` | SoulX turn server（`repo/` uvicorn server:app） | 5 | 8000 | `soulx/venv` |
+| `pvad` | **PVAD 主说话人门控 sidecar（`services/pvad_server.py`，CPU）** | – | 8086 | `full_duplex/venv-frc` |
 | `web` | Web 演示应用（`repo/dialogue_system/app.py`，`TTS_ENGINE=voxcpm\|firered`） | – | 8090 | `soulx/venv` |
 
 `tmux attach -t soulx` 查看；日志在 `logs/*.log`。TTS 回滚：`TTS_ENGINE=firered`
@@ -148,7 +150,21 @@ soulx/
    prompt（含预设）、TTS 引擎按会话切换（voxcpm/firered）、VoxCPM2 音色参数
    （cfg/quality steps/voice description）、记忆轮数、首音频分段长度。
    详见 `docs/修改日志.md` 2026-10-28 条。
-5. **配置**：`config/config.yaml` 按原 README 基准 `max_wait_num: 5`、
+5. **主说话人门控 + 浏览器回声消除（2026-10-29）**：接入 FireRedChat 的
+   fireredchat-pvad 模块（ONNX 个性化 VAD + ECAPA 说话人嵌入），作为
+   `services/pvad_server.py`（:8086，CPU，运行于 full_duplex/venv-frc ——
+   唯一带 speechbrain/onnxruntime 栈的环境，跨 venv 复用模式同 eot_bench
+   的 ultraVAD）。**架构约束：完全不碰轮次控制器路径**——mic chunk 经
+   `feed()`（队列 put）异步旁路送入 sidecar，pvad 概率仅作 UI 实时遥测；
+   身份门控用 ECAPA 余弦（实测 pvad 概率在硬负例上无法区分说话人），
+   只在两个决策点（抢话、话轮完成）以 worker 线程询问，信号未知一律
+   fail-open（服务宕机验证过：对话完全不受影响）。首个通过门控的话轮
+   自动注册主说话人；三态模式 off/shadow/enforce + 相似度阈值可在
+   Settings 实时调。回声/降噪走浏览器 WebRTC 处理链
+   （echoCancellation + noiseSuppression + autoGainControl，与 FireRedChat
+   官方 demo 同款——它没有服务端 AEC 模型）。详见
+   `docs/修改日志.md` 2026-10-29 条。
+6. **配置**：`config/config.yaml` 按原 README 基准 `max_wait_num: 5`、
    `far_field_threshold: 0`。
 
 ## 6. 环境与网络
@@ -179,4 +195,8 @@ bash scripts/start_services.sh
 
 # 重建评估输入
 /home/research/krisl/soulx/venv/bin/python -I scripts/build_eval_inputs.py
+
+# PVAD 主说话人门控测试（服务已拉起时）
+/home/research/krisl/soulx/venv/bin/python -I scripts/pvad_service_test.py   # sidecar 13 项
+/home/research/krisl/soulx/venv/bin/python -I scripts/pvad_ws_test.py       # web 门控行为 11 项
 ```
