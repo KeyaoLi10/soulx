@@ -18,6 +18,21 @@ TOOL_QUIET = "[[quiet]]"
 # first bytes of each round so TTS never speaks it
 _LEAD_ROLE_JUNK = re.compile(r"^\s*(?:assistant|user|system|tool)\s*\n+")
 
+# mid-answer variant (measured 2026-10-30 14:50:27, session ec822c0a): in
+# tool-continuation rounds the model sometimes writes a chat-transcript
+# boundary — "好的好的。\nassistant\n好滴，…" — and TTS reads the bare marker
+# aloud ("assistant"). _LEAD_ROLE_JUNK only covers the answer start, so
+# standalone role lines are stripped anywhere in the stream. During
+# streaming only \n-terminated lines match (a partial "assista" tail must
+# not be touched); the tail variant catches an unterminated final one.
+_ROLE_LINE_JUNK = re.compile(r"(?m)^[ \t]*(?:assistant|user|system|tool)[ \t]*\r?\n")
+_ROLE_TAIL_JUNK = re.compile(r"(?m)^[ \t]*(?:assistant|user|system|tool)[ \t]*$")
+
+
+def strip_role_junk(text):
+    """Remove standalone role-marker lines anywhere in spoken text."""
+    return _ROLE_TAIL_JUNK.sub("", _ROLE_LINE_JUNK.sub("", text))
+
 
 class QwenLLM_stream:
     PUNCT = r"[.!?;:。！？；：\n]"
@@ -203,6 +218,10 @@ class QwenLLM_stream:
                                     sanitized = True
                                 elif len(buffer) > 24:
                                     sanitized = True
+                            # standalone role-marker lines mid-answer
+                            # (see _ROLE_LINE_JUNK) — before popping, so a
+                            # marker line can never ride inside a segment
+                            buffer = _ROLE_LINE_JUNK.sub("", buffer)
                             while True:
                                 seg, buffer = self.pop_segment(buffer, min_len=min_seg_len)
                                 if seg:
@@ -221,14 +240,19 @@ class QwenLLM_stream:
                         response.close()
 
                 if buffer.strip() and not (stop_event and stop_event.is_set()):
-                    yield buffer.strip()
+                    buffer = strip_role_junk(buffer)
+                    if buffer.strip():
+                        yield buffer.strip()
 
                 if not tool_calls or tool_handler is None:
                     return
 
                 # transient continuation: the model's own words + its tool
-                # calls, then one observation per call
-                content = (full_text + "\n" if full_text.strip() else "")
+                # calls, then one observation per call. strip_role_junk so
+                # the model doesn't see (and re-learn) its own marker
+                # hallucination in the transcript
+                content = strip_role_junk(full_text)
+                content = (content + "\n" if content.strip() else "")
                 for name, args in tool_calls:
                     content += self._render_tool_xml(name, args)
                 transient.append({"role": "assistant", "content": content.rstrip("\n")})

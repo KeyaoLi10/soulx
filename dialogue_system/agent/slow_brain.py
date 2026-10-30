@@ -34,9 +34,10 @@ import time
 import requests
 
 from agent import tools as agent_tools
-from clients.llm_client import _LEAD_ROLE_JUNK  # same occasional
-# role-marker hallucination the fast brain strips (see llm_client) — the
-# slow brain's answer is spoken too, so it needs the same guard
+from clients.llm_client import _LEAD_ROLE_JUNK, strip_role_junk  # same
+# occasional role-marker hallucination the fast brain strips (see
+# llm_client) — the slow brain's answer is spoken too, so it needs the
+# same guard (lead + mid-answer standalone marker lines)
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,7 @@ class SlowBrain:
                 return None
 
             if not tool_calls:
-                result = _LEAD_ROLE_JUNK.sub("", speech).strip()
+                result = strip_role_junk(_LEAD_ROLE_JUNK.sub("", speech)).strip()
                 if not result:
                     result = "抱歉，这个任务我没能完成。"
                 logger.info("[slowbrain %s] completed in %.1fs (%d rounds): %s",

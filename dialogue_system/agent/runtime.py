@@ -101,6 +101,12 @@ FAST_TOOLS = [
 # appended to the persona system prompt when the agent is enabled
 AGENT_SYSTEM_ADDON = (
     "你有一个后台任务助手（慢脑），可以把复杂任务委派给它后台执行：\n"
+    "- 【实时性问题必须委派，严禁凭记忆作答】以下几类问题你的内在知识必然过时，"
+    "无论你多确定都必须调用 delegate_task 委派查询，绝不能直接回答："
+    "今天几号/星期几/现在几点、天气、股价/指数/汇率/油价/物价、新闻时事、"
+    "体育比赛结果，以及一切带“今天/现在/最新/最近/刚刚”字样的时效性问题。"
+    "拿不准算不算实时问题时一律委派——委派只慢几秒，凭记忆硬答会把过时的错误"
+    "数字直接说给用户听。\n"
     "- 需要联网搜索、查资料、查天气/新闻/价格、仔细计算或多步推理的请求，必须调用 "
     "delegate_task 委派，goal 里写全所有细节（自包含，后台看不到你们的对话）。\n"
     "- 【最重要】凡是你对用户说了“我去查/我查一下/稍等”这类话，同一次回复里必须已经"
@@ -305,6 +311,92 @@ class AgentRuntime:
         self.cancel()  # cancels all active tasks, emits task_update
         return (f"[系统提示：已根据用户的话自动取消后台任务 {ids}。"
                 "请用一两句话自然地向用户确认，不要编造其他结果。]")
+
+    # ------------------------------------------------------------------
+    # deterministic real-time-question detection
+    # ------------------------------------------------------------------
+    # Measured failure mode (2026-10-30 live session): asked "今天是几号",
+    # the fast brain answered a confident but WRONG date from parametric
+    # memory ("2024年10月12日") without ever calling delegate_task — the
+    # addon prompt alone doesn't reliably trigger the call. Same design as
+    # auto_cancel: the Runtime detects the pattern itself and injects a
+    # grounded note; the fast brain still makes the actual tool call.
+    # Time words alone are not enough ("今天心情不错" is small talk) — the
+    # pattern requires a realtime noun (weather/quotes/news/date...) near a
+    # time marker, or the noun on its own.
+    _REALTIME_RE = re.compile(
+        r"(今天|现在|目前|最新|最近|刚刚).{0,10}"
+        r"(几号|星期|礼拜|几点|天气|温度|气温|股价|指数|汇率|油价|金价|新闻|价格|行情)"
+        r"|(天气|预报|气温|股价|指数|汇率|油价|金价|新闻|时事|赛果|比分|几号|星期几|礼拜几|现在几点)"
+    )
+
+    def realtime_note(self, user_text):
+        """If the user asks a real-time question and nothing is running yet,
+        return a note telling the fast brain it MUST delegate this one."""
+        text = (user_text or "").strip()
+        if not text or not self._REALTIME_RE.search(text):
+            return None
+        with self.lock:
+            active = [t for t in self.tasks.values()
+                      if t.status in ("queued", "running")]
+        if active:
+            # already working on something — the mention-gated task view
+            # covers progress questions; don't force a second delegation
+            return None
+        return ("[系统提示：用户的问题涉及实时性信息（日期/天气/行情/新闻等），"
+                "你的内在知识必然过时。本次回复必须调用 delegate_task 委派后台查询，"
+                "结果交付之前不要向用户说出任何具体数字或事实，先简短说明你去查一下。]")
+
+    # ------------------------------------------------------------------
+    # deterministic delegate safety net (auto_delegate)
+    # ------------------------------------------------------------------
+    # Measured failure mode (2026-10-30 14:51, session ec822c0a): the user
+    # asked "再查查今天的天气", realtime_note injected the MUST-delegate
+    # instruction, and the fast brain STILL only said "好哒，我去看看今天
+    # 天气怎么样。" without ever calling delegate_task — no task existed,
+    # the panel stayed empty, and a minute later the model fabricated a
+    # weather answer from parametric memory. Third confirmation (after
+    # auto_cancel and the double-acceptance probe) that behavior
+    # constraints cannot live in the prompt alone. Mirror of auto_cancel:
+    # the Runtime creates the task AFTER generation when the spoken reply
+    # committed to checking but no delegate actually ran — the acceptance
+    # speech is already out, so the task makes it true instead of leaving
+    # it a lie. task_ids_before is the pre-generation task-id snapshot the
+    # caller takes, distinguishing "delegate ran this turn" from "task
+    # table unchanged".
+    _ACCEPT_RE = re.compile(
+        r"我去查|我去看看|我去问|这就去|马上(帮)?你?查|帮你查|帮你看看"
+        r"|正在查|稍后(告诉|汇报|给你)|等(一下|我)查"
+    )
+
+    def auto_delegate(self, user_text, reply_text, task_ids_before):
+        """If the fast brain's spoken reply committed to checking
+        ("我去查…") but no delegate_task ran this turn, create the task
+        now. Returns the new task id, or None."""
+        text = (user_text or "").strip()
+        reply = (reply_text or "").strip()
+        if not text or not reply:
+            return None
+        # a clarifying question ("你想查哪里的？") is a commitment to
+        # nothing — the model is waiting for the user, not checking
+        if "？" in reply or "?" in reply:
+            return None
+        if not self._ACCEPT_RE.search(reply):
+            return None
+        if not re.search(r"查|搜|帮我|算", text):
+            return None
+        with self.lock:
+            if set(self.tasks.keys()) != set(task_ids_before):
+                return None  # a delegate DID run this turn
+            active = [t for t in self.tasks.values()
+                      if t.status in ("queued", "running")]
+        if active:
+            return None
+        before = set(self.tasks.keys())
+        self.delegate(text, "")
+        with self.lock:
+            new = sorted(set(self.tasks.keys()) - before)
+        return new[-1] if new else None
 
     # ------------------------------------------------------------------
     # slow brain side

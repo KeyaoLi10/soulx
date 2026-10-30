@@ -1437,6 +1437,11 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
             # the slow brain ran — the user wants free chat on other
             # topics in the meantime, with progress synced only on request.
             auto_note = agent_runtime.auto_cancel(asr_text)
+            # real-time questions (date/weather/quotes/news...) get a
+            # MUST-delegate note — the addon prompt alone doesn't reliably
+            # trigger the call (measured: a confident wrong date answered
+            # from parametric memory)
+            realtime_note = agent_runtime.realtime_note(asr_text)
             extra_context = None
             if auto_note or _TASK_MENTION_RE.search(asr_text):
                 extra_context = agent_runtime.task_view()
@@ -1444,6 +1449,11 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
                 extra_context = (
                     (extra_context + "\n" + auto_note) if extra_context
                     else auto_note
+                )
+            if realtime_note:
+                extra_context = (
+                    (extra_context + "\n" + realtime_note) if extra_context
+                    else realtime_note
                 )
             llm_reply_gen = llm.generate_agent_with_history(
                 client_id,
@@ -1455,6 +1465,9 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
                 tools=FAST_TOOLS,
                 tool_handler=agent_runtime.handle_tool,
             )
+            # pre-generation task-table snapshot for the auto_delegate
+            # safety net below
+            task_ids_before = set(agent_runtime.tasks.keys())
         else:
             llm_reply_gen = llm.generate_with_history(
                 client_id,
@@ -1477,10 +1490,29 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
         with session.lock:
             session.gen_in_progress = True
         try:
-            _run_speech_pipeline(
+            fully_spoken = _run_speech_pipeline(
                 session, client_id, llm_reply_gen, current_stop_event,
                 tts_client, tts_options, grace_until=grace_until,
             )
+            # deterministic delegate safety net (runtime.auto_delegate):
+            # the fast brain said "我去查" in speech but never called
+            # delegate_task — measured 2026-10-30 14:51 (session
+            # ec822c0a) with the realtime MUST-delegate note injected and
+            # the call still missing; the model later fabricated the
+            # answer. Create the task now so the acceptance speech is
+            # true and the panel shows it.
+            if agent_runtime and fully_spoken:
+                reply_text = ""
+                with session.lock:
+                    reply_text = session.pending_message or ""
+                new_tid = agent_runtime.auto_delegate(
+                    asr_text, reply_text, task_ids_before)
+                if new_tid:
+                    logger.info(
+                        "[%s] auto-delegated %s: fast brain accepted in "
+                        "speech but never called delegate_task (%s)",
+                        client_id[:8], new_tid, asr_text[:60],
+                    )
         finally:
             with session.lock:
                 session.gen_in_progress = False
