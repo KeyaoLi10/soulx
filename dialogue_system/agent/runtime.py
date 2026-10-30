@@ -328,6 +328,7 @@ class AgentRuntime:
         r"(今天|现在|目前|最新|最近|刚刚).{0,10}"
         r"(几号|星期|礼拜|几点|天气|温度|气温|股价|指数|汇率|油价|金价|新闻|价格|行情)"
         r"|(天气|预报|气温|股价|指数|汇率|油价|金价|新闻|时事|赛果|比分|几号|星期几|礼拜几|现在几点)"
+        r"|(查|问)[^，。？！]{0,6}(今天|日期)"
     )
 
     def realtime_note(self, user_text):
@@ -368,6 +369,21 @@ class AgentRuntime:
         r"我去查|我去看看|我去问|这就去|马上(帮)?你?查|帮你查|帮你看看"
         r"|正在查|稍后(告诉|汇报|给你)|等(一下|我)查"
     )
+    # sentence-level question guard: the acceptance commitment must live
+    # in a NON-question sentence. Measured 2026-10-30 15:07 (session
+    # 164595f0): "好的，我先帮你查一下今天的信息～今天几号了？" — the
+    # model committed, then asked the user the date (nonsense, but the
+    # commitment stands); a whole-reply "？" guard let that case slip
+    # through the net. Conversely "我可以帮你查，你想查哪里的呀？" is one
+    # question sentence offering, not committing — still skipped.
+    _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?～\n])")
+
+    def _accepts_in_speech(self, reply):
+        non_q = "".join(
+            s for s in self._SENT_SPLIT_RE.split(reply)
+            if not s.rstrip().endswith(("？", "?"))
+        )
+        return bool(self._ACCEPT_RE.search(non_q))
 
     def auto_delegate(self, user_text, reply_text, task_ids_before):
         """If the fast brain's spoken reply committed to checking
@@ -377,11 +393,7 @@ class AgentRuntime:
         reply = (reply_text or "").strip()
         if not text or not reply:
             return None
-        # a clarifying question ("你想查哪里的？") is a commitment to
-        # nothing — the model is waiting for the user, not checking
-        if "？" in reply or "?" in reply:
-            return None
-        if not self._ACCEPT_RE.search(reply):
+        if not self._accepts_in_speech(reply):
             return None
         if not re.search(r"查|搜|帮我|算", text):
             return None
