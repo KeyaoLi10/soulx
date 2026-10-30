@@ -29,3 +29,7 @@ services/certs/
 # 本地杂项
 .DS_Store
 nohup.out
+
+# API keys (plain files, never commit)
+apikey.txt
+*tavily*
