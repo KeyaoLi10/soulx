@@ -1437,11 +1437,12 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
             # the slow brain ran — the user wants free chat on other
             # topics in the meantime, with progress synced only on request.
             auto_note = agent_runtime.auto_cancel(asr_text)
-            # real-time questions (date/weather/quotes/news...) get a
-            # MUST-delegate note — the addon prompt alone doesn't reliably
-            # trigger the call (measured: a confident wrong date answered
-            # from parametric memory)
-            realtime_note = agent_runtime.realtime_note(asr_text)
+            # NOTE: no realtime MUST-delegate note is injected anymore —
+            # an A/B against :6008 (2026-10-30, 5 trials/cell) showed any
+            # trailing user-role note REDUCES the fast brain's own tool
+            # trigger rate (4-5/5 without vs 0-4/5 with, three wordings).
+            # The addon's realtime hard rule + runtime.auto_delegate
+            # (post-turn safety net below) cover the failure mode instead.
             extra_context = None
             if auto_note or _TASK_MENTION_RE.search(asr_text):
                 extra_context = agent_runtime.task_view()
@@ -1449,11 +1450,6 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
                 extra_context = (
                     (extra_context + "\n" + auto_note) if extra_context
                     else auto_note
-                )
-            if realtime_note:
-                extra_context = (
-                    (extra_context + "\n" + realtime_note) if extra_context
-                    else realtime_note
                 )
             llm_reply_gen = llm.generate_agent_with_history(
                 client_id,

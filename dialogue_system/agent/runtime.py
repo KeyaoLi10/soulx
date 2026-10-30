@@ -313,48 +313,11 @@ class AgentRuntime:
                 "请用一两句话自然地向用户确认，不要编造其他结果。]")
 
     # ------------------------------------------------------------------
-    # deterministic real-time-question detection
-    # ------------------------------------------------------------------
-    # Measured failure mode (2026-10-30 live session): asked "今天是几号",
-    # the fast brain answered a confident but WRONG date from parametric
-    # memory ("2024年10月12日") without ever calling delegate_task — the
-    # addon prompt alone doesn't reliably trigger the call. Same design as
-    # auto_cancel: the Runtime detects the pattern itself and injects a
-    # grounded note; the fast brain still makes the actual tool call.
-    # Time words alone are not enough ("今天心情不错" is small talk) — the
-    # pattern requires a realtime noun (weather/quotes/news/date...) near a
-    # time marker, or the noun on its own.
-    _REALTIME_RE = re.compile(
-        r"(今天|现在|目前|最新|最近|刚刚).{0,10}"
-        r"(几号|星期|礼拜|几点|天气|温度|气温|股价|指数|汇率|油价|金价|新闻|价格|行情)"
-        r"|(天气|预报|气温|股价|指数|汇率|油价|金价|新闻|时事|赛果|比分|几号|星期几|礼拜几|现在几点)"
-        r"|(查|问)[^，。？！]{0,6}(今天|日期)"
-    )
-
-    def realtime_note(self, user_text):
-        """If the user asks a real-time question and nothing is running yet,
-        return a note telling the fast brain it MUST delegate this one."""
-        text = (user_text or "").strip()
-        if not text or not self._REALTIME_RE.search(text):
-            return None
-        with self.lock:
-            active = [t for t in self.tasks.values()
-                      if t.status in ("queued", "running")]
-        if active:
-            # already working on something — the mention-gated task view
-            # covers progress questions; don't force a second delegation
-            return None
-        return ("[系统提示：用户的问题涉及实时性信息（日期/天气/行情/新闻等），"
-                "你的内在知识必然过时。本次回复必须调用 delegate_task 委派后台查询，"
-                "结果交付之前不要向用户说出任何具体数字或事实，先简短说明你去查一下。]")
-
-    # ------------------------------------------------------------------
     # deterministic delegate safety net (auto_delegate)
     # ------------------------------------------------------------------
     # Measured failure mode (2026-10-30 14:51, session ec822c0a): the user
-    # asked "再查查今天的天气", realtime_note injected the MUST-delegate
-    # instruction, and the fast brain STILL only said "好哒，我去看看今天
-    # 天气怎么样。" without ever calling delegate_task — no task existed,
+    # asked "再查查今天的天气" and the fast brain only said "好哒，我去看看
+    # 今天天气怎么样。" without ever calling delegate_task — no task existed,
     # the panel stayed empty, and a minute later the model fabricated a
     # weather answer from parametric memory. Third confirmation (after
     # auto_cancel and the double-acceptance probe) that behavior
@@ -365,6 +328,14 @@ class AgentRuntime:
     # it a lie. task_ids_before is the pre-generation task-id snapshot the
     # caller takes, distinguishing "delegate ran this turn" from "task
     # table unchanged".
+    #
+    # NOTE: the former realtime_note pre-turn injection was REMOVED
+    # (2026-10-30 17:xx): an A/B against :6008 (5 trials per cell, full
+    # Elva persona + addon) showed the note REDUCES the fast brain's own
+    # trigger rate (prompt-only 4-5/5 vs note 0-4/5 across three wordings
+    # — the model verbally acknowledges the trailing note and stops after
+    # the acceptance speech). The addon's realtime hard rule keeps the
+    # direct-call rate high; auto_delegate catches the residual misses.
     _ACCEPT_RE = re.compile(
         r"我去查|我去看看|我去问|这就去|马上(帮)?你?查|帮你查|帮你看看"
         r"|正在查|稍后(告诉|汇报|给你)|等(一下|我)查"
