@@ -43,7 +43,13 @@ logger = logging.getLogger(__name__)
 
 SLOW_LLM_BASE = "http://127.0.0.1:6008"
 
-MAX_STEPS = 8                 # tool rounds before forcing a conclusion
+# Tool-round budget (2026-10-30, 用户要求"3 轮调用就一定要出结果"): the loop
+# runs MAX_STEPS rounds, the LAST of which has tools stripped and forces a
+# conclusion — so MAX_STEPS = 4 means 3 tool-calling rounds + 1 forced answer.
+# The old 8 was measured dragging simple lookups through speculative
+# fetch_page chains; 3 rounds is enough for search→read→calculate tasks, and
+# the in-band "已达上限" note makes the model wrap up with what it has.
+MAX_STEPS = 4
 TASK_TIMEOUT_S = 480          # hard wall-clock budget for one task
 MAX_CALLS_PER_ROUND = 4       # hard cap on tool calls in one generation
 STREAM_READ_TIMEOUT_S = 120   # no token for this long -> connection error
@@ -73,7 +79,8 @@ SLOW_SYSTEM_PROMPT = (
     "1. 每一步要么调用工具继续收集信息，要么直接给出最终答案，不要空转。"
     "思考务必精炼：每轮几十个字内做出决策，不要反复推演。"
     "一轮最多调用两三个工具，优先消化已有结果而不是不断抓取新网页。\n"
-    "2. 【最重要】查到的信息已经足够回答任务时，立即在下一轮给出最终答案，"
+    "2. 【最重要】你最多只有 3 轮工具调用机会，用完后必须基于已有信息给出最终答案——"
+    "查到的信息已经足够回答任务时，立即在下一轮给出最终答案，"
     "不要再调用工具、不要反复验证。对查天气、查事实这类任务，通常一次搜索的摘要就足够了。\n"
     "3. 最终答案将被转成语音播报给用户：使用与任务描述相同的语言；先给结论，再给关键事实、数据或依据；"
     "字数控制在两百字以内（除非任务明确要求更详细）；不要使用 markdown 格式、列表符号、标题或表情。\n"

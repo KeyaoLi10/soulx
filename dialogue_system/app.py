@@ -851,8 +851,22 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
                 reply_text = ""
                 with session.lock:
                     reply_text = session.pending_message or ""
+                # auto_delegate judges on the MERGED user utterance, not the
+                # turn's raw ASR fragment: a query arrives fragmented across
+                # turns ("帮我查一下。""…诺贝尔物理学奖得主是谁？""详细介绍
+                # 他们。"), and the keyword check on the last fragment alone
+                # misses queries whose 查/搜 landed earlier (measured
+                # 2026-10-30 e2e: acceptance spoken, no delegate_task, the
+                # backstop silently skipped on "详细介绍他们。"). llm_client's
+                # groupby has already merged the fragments into the last
+                # user history entry — and it makes a far better task goal.
+                user_text = asr_text
+                for m in reversed(llm.get_session(client_id)):
+                    if m.get("role") == "user":
+                        user_text = m.get("content") or asr_text
+                        break
                 new_tid = agent_runtime.auto_delegate(
-                    asr_text, reply_text, task_ids_before)
+                    user_text, reply_text, task_ids_before)
                 if new_tid:
                     logger.info(
                         "[%s] auto-delegated %s: fast brain accepted in "

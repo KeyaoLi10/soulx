@@ -11,6 +11,7 @@ privilege isolation — do not expose this system to untrusted users.
 """
 import html.parser
 import json
+import logging
 import os
 import re
 import subprocess
@@ -18,8 +19,11 @@ import sys
 import tempfile
 import time
 import datetime
+from pathlib import Path
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 # all outbound web traffic goes through the local mihomo proxy (same one the
 # workspace uses for HF); empty string disables proxying
@@ -33,6 +37,32 @@ SEARCH_TIMEOUT_S = 15
 FETCH_TIMEOUT_S = 10
 REPL_TIMEOUT_S = 20
 MAX_TOOL_OUTPUT_CHARS = 4000
+
+# Primary search: Tavily API (agent-oriented, no bot-gating, ~1-2s). The old
+# DDG-html + baidu stack stays as _fallback_search for when Tavily is
+# unavailable (no key / quota / network). Key resolution order: TAVILY_API_KEY
+# env, then the plain key file (workspace convention — never commit it).
+TAVILY_KEY_FILE = os.environ.get(
+    "TAVILY_KEY_FILE", "/home/research/krisl/soulx/apikey.txt"
+)
+TAVILY_TIMEOUT_S = 10
+# keep-alive session: saves the per-call TLS handshake through the proxy
+# (measured ~1s of the per-call latency). include_answer is deliberately
+# OFF — it adds ~3s per query and answers in English even for Chinese
+# queries; the result snippets are enough for the slow brain.
+_TAVILY_SESSION = requests.Session()
+if PROXIES:
+    _TAVILY_SESSION.proxies.update(PROXIES)
+
+
+def _tavily_key():
+    key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return Path(TAVILY_KEY_FILE).read_text().strip()
+    except OSError:
+        return ""
 
 
 def _clip(text, limit=MAX_TOOL_OUTPUT_CHARS):
@@ -180,12 +210,53 @@ def _format_rows(rows):
 
 
 def web_search(query, max_results=6):
-    """DDG html endpoint via POST (curl), baidu fallback.
+    """Tavily search API, with the legacy DDG/baidu stack as fallback.
 
-    Measured on this box: requests/urllib3 gets a bot-challenge page (HTTP
-    202, TLS-fingerprint level) while curl through the same proxy and UA
-    succeeds at the very same moment — so the search tool uses curl. The
-    DDG challenge still appears intermittently on the shared proxy exit IP
+    Tavily became the primary path 2026-10-30 ("工具调用总是很慢"): the
+    DDG-html endpoint intermittently bot-challenges the shared proxy exit
+    IP, and every challenged query burned a 5s retry plus the baidu detour
+    before any result came back. Tavily is an agent-oriented API (no
+    bot-gating) whose content snippets are usually enough for the slow
+    brain to answer without a follow-up fetch_page round.
+
+    Any Tavily failure — missing key, quota exhausted, network — falls
+    back to _fallback_search rather than dead-ending the task.
+    """
+    q = " ".join(str(query).split())
+    key = _tavily_key()
+    if key:
+        try:
+            r = _TAVILY_SESSION.post(
+                "https://api.tavily.com/search",
+                headers={"Authorization": f"Bearer {key}"},
+                json={"query": q, "max_results": max_results},
+                timeout=TAVILY_TIMEOUT_S,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            logger.info("tavily search failed (%s); falling back to ddg/baidu", e)
+        else:
+            rows = [
+                (x.get("title", ""), x.get("url", ""), x.get("content", ""))
+                for x in data.get("results", [])
+                if x.get("url")
+            ]
+            if rows:
+                return _format_rows(rows)
+            # Tavily came back empty — try the fallback before giving up
+            logger.info("tavily search returned no results; trying fallback")
+    return _fallback_search(q, max_results)
+
+
+def _fallback_search(query, max_results=6):
+    """Legacy search stack: DDG html endpoint via POST (curl), baidu fallback.
+
+    Kept as the fallback for when Tavily is unavailable. Measured on this
+    box: requests/urllib3 gets a bot-challenge page (HTTP 202,
+    TLS-fingerprint level) while curl through the same proxy and UA
+    succeeds at the very same moment — so this path uses curl. The DDG
+    challenge still appears intermittently on the shared proxy exit IP
     (typically after a burst of queries); on challenge (and during the DDG
     cooldown, and when DDG returns nothing) the query is retried on baidu
     before giving up."""
@@ -348,9 +419,9 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web (DuckDuckGo, automatic baidu fallback). "
-                "Returns numbered results with title, url and a short "
-                "snippet. Use for facts you are not sure about or that "
+                "Search the web (Tavily API, automatic fallback). Returns an "
+                "optional summary plus numbered results with title, url and a "
+                "short snippet. Use for facts you are not sure about or that "
                 "change over time."
             ),
             "parameters": {
