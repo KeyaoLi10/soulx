@@ -33,6 +33,11 @@ class TurnTaking:
         # Read by app.py at turn-launch time to decide whether the reply
         # needs a premature-turn grace window. Only written on "speak".
         self.last_turn_trigger = None
+        # Per-session wait-path override (chunks), pushed to the turn server
+        # as a config message after EVERY (re)connect: the server GCs idle
+        # sessions after 60s, so a one-shot push on set would silently
+        # expire. None = server/model default.
+        self.max_wait_num = None
 
     def _emit_status(self, state, message, force=False):
         if not self.status_callback:
@@ -76,6 +81,50 @@ class TurnTaking:
         # event loop forever inside create_connection.
         self.ws = websocket.create_connection(self.server_url, timeout=5.0)
         self.ws.settimeout(self.timeout)
+        # Re-push session config: the server may have GC'd this session
+        # (60s idle) since the last connection, dropping our override.
+        if self.max_wait_num is not None:
+            try:
+                self._send_config()
+            except Exception as exc:
+                # Non-fatal: worst case the server uses its default until
+                # the next successful push.
+                print(
+                    f"[VadClient] max_wait_num re-push failed "
+                    f"({type(exc).__name__}: {exc})",
+                    flush=True,
+                )
+
+    def _send_config(self):
+        # Unsolicited control message — the server never replies to it, so
+        # this must NOT go through process()'s send/recv pairing.
+        self.ws.send(
+            json.dumps(
+                {
+                    "type": "config",
+                    "session_id": self.client_id,
+                    "max_wait_num": self.max_wait_num,
+                }
+            )
+        )
+
+    def set_max_wait_num(self, n):
+        """Override wait-path silence confirmation (chunks). None = default.
+
+        Stores the value and pushes it to the turn server immediately (if
+        connected); connect() re-pushes after every reconnect so the
+        override survives server-side session GC.
+        """
+        self.max_wait_num = n
+        if self.ws is not None and n is not None:
+            try:
+                self._send_config()
+            except Exception as exc:
+                print(
+                    f"[VadClient] set_max_wait_num push failed "
+                    f"({type(exc).__name__}: {exc}); will re-push on next connect",
+                    flush=True,
+                )
 
     def reset(self, client_id=None):
         if self.ws:

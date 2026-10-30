@@ -213,8 +213,14 @@ class TurnModel:
 
         return False, None, None, None
 
-    def process(self, audio_chunk):
-        """Process audio chunk, return predict state."""
+    def process(self, audio_chunk, max_wait_num=None):
+        """Process audio chunk, return predict state.
+
+        max_wait_num: optional per-call override of the wait-path silence
+        confirmation length (chunks). None -> config default. The model is
+        shared across sessions, so this knob travels WITH the chunk instead
+        of living on the model instance.
+        """
         assert audio_chunk.dtype == np.float32
         # print(audio_chunk.shape)
         self.buffer = np.concatenate([self.buffer, audio_chunk])
@@ -230,12 +236,14 @@ class TurnModel:
 
         if start_prediction:
             t_start = time.time()
-            predicted_state = self.state_predict(process_chunk, audio_back, audio_ahead)
+            predicted_state = self.state_predict(
+                process_chunk, audio_back, audio_ahead, max_wait_num
+            )
             self._log(f"[Timing] Total chunk: {time.time() - t_start:.4f}s\n\n")
 
         return predicted_state
 
-    def state_predict(self, process_chunk, audio_back, audio_ahead):
+    def state_predict(self, process_chunk, audio_back, audio_ahead, max_wait_num=None):
         state, delta_text, asr_buffer = self.infer(
             process_chunk, audio_back, audio_ahead
         )
@@ -265,7 +273,8 @@ class TurnModel:
 
             if self.monitoring_wait_silence:
                 self.wait_idle_cnt += 1
-                if self.wait_idle_cnt >= self.config.infer_config["max_wait_num"]:
+                effective_wait = max_wait_num or self.config.infer_config["max_wait_num"]
+                if self.wait_idle_cnt >= effective_wait:
                     self._log("Continuous silence after wait, triggering reply")
                     if self.speech_detected:
                         segment = self.cascade_asr.recognize(

@@ -132,6 +132,17 @@ function scheduleReconnect() {
   }, delay);
 }
 
+// Skip the backoff wait and connect immediately (manual button, or the
+// network just came back — the pending timer, if any, is cancelled).
+function reconnectNow() {
+  if (socket && (socket.readyState === WebSocket.OPEN ||
+                 socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  connectSocket();
+}
+
 function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
@@ -163,6 +174,36 @@ function hideConnBanner() {
 }
 
 connectSocket();
+
+// Manual reconnect button on the connection banner.
+document.getElementById('reconnectNowBtn').addEventListener('click', reconnectNow);
+
+// Network-level events: when the OS reports the network is back, don't sit
+// out the remaining backoff — the socket is almost certainly dead and the
+// retry would succeed right away.
+window.addEventListener('online', () => {
+  console.log('[WebSocket] network online — attempting immediate reconnect');
+  reconnectNow();
+});
+window.addEventListener('offline', () => {
+  console.log('[WebSocket] network offline');
+  showConnBanner();
+  setConnState('offline', 'Offline');
+  // The socket won't notice the drop until a send fails; force the issue
+  // so reconnection starts (and completes) the moment we're back.
+  try { if (socket) socket.close(); } catch (e) { /* already closing */ }
+});
+// Returning to a backgrounded tab: timers were throttled, so the heartbeat
+// may not have fired for a long time — check staleness right away instead
+// of waiting for the next (throttled) tick.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && socket &&
+      socket.readyState === WebSocket.OPEN &&
+      Date.now() - lastServerMsgTime > HEARTBEAT_STALE_MS) {
+    console.warn('[WebSocket] stale after tab returned to foreground, forcing reconnect');
+    try { socket.close(); } catch (e) { /* already closing */ }
+  }
+});
 
 // Handle incoming messages
 function onSocketMessage(event) {
@@ -681,6 +722,10 @@ const settingsEls = {
   saved: document.getElementById('personaSaved'),
   ttsEngine: document.getElementById('ttsEngine'),
   turnEngine: document.getElementById('turnEngine'),
+  turnWaitMs: document.getElementById('turnWaitMs'),
+  turnWaitMsVal: document.getElementById('turnWaitMsVal'),
+  turnGraceMs: document.getElementById('turnGraceMs'),
+  turnGraceMsVal: document.getElementById('turnGraceMsVal'),
   ttsCfg: document.getElementById('ttsCfg'),
   ttsCfgVal: document.getElementById('ttsCfgVal'),
   ttsSteps: document.getElementById('ttsSteps'),
@@ -709,6 +754,8 @@ function currentSettings() {
     min_seg_len: parseInt(settingsEls.minSegLen.value, 10) || 10,
     tts_engine: settingsEls.ttsEngine.value,
     turn_engine: settingsEls.turnEngine.value,
+    turn_wait_ms: parseInt(settingsEls.turnWaitMs.value, 10) || 800,
+    turn_grace_ms: parseInt(settingsEls.turnGraceMs.value, 10) || 900,
     tts_cfg: parseFloat(settingsEls.ttsCfg.value) || 2.0,
     tts_timesteps: parseInt(settingsEls.ttsSteps.value, 10) || 10,
     pvad_mode: settingsEls.pvadMode.value,
@@ -760,6 +807,8 @@ function debouncedSend() {
     sendConfig({
       tts_engine: s.tts_engine,
       turn_engine: s.turn_engine,
+      turn_wait_ms: s.turn_wait_ms,
+      turn_grace_ms: s.turn_grace_ms,
       tts_cfg: s.tts_cfg,
       tts_timesteps: s.tts_timesteps,
       max_history: s.max_history,
@@ -771,8 +820,31 @@ function debouncedSend() {
   }, 400);
 }
 
+// The two turn-timing sliders only affect the SoulX engine — gray them out
+// while frc is selected (values still ride along in the payload, the server
+// ignores them in frc mode).
+function syncTurnTimingState() {
+  const frc = settingsEls.turnEngine.value === 'frc';
+  [settingsEls.turnWaitMs, settingsEls.turnGraceMs].forEach((el) => {
+    el.disabled = frc;
+    el.closest('.field').classList.toggle('frc-off', frc);
+  });
+}
+
 settingsEls.ttsEngine.addEventListener('change', debouncedSend);
-settingsEls.turnEngine.addEventListener('change', debouncedSend);
+settingsEls.turnEngine.addEventListener('change', () => {
+  syncTurnTimingState();
+  debouncedSend();
+});
+settingsEls.turnWaitMs.addEventListener('input', () => {
+  settingsEls.turnWaitMsVal.textContent = settingsEls.turnWaitMs.value + ' ms';
+  debouncedSend();
+});
+settingsEls.turnGraceMs.addEventListener('input', () => {
+  settingsEls.turnGraceMsVal.textContent = settingsEls.turnGraceMs.value + ' ms';
+  debouncedSend();
+});
+syncTurnTimingState();
 settingsEls.ttsCfg.addEventListener('input', () => {
   settingsEls.ttsCfgVal.textContent = parseFloat(settingsEls.ttsCfg.value).toFixed(1);
   debouncedSend();

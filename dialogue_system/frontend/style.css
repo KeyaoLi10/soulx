@@ -576,6 +576,19 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* turn-timing sliders gray out while the frc engine is selected (they only
+   affect the SoulX path) */
+.field input[type="range"]:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.field input[type="range"]:disabled ~ .block-hint {
+  opacity: 0.5;
+}
+.field.frc-off {
+  opacity: 0.55;
+}
+
 .input {
   border: 1px solid var(--border-strong);
   border-radius: 8px;
@@ -721,7 +734,23 @@ input[type="range"] {
   font-size: 14px;
   font-weight: 500;
   box-shadow: 0 0 24px var(--red-glow);
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
+
+.conn-banner button {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.conn-banner button:hover { background: rgba(255, 255, 255, 0.24); }
 
 .conn-banner.hidden { display: none; }
 

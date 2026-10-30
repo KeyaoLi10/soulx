@@ -355,6 +355,17 @@ DEFAULT_SETTINGS = {
     # services are shared, the FRC-only services (ultraVAD :8082,
     # FireRedASR :8010) must be running for "frc".
     "turn_engine": "soulx",
+    # Wait-path silence confirmation after an <|user_incomplete|>: how long
+    # the user must stay quiet before the reply fires. Live-tunable; shown
+    # as ms in the UI and pushed to the turn server as max_wait_num chunks
+    # of 160 ms (800 ms = 5 chunks, the config.yaml default).
+    "turn_wait_ms": 800,
+    # Complete-trigger hold window: after a (zero-confirmation) "complete"
+    # turn fires, LLM output is held invisible for this long; resumed
+    # speech inside the window silently discards the generation. 0 disables
+    # the window (pre-2026-10-30 behavior — not recommended, that was the
+    # barge-in bug).
+    "turn_grace_ms": 900,
 }
 
 print("System initialized: VAD Pool, LLM client, TTS clients ready.")
@@ -436,6 +447,8 @@ _PVAD_FORENSICS_MAX = 200 # gate-decision audio dumps per session (disk
 _PVAD_FORENSICS_CONTEXT_S = 6.0
                           # raw mic context dumped around a gate decision
 _BARGEIN_MIN_CHUNKS = 3   # consecutive nonidle chunks before a barge-in
+_CHUNK_MS = 160            # one upstream audio chunk (2560 samples @16k) —
+                          # converts turn_wait_ms to max_wait_num chunks
 # Premature-turn grace (2026-10-30 抢话修复): a "complete"-triggered turn
 # boundary fires the reply instantly with zero silence confirmation, so
 # mid-sentence pauses get misread as finished turns. The reply generation
@@ -445,6 +458,8 @@ _BARGEIN_MIN_CHUNKS = 3   # consecutive nonidle chunks before a barge-in
 # takes ~1s anyway, so the hold costs almost no perceived latency.
 # "wait"-triggered turns need no grace (already silence-verified by
 # max_wait_num idle chunks on the turn server).
+# Live-tunable per session since 2026-10-30 (settings turn_grace_ms); this
+# constant is only the fallback for sessions without the setting.
 _TURN_GRACE_S = 0.9
 # Mention gate for the Agent Runtime task view (2026-10-30 闲聊不汇报):
 # the fast brain only sees "当前后台任务：…" when the user's turn actually
@@ -1450,8 +1465,14 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
             )
 
         # 5. LLM & TTS Streaming (shared speech outlet)
+        # Grace window length is live-tunable (settings turn_grace_ms); the
+        # module constant is only the fallback. 0 disables the window.
+        grace_s = (
+            settings.get("turn_grace_ms", int(_TURN_GRACE_S * 1000)) / 1000.0
+        )
         grace_until = (
-            time.time() + _TURN_GRACE_S if turn_trigger == "complete" else None
+            time.time() + grace_s if turn_trigger == "complete" and grace_s > 0
+            else None
         )
         with session.lock:
             session.gen_in_progress = True
@@ -1480,6 +1501,10 @@ _SETTING_RULES = {
     "tts_cfg": (float, 0.5, 5.0),
     "system_prompt": (str, 0, 4000),
     "pvad_threshold": (float, 0.3, 0.9),
+    # turn timing: wait confirmation 1-20 chunks; grace window 0-3 s
+    # (0 = disabled)
+    "turn_wait_ms": (int, 160, 3200),
+    "turn_grace_ms": (int, 0, 3000),
 }
 _TTS_ENGINES = ("voxcpm", "firered")
 _PVAD_MODES = ("off", "shadow", "enforce")
@@ -1521,12 +1546,44 @@ def _merge_session_settings(session, data: dict) -> dict:
             # utterance so a stale pending commit can't fire later
             if session.frc is not None:
                 session.frc.reset()
+            # switching back to soulx: re-apply the wait override — it was
+            # skipped while in frc mode, and the server session may have
+            # been GC'd during the detour (recreated from session_config,
+            # but only if a push ever happened)
+            if engine == "soulx":
+                _push_turn_wait_num(session)
         session.settings["turn_engine"] = engine
 
     if "agent_enabled" in data:
         session.settings["agent_enabled"] = bool(data["agent_enabled"])
 
+    if "turn_wait_ms" in data:
+        _push_turn_wait_num(session)
+
     return dict(session.settings)
+
+
+def _push_turn_wait_num(session):
+    """Push the session's turn_wait_ms to the turn server as max_wait_num.
+
+    Call after the setting changes and once at session init. Skipped in frc
+    mode (the SoulX turn server sees no audio then — harmless either way,
+    but the push would race the engine switch for nothing). The turn server
+    keeps the override in a GC-surviving store, so it survives frc detours
+    and reconnects.
+    """
+    if session.settings.get("turn_engine") == "frc":
+        return
+    wait_ms = session.settings.get("turn_wait_ms")
+    if wait_ms is None:
+        return
+    n = int(wait_ms) // _CHUNK_MS
+    if n < 1:
+        n = 1
+    try:
+        session.vad.set_max_wait_num(n)
+    except Exception as exc:
+        logger.warning(f"set_max_wait_num({n}) failed for session: {exc}")
 
 
 @app.websocket("/ws")
@@ -1561,6 +1618,12 @@ async def websocket_endpoint(websocket: WebSocket):
         )
 
         session = session_manager.create_session(client_id, vad_instance, websocket)
+
+        # announce the wait-path override to the turn server now — the
+        # server session is created on first audio, and the override store
+        # must be populated before that (also survives server restarts via
+        # the client's per-reconnect re-push)
+        _push_turn_wait_num(session)
 
         # Rebind the circle callback now that the session exists: while the
         # assistant's buffered audio is still playing, a nonidle blip's

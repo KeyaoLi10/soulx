@@ -23,6 +23,13 @@ GC_INTERVAL_SEC = 10  # Session GC interval
 
 # Global state
 sessions: Dict[str, TurnSession] = {}
+# Config overrides (e.g. max_wait_num) keyed by session_id. Kept SEPARATE
+# from sessions: a session idle >SESSION_TTL_SEC is GC'd, but the client
+# keeps its WS connection (e.g. the web app ran in frc mode for a while,
+# where no audio reaches this server) — a per-session-only override would
+# be silently lost when the session is recreated from later audio. Entries
+# expire only once their session is gone AND the client stopped pushing.
+session_config: Dict[str, dict] = {}
 
 
 # FastAPI Lifecycle
@@ -58,6 +65,17 @@ async def session_gc_loop():
             print(f"[TurnTaking] GC session {sid}")
             del sessions[sid]
 
+        # config overrides outlive their session (see session_config note),
+        # but not forever: drop them once the session is gone and the
+        # client hasn't re-pushed within the same TTL.
+        stale_cfg = [
+            sid
+            for sid, cfg in session_config.items()
+            if sid not in sessions and now - cfg["ts"] > SESSION_TTL_SEC
+        ]
+        for sid in stale_cfg:
+            del session_config[sid]
+
         await asyncio.sleep(GC_INTERVAL_SEC)
 
 
@@ -72,6 +90,37 @@ async def turn_ws(ws: WebSocket):
             data = json.loads(raw)
 
             if data.get("type") != "audio":
+                # {"type":"config","session_id":...,"max_wait_num":N}
+                # — unsolicited control message, NO reply is sent (the
+                # client's recv loop expects exactly one response per audio
+                # chunk and never reads for control messages).
+                if data.get("type") == "config" and "session_id" in data:
+                    session_id = data["session_id"]
+                    if session_id not in sessions:
+                        engine = TurnTakingEngine(model=ws.app.state.model)
+                        sessions[session_id] = TurnSession(engine)
+                        print(f"[TurnTaking] new session {session_id} (config)")
+                    session = sessions[session_id]
+                    session.touch()
+                    if "max_wait_num" in data:
+                        try:
+                            n = int(data["max_wait_num"])
+                        except (TypeError, ValueError):
+                            n = None
+                        # clamp: 1..50 chunks (160ms each) — 0 would fire
+                        # "wait" on the first idle chunk, >50 is unusable
+                        n = n if n is not None and 1 <= n <= 50 else None
+                        session.set_max_wait_num(n)
+                        # persist beyond session GC (see session_config note)
+                        session_config[session_id] = {
+                            "max_wait_num": n,
+                            "ts": time.time(),
+                        }
+                        print(
+                            f"[TurnTaking] session {session_id} "
+                            f"max_wait_num -> {n if n is not None else 'default'}",
+                            flush=True,
+                        )
                 continue
 
             session_id = data["session_id"]
@@ -80,6 +129,11 @@ async def turn_ws(ws: WebSocket):
                 engine = TurnTakingEngine(model=ws.app.state.model)
                 sessions[session_id] = TurnSession(engine)
                 print(f"[TurnTaking] new session {session_id}")
+                # re-apply any surviving config override (session was GC'd
+                # and is being recreated from fresh audio)
+                cfg = session_config.get(session_id)
+                if cfg is not None and cfg.get("max_wait_num") is not None:
+                    sessions[session_id].set_max_wait_num(cfg["max_wait_num"])
 
             session = sessions[session_id]
             session.touch()  # Update timestamp

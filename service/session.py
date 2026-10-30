@@ -28,6 +28,16 @@ class TurnSession:
         self.last_state = result["state"]
         return result
 
+    def set_max_wait_num(self, n):
+        """Override the wait-path silence confirmation length (chunks).
+
+        n: positive int, or None to fall back to the model config default.
+        Takes effect on the very next fed chunk — no state reset, mid-turn
+        changes only affect silence counted from then on (wait_idle_cnt is
+        runtime state and is untouched here).
+        """
+        self.engine.max_wait_num = n
+
         # # Report only when state changes
         # if result["state"] != self.last_state:
         #     self.last_state = result["state"]

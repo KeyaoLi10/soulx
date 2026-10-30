@@ -10,7 +10,10 @@
 </head>
 
 <body>
-  <div id="connBanner" class="conn-banner hidden">Connection lost — reconnecting…</div>
+  <div id="connBanner" class="conn-banner hidden">
+    <span>Connection lost — reconnecting…</span>
+    <button id="reconnectNowBtn" type="button">Reconnect now</button>
+  </div>
 
   <div id="loadingOverlay" class="loading-overlay">
     <div class="loading-card">
@@ -120,6 +123,16 @@
             <option value="frc">FireRedChat (dual EOT)</option>
           </select>
           <span class="block-hint">Turn-taking architecture: SoulX semantic turn server, or the FireRedChat pipeline (pVAD endpointing + ultraVAD/Qwen dual end-of-turn). LLM and voice are the same either way.</span>
+        </div>
+        <div class="field">
+          <label for="turnWaitMs">Wait-path silence <span id="turnWaitMsVal" class="val">800 ms</span></label>
+          <input id="turnWaitMs" type="range" min="160" max="3200" step="160" value="800">
+          <span class="block-hint">After an unfinished sentence, how long you must stay quiet before the reply fires (SoulX engine only).</span>
+        </div>
+        <div class="field">
+          <label for="turnGraceMs">Complete-turn hold window <span id="turnGraceMsVal" class="val">900 ms</span></label>
+          <input id="turnGraceMs" type="range" min="0" max="3000" step="100" value="900">
+          <span class="block-hint">A predicted-complete turn holds the reply this long before speaking — resume speaking inside the window to cancel it. 0 disables (not recommended). SoulX engine only.</span>
         </div>
         <div class="field">
           <label for="ttsEngine">Engine</label>
