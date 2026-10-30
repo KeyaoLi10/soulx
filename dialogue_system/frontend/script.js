@@ -143,6 +143,20 @@ function reconnectNow() {
   connectSocket();
 }
 
+// The always-visible header button: unlike reconnectNow(), this works even
+// when a socket is still nominally OPEN (half-dead TCP, wedged session...).
+// The old socket's onclose is detached so it can't schedule a second
+// reconnect after we've already started the replacement connection.
+function manualReconnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (socket) {
+    socket.onclose = null;
+    socket.onerror = null;
+    try { socket.close(); } catch (e) { /* already dead */ }
+  }
+  connectSocket();
+}
+
 function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
@@ -177,6 +191,9 @@ connectSocket();
 
 // Manual reconnect button on the connection banner.
 document.getElementById('reconnectNowBtn').addEventListener('click', reconnectNow);
+
+// Always-visible reconnect button in the top bar.
+document.getElementById('reconnectBtn').addEventListener('click', manualReconnect);
 
 // Network-level events: when the OS reports the network is back, don't sit
 // out the remaining backoff — the socket is almost certainly dead and the

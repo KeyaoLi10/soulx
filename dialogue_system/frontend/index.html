@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
   <title>Voice Studio</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=20261030b">
 </head>
 
 <body>
@@ -39,6 +39,8 @@
         <span id="vadStatus" data-state="idle">Waiting for user speech</span>
       </div>
       <div id="connPill" class="conn-pill" data-state="connecting">Connecting…</div>
+      <button id="reconnectBtn" class="conn-reconnect" type="button"
+              title="Force a fresh connection to the server">Reconnect</button>
     </div>
   </header>
 
@@ -215,7 +217,7 @@
     </aside>
   </main>
 
-  <script src="script.js"></script>
+  <script src="script.js?v=20261030b"></script>
 </body>
 
 </html>

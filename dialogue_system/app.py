@@ -1914,6 +1914,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ==== Static Resource Routing ====
+# Browsers heuristic-cache index.html (StaticFiles sends only etag/last-modified),
+# so an updated frontend can stay invisible in an already-open tab. Always
+# revalidate the HTML shell; JS/CSS bust via the ?v= query in index.html.
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 
