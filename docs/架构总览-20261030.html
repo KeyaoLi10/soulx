@@ -149,7 +149,7 @@ footer { margin: 54px 0 38px; padding-top: 14px; border-top: 2px solid var(--ink
     <div class="layer">
       <div class="tag">应用层<span class="en">WEB APP :8090</span></div>
       <div class="body">
-        <div class="node core"><b>pipeline_worker · _run_speech_pipeline 统一语音出口</b><span>ASR → 主说话人门控（pvad，默认 off，fail-open）→ pending 提交 → 历史 → 生成 → TTS 流式推送；<b>complete 触发 0.9s 宽限保持窗</b>：生成进 held_chunks 对用户不可见，复语即静默丢弃整次（未说出不进历史），窗口过期 _flush_held() 逐段播出；播放期 barge-in 3 块迟滞、每 episode 单次打断</span></div>
+        <div class="node core"><b>pipeline_worker · _run_speech_pipeline 统一语音出口</b><span>ASR → 主说话人门控（pvad，默认 off，fail-open）→ pending 提交 → 历史 → 生成 → TTS 流式推送；<b>complete 触发宽限保持窗（turn_grace_ms，默认 0.9s 可调）</b>：生成进 held_chunks 对用户不可见，复语即静默丢弃整次（未说出不进历史），窗口过期 _flush_held() 逐段播出；播放期 barge-in 3 块迟滞、每 episode 单次打断</span></div>
         <div class="node"><b>AgentRuntime（确定性仲裁）</b><span>任务表 / 议程；交付时机 = 用户空闲 + 无播放 + 无生成的空档期，经同一语音出口以 user 角色系统提示注入；<b>auto_cancel</b> 改口正则先行取消；任务状态按提及注入（_TASK_MENTION_RE，闲聊不汇报）；工具轮次不进持久历史</span></div>
       </div>
     </div>
@@ -214,8 +214,8 @@ footer { margin: 54px 0 38px; padding-top: 14px; border-top: 2px solid var(--ink
   <div class="tbl-wrap"><table class="tbl">
     <tr><th>参数</th><th>值</th><th>位置</th></tr>
     <tr><td>上行 chunk / 下行音频</td><td class="mono">16 kHz float32 · 160 ms ｜ 24 kHz PCM</td><td class="mono">前端 ↔ web app</td></tr>
-    <tr><td>max_wait_num（wait 路径静音）</td><td class="mono">5 块 ≈ 0.8s</td><td class="mono">repo/config/config.yaml</td></tr>
-    <tr><td>_TURN_GRACE_S（complete 宽限）</td><td class="mono">0.9s</td><td class="mono">app.py</td></tr>
+    <tr><td>turn_wait_ms（wait 路径静音）</td><td class="mono">800 ms 默认 · 可调 160–3200</td><td class="mono">Settings → turn server max_wait_num</td></tr>
+    <tr><td>turn_grace_ms（complete 宽限）</td><td class="mono">900 ms 默认 · 可调 0–3000</td><td class="mono">Settings → app.py</td></tr>
     <tr><td>_BARGEIN_MIN_CHUNKS（抢话迟滞）</td><td class="mono">3 块 = 480ms</td><td class="mono">app.py</td></tr>
     <tr><td>FRC onset / EOS / 阈值 / 封顶</td><td class="mono">3 块 / 0.4s / 0.2 / EOS+6.0s</td><td class="mono">frc_engine.py</td></tr>
     <tr><td>FRC 前滚 / 话轮上限 / 音频环</td><td class="mono">2.5s / 60s / 20s</td><td class="mono">frc_engine.py</td></tr>

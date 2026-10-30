@@ -84,6 +84,12 @@ REF_WAV = os.environ.get("VOXCPM_REF_WAV", "").strip()
 ANCHOR_WAV = os.environ.get("VOXCPM_ANCHOR_WAV", f"{SOULX}/data/voxcpm_anchor.wav")
 VOICE_DESC = os.environ.get("VOXCPM_VOICE_DESC", "")  # zero-shot fallback only
 OUT_RATE = 24000  # web app / frontend contract — do not change unilaterally
+# Text normalization (2026-10-30): VoxCPM2's facade generate() has
+# normalize=True but the prompt-cache fast path we call does NOT normalize —
+# digits/symbols reached the acoustic model raw ("23.5度" read as digits,
+# "0.6B" mangled). We run the same TextNormalizer the facade uses, before
+# generation, for both the reference and zero-shot paths.
+TEXT_NORM = os.environ.get("VOXCPM_TEXT_NORM", "1").strip() != "0"
 
 # Fixed sentence used once to sample the anchor voice. Neutral, mid-pitch,
 # long enough (~4 s) for a clean ECAPA/VAE embedding of the timbre.
@@ -94,6 +100,60 @@ MODEL_SR = None   # native sample rate of the loaded model (VoxCPM2: 48000)
 PROMPT_CACHE = None  # reference-mode cache; None => zero-shot fallback
 LORA_LOADED = False
 GEN_LOCK = threading.Lock()  # serializes GPU generation; producer-only
+
+TEXT_NORMALIZER = None  # lazy singleton — loads WeTextProcessing (slow, ~10s)
+TN_LOCK = threading.Lock()
+
+
+def _get_normalizer():
+    """Lazy-init the TextNormalizer the facade's normalize=True path uses.
+
+    Imports are deferred: WeTextProcessing pulls in a pynini/OpenFst stack
+    (~10s) that we only pay on the first synthesized request (or never, if
+    the default text never contains digits/symbols and TEXT_NORM=0).
+    Init failures degrade to no-op (raw text) — TTS must not go down over
+    a normalization hiccup.
+    """
+    global TEXT_NORMALIZER
+    if TEXT_NORMALIZER is not None:
+        return TEXT_NORMALIZER
+    if not TEXT_NORM:
+        return None
+    with TN_LOCK:
+        if TEXT_NORMALIZER is None:
+            try:
+                from voxcpm.utils.text_normalize import TextNormalizer
+                t0 = time.time()
+                TEXT_NORMALIZER = TextNormalizer()
+                print(
+                    f"[voxcpm-tts] text normalization enabled "
+                    f"(WeTextProcessing loaded in {time.time()-t0:.1f}s)",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[voxcpm-tts] WARNING: TextNormalizer init failed "
+                    f"({type(exc).__name__}: {exc}) — synthesizing raw text",
+                    flush=True,
+                )
+    return TEXT_NORMALIZER
+
+
+def _normalize_text(text):
+    tn = _get_normalizer()
+    if tn is None:
+        return text
+    try:
+        return tn.normalize(text)
+    except Exception as exc:
+        # a malformed string must not kill the request — raw is degraded but
+        # speakable
+        print(
+            f"[voxcpm-tts] WARNING: normalize({text[:40]!r}) failed "
+            f"({type(exc).__name__}: {exc}) — using raw text",
+            flush=True,
+        )
+        return text
 
 _DONE = object()  # sentinel: producer finished (after error or normally)
 
@@ -253,6 +313,7 @@ def health():
         "model_sample_rate": MODEL_SR,
         "lora": LORA_LOADED,
         "anchored": PROMPT_CACHE is not None,
+        "text_norm": TEXT_NORM,
     }
 
 
@@ -272,6 +333,13 @@ def synthesize(req: SynthRequest):
 
     # parity with the facade's _generate text cleanup
     text = re.sub(r"\s+", " ", text.replace("\n", " "))
+
+    # text normalization (digits/symbols/units -> speakable words). The
+    # facade's generate(normalize=True) runs this exact class; the
+    # prompt-cache fast path has no such knob, so we do it ourselves —
+    # covers both reference mode and the zero-shot fallback below.
+    if TEXT_NORM:
+        text = _normalize_text(text)
 
     # queue carries raw pcm bytes, ("err", msg) tuples, or _DONE.
     # Unbounded on purpose: bounded by one short LLM segment (~few hundred

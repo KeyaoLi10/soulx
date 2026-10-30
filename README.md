@@ -188,8 +188,10 @@ soulx/
    助手气泡流式追加）、无外部 CDN 依赖、无品牌字样。
    Settings 面板（`update_config` WS 事件，实时生效）：LLM 人设/剧本
    prompt（含预设）、TTS 引擎按会话切换（voxcpm/firered）、VoxCPM2 音色参数
-   （cfg/quality steps/voice description）、记忆轮数、首音频分段长度。
-   详见 `docs/修改日志.md` 2026-10-28 条。
+   （cfg/quality steps）、记忆轮数、首音频分段长度、**轮次时序**（wait 路径
+   静音确认 160–3200ms / complete 宽限保持窗 0–3000ms，均以毫秒展示、
+   随滑杆实时下发；2026-10-30 新增）。
+   详见 `docs/修改日志.md` 2026-10-28 / 2026-10-30 条。
 5. **主说话人门控 + 浏览器回声消除（2026-10-29）**：接入 FireRedChat 的
    fireredchat-pvad 模块（ONNX 个性化 VAD + ECAPA 说话人嵌入），作为
    `services/pvad_server.py`（:8086，CPU，运行于 full_duplex/venv-frc ——

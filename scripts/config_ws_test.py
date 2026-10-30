@@ -13,6 +13,7 @@ socket timeout corrupts websocket-client's frame state — don't do that.
 Usage: venv/bin/python -I scripts/config_ws_test.py
 """
 import json
+import subprocess
 import threading
 import time
 import wave
@@ -112,14 +113,43 @@ s = send_update(ws, {
     "tts_engine": "voxcpm",
     "tts_cfg": 3.5,
     "tts_timesteps": 20,
+    "turn_wait_ms": 1600,
+    "turn_grace_ms": 1500,
 })
 check("config_applied persona", s.get("system_prompt") == "You are a pirate captain. Answer in one short sentence.")
 check("config_applied max_history=12", s.get("max_history") == 12)
 check("config_applied min_seg_len=6", s.get("min_seg_len") == 6)
 check("config_applied cfg=3.5", s.get("tts_cfg") == 3.5)
 check("config_applied steps=20", s.get("tts_timesteps") == 20)
+check("config_applied turn_wait_ms=1600", s.get("turn_wait_ms") == 1600)
+check("config_applied turn_grace_ms=1500", s.get("turn_grace_ms") == 1500)
 check("removed key tts_voice_desc ignored", "tts_voice_desc" not in s)
 check("config_applied engine", s.get("tts_engine") == "voxcpm")
+
+# turn_wait_ms=1600 must reach the turn server as max_wait_num=10 chunks.
+# The web app pushes it via the config message, BUT the pooled TurnTaking
+# client only opens its turn-server socket on the first process() call —
+# before any audio, set_max_wait_num() just stores the value. So: feed a
+# second of audio to trigger the connect (connect() re-pushes the stored
+# override), then check the turn server log.
+ws.send(json.dumps({"event": "config_audio", "data": {"sample_rate": SR}}))
+time.sleep(0.3)
+for i in range(0, SR, CHUNK):  # 1s of speech
+    payload = (np.clip(WAV[i:i + CHUNK], -1, 1) * 32767).astype("<i2").tobytes()
+    try:
+        ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
+    except Exception as e:
+        log("FAIL", f"send broke: {e}")
+        break
+    time.sleep(0.16)
+time.sleep(1.0)
+log_tail = subprocess.run(
+    ["grep", "max_wait_num", "/home/research/krisl/soulx/logs/turn.log"],
+    capture_output=True, text=True,
+).stdout
+check("turn server got max_wait_num=10",
+      "max_wait_num -> 10" in log_tail,
+      f"(grep: {log_tail[-200:]!r})")
 
 # --- 2. hostile update: clamp + ignore bad types ---
 s2 = send_update(ws, {
@@ -129,6 +159,8 @@ s2 = send_update(ws, {
     "tts_timesteps": 1e9,        # clamp to 40
     "system_prompt": 12345,      # wrong type, ignored
     "tts_engine": "voiceclone",  # invalid, ignored
+    "turn_wait_ms": 99999,       # clamp to 3200
+    "turn_grace_ms": -100,       # clamp to 0 (window disabled)
     "evil_key": "x",             # unknown, ignored
 })
 check("clamp max_history=20", s2.get("max_history") == 20)
@@ -137,7 +169,13 @@ check("bad cfg ignored (3.5)", s2.get("tts_cfg") == 3.5)
 check("clamp timesteps=40", s2.get("tts_timesteps") == 40)
 check("bad persona ignored", s2.get("system_prompt") == "You are a pirate captain. Answer in one short sentence.")
 check("bad engine ignored", s2.get("tts_engine") == "voxcpm")
+check("clamp turn_wait_ms=3200", s2.get("turn_wait_ms") == 3200)
+check("clamp turn_grace_ms=0", s2.get("turn_grace_ms") == 0)
 check("unknown key ignored", "evil_key" not in s2)
+
+# --- 2b. restore sane timing before the live round (1600ms wait would
+# slow the wait-path trigger; grace 0 would disable the hold window) ---
+send_update(ws, {"turn_wait_ms": 800, "turn_grace_ms": 900})
 
 # --- 3. one real round with the custom persona/params ---
 with events_lock:
