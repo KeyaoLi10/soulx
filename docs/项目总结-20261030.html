@@ -1,0 +1,322 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SoulX-Duplug 项目总结</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;900&family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout concept: 单栏编辑部式报告，72ch 正文 + 指标条 + 双栏时间线；
+   色彩取自产品本身的"录音室控制台"身份：纸白偏青的底、墨青正文、霓虹青点睛。 */
+:root {
+  --paper: #f6f8f8;
+  --card: #ffffff;
+  --ink: #1b2427;
+  --muted: #5c6d72;
+  --accent: #0e7490;
+  --accent-deep: #0a556b;
+  --warn: #a85b08;
+  --line: #d7dee0;
+  --code-bg: #edf2f3;
+  --ok: #1a7f4f;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #10181b;
+    --card: #172226;
+    --ink: #dee7e9;
+    --muted: #8ba1a7;
+    --accent: #3fbbda;
+    --accent-deep: #6fd0e7;
+    --warn: #e2a95e;
+    --line: #28363c;
+    --code-bg: #0c1417;
+    --ok: #4cc38a;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #10181b;
+  --card: #172226;
+  --ink: #dee7e9;
+  --muted: #8ba1a7;
+  --accent: #3fbbda;
+  --accent-deep: #6fd0e7;
+  --warn: #e2a95e;
+  --line: #28363c;
+  --code-bg: #0c1417;
+  --ok: #4cc38a;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 15.5px/1.8 "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  padding: 0 20px;
+}
+.wrap { max-width: 880px; margin: 0 auto; }
+h1, h2, h3 { font-family: "Noto Serif SC", "Songti SC", serif; text-wrap: balance; }
+h1 { font-size: 34px; font-weight: 900; line-height: 1.3; margin: 0 0 6px; }
+h2 { font-size: 21px; font-weight: 900; margin: 0 0 14px; }
+h3 { font-size: 16.5px; font-weight: 600; margin: 0 0 6px; font-family: "Noto Sans SC", sans-serif; }
+p { margin: 0 0 10px; }
+code, .mono { font-family: "JetBrains Mono", "Noto Sans SC", monospace; font-variant-numeric: tabular-nums; }
+
+/* masthead */
+header { padding: 44px 0 0; }
+.eyebrow {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 10px;
+}
+.statusline { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 14px 0 0; font-size: 13.5px; color: var(--muted); }
+.badge {
+  display: inline-block; padding: 1px 10px; border-radius: 999px;
+  border: 1px solid var(--ok); color: var(--ok); font-size: 12.5px; font-weight: 500;
+}
+#wave { display: block; width: 100%; height: 44px; margin: 18px 0 0; }
+.lede { font-size: 17px; color: var(--ink); max-width: 42em; margin: 20px 0 0; }
+
+/* metrics */
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 30px 0 0; }
+.metric { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px 12px; }
+.metric .v { font-family: "JetBrains Mono", monospace; font-size: 25px; font-weight: 600; color: var(--accent-deep); line-height: 1.15; font-variant-numeric: tabular-nums; }
+.metric .v small { font-size: 14px; font-weight: 400; color: var(--muted); }
+.metric .k { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+
+/* sections */
+section { margin-top: 52px; }
+.sechead { display: flex; align-items: baseline; gap: 12px; border-bottom: 2px solid var(--ink); padding-bottom: 8px; margin-bottom: 18px; }
+.sechead .no { font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--accent); }
+
+/* architecture diagram */
+.arch { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px 18px 14px; overflow-x: auto; }
+.arch .row { display: grid; gap: 12px; }
+.arch .engines { grid-template-columns: 1fr 1fr; }
+.node { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--paper); }
+.node b { display: block; font-size: 14px; margin-bottom: 2px; }
+.node span { font-size: 12.5px; color: var(--muted); line-height: 1.65; display: block; }
+.node.core { border-color: var(--accent); border-width: 1.5px; }
+.arrow { text-align: center; color: var(--muted); font-size: 15px; line-height: 1.2; padding: 2px 0; }
+.port { font-family: "JetBrains Mono", monospace; font-size: 11.5px; color: var(--accent); }
+
+/* code evidence */
+pre {
+  background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px; overflow-x: auto; margin: 10px 0;
+  font-family: "JetBrains Mono", monospace; font-size: 12.5px; line-height: 1.75;
+}
+pre .c { color: var(--muted); }
+pre .g { color: var(--ok); }
+pre .w { color: var(--warn); }
+
+/* cards */
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+.card p { font-size: 14px; color: var(--ink); }
+.card .tag { font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .1em; color: var(--accent); text-transform: uppercase; }
+
+/* timeline */
+.timeline { border-left: 2px solid var(--line); margin-left: 6px; padding-left: 22px; display: grid; gap: 18px; }
+.tl-item { position: relative; }
+.tl-item::before {
+  content: ""; position: absolute; left: -28px; top: 7px;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--paper); border: 2px solid var(--accent);
+}
+.tl-item .d { font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--accent); }
+.tl-item h3 { margin-top: 1px; }
+.tl-item p { font-size: 14px; color: var(--muted); margin: 0; max-width: 46em; }
+
+/* tables */
+.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; background: var(--card); }
+.tbl-wrap { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; overflow-x: auto; }
+.tbl th, .tbl td { padding: 9px 14px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tbl th { font-size: 12.5px; color: var(--muted); font-weight: 500; background: var(--paper); white-space: nowrap; }
+.tbl tr:last-child td { border-bottom: none; }
+.tbl .mono { font-size: 12.5px; }
+.pill { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--ok); color: var(--ok); white-space: nowrap; }
+
+/* lessons */
+.lesson { display: grid; grid-template-columns: 40px 1fr; gap: 14px; padding: 13px 0; border-bottom: 1px dashed var(--line); }
+.lesson:last-child { border-bottom: none; }
+.lesson .n { font-family: "JetBrains Mono", monospace; font-weight: 600; color: var(--warn); font-size: 15px; }
+.lesson p { margin: 0; font-size: 14.5px; }
+.lesson b { color: var(--ink); }
+
+footer { margin: 56px 0 40px; padding-top: 16px; border-top: 2px solid var(--ink); font-size: 12.5px; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+
+@media (max-width: 640px) {
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+  .cards { grid-template-columns: 1fr; }
+  .arch .engines { grid-template-columns: 1fr; }
+  h1 { font-size: 27px; }
+}
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">SoulX-Duplug · 全双工语音对话 Agent</div>
+  <h1>五天，从开源轮次底座到可演示的语音 Agent 系统</h1>
+  <canvas id="wave" aria-hidden="true"></canvas>
+  <div class="statusline">
+    <span class="badge">全量回归通过 · 10 服务在线</span>
+    <span>汇报日期 2026-10-30</span>
+    <span>分支 dev · <span class="mono">7a4e28c / a0b30a4</span></span>
+  </div>
+  <p class="lede">在 SoulX-Duplug 0.6B 流式语义 VAD 的开源级联底座上，落地了一套听得懂轮次、有快慢两个大脑、能后台干活、可在两种前端引擎间热切换的中文全双工语音对话系统。LLM 与 TTS 因本机资源替换为 Qwen3.5-9B 与 VoxCPM2（自训 LoRA）。</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="v">11<small>/11</small></div><div class="k">全链路 E2E：委派→闲聊不打扰→改口取消</div></div>
+  <div class="metric"><div class="v">7<small>/7</small></div><div class="k">FRC 引擎 E2E：1.2s 句中停顿零切分</div></div>
+  <div class="metric"><div class="v">24<small>/24</small></div><div class="k">agent_smoke 回归（Runtime·工具·慢脑）</div></div>
+  <div class="metric"><div class="v">6–9<small>s</small></div><div class="k">后台任务延迟（天气类，原 15–25s）</div></div>
+  <div class="metric"><div class="v">80<small>ms</small></div><div class="k">TTS 首块延迟 · RTF 0.32</div></div>
+  <div class="metric"><div class="v">0.65<small>–0.75</small></div><div class="k">跨段音色一致性（ECAPA，原最低 0.22）</div></div>
+</div>
+
+<section>
+  <div class="sechead"><span class="no">01</span><h2>系统架构</h2></div>
+  <div class="arch">
+    <div class="node"><b>用户音频 <span class="port">16 kHz · 160 ms/chunk</span></b><span>麦克风经浏览器 WebRTC 回声消除上行</span></div>
+    <div class="arrow">↓</div>
+    <div class="row engines">
+      <div class="node"><b>SoulX 引擎（默认）<span class="port">:8000 · GPU5</span></b><span>SoulX-Duplug-0.6B 状态机 idle / nonidle / speak + paraformer 转写；话轮触发分 <b>complete</b>（立即）/ <b>wait</b>（5 块静音确认）两路</span></div>
+      <div class="node"><b>FRC 引擎（可热切换）<span class="port">:8086/:8082/:8010</span></b><span>pvad 通用 VAD 端点检测 → ultraVAD × Qwen 语义双通道 EOT，min 融合 ≥0.2 快速提交 → FireRedASR 整句转写</span></div>
+    </div>
+    <div class="arrow">↓</div>
+    <div class="node core"><b>Web app <span class="port">:8090</span> · pipeline_worker</b><span>话轮门控 → 历史 → 生成 → TTS → 推送。complete 触发话轮经 0.9s 宽限保持窗（抢话修复）；快脑 <span class="port">:6007</span> thinking=off，原生 tool calling 委派后台；AgentRuntime 确定性仲裁任务表 / 议程 / 空档期交付</span></div>
+    <div class="arrow">↓</div>
+    <div class="row engines">
+      <div class="node"><b>快脑 <span class="port">:6007 · GPU6</span></b><span>Qwen3.5-9B，/agent_chat 三通道流 + delegate_task / cancel_task</span></div>
+      <div class="node"><b>慢脑 <span class="port">:6008 · GPU1</span></b><span>Qwen3.5-9B 后台 agent 循环：web_search（DDG→百度回落）/ fetch_page / python_repl / 时间</span></div>
+    </div>
+    <div class="arrow">↓</div>
+    <div class="node"><b>VoxCPM2 TTS <span class="port">:8085 · GPU7</span></b><span>自训 LoRA（r=32）+ 参考音色锚定 → 24 kHz PCM，FireRedTTS :8081 作回退</span></div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">02</span><h2>核心技术点</h2></div>
+  <div class="cards">
+    <div class="card">
+      <div class="tag">抢话修复 · 宽限保持窗</div>
+      <h3>complete 触发零确认是抢话根源</h3>
+      <p>「&lt;user_complete&gt;」一有预测立即接话；中文句中停顿被 0.6B 模型误判为说完。修复后 complete 话轮获得 0.9s 保持窗：LLM 照常流式生成但对用户不可见，窗口内持续复语即<b>静默丢弃整次生成</b>——未说出的回复不进历史，续说经 groupby 并成完整句。wait 触发（已静音确认）不设宽限。连带修复了 E2E 委派失败：其根因正是话轮碎片化截断残段污染历史，修复后 8/11 → 11/11。</p>
+    </div>
+    <div class="card">
+      <div class="tag">FRC 前端 · 双 EOT 融合</div>
+      <h3>语义判别力：整句 0.94，半句 0.018</h3>
+      <p>ultraVAD（20s 音频窗 + 助手文本）与 Qwen 首 token 概率打分（/v1/score，一次 prefill ≈60ms）并行判 EOT，min 融合双确认才快速提交，否则 hold 至 EOS+6s 封顶，复语即取消。决策代际计数防「复语 → 新 EOS → 旧请求晚到」竞态。实测日志：</p>
+      <pre><span class="c"># 整句</span>
+uv=0.908 llm=0.940 → <span class="g">fast-commit</span>
+<span class="c"># 「帮我查一下明天早上」1.2s 停顿</span>
+uv=0.088 llm=0.018 → <span class="w">hold</span>，复语取消
+<span class="c"># 后半句接上后整句提交</span>
+uv=0.545 llm=0.932 → <span class="g">fast-commit</span></pre>
+    </div>
+    <div class="card">
+      <div class="tag">快慢脑 · 确定性仲裁</div>
+      <h3>关键逻辑放 Runtime，不指望模型懂事</h3>
+      <p>交付时机 = 用户空闲 + 无播放 + 无生成的空档期，经与用户话轮完全相同的语音出口。<b>改口取消由 Runtime 确定性执行</b>（快脑实测会说「已取消」却不调工具）；任务状态按提及注入——慢脑运行期间闲聊不汇报，用户问到才同步进度。工具轮次不进持久历史。</p>
+    </div>
+    <div class="card">
+      <div class="tag">语音质量 · 音色一致</div>
+      <h3>zero-shot 每段一个随机音色 → 锚定克隆</h3>
+      <p>VoxCPM2 zero-shot 每次调用重新采样，段间 ECAPA 余弦最低 0.22；改为启动时锚定参考音色（prompt cache 一次全段复用）+ 自训 LoRA 后稳定在 0.65–0.75。首块 80ms、RTF 0.32，满足实时对话。</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">03</span><h2>五天开发时间线</h2></div>
+  <div class="timeline">
+    <div class="tl-item"><div class="d">10-26</div><h3>底座部署与首条链路打通</h3><p>模型下载（hf-mirror 分段并行）、turn server 上线、Qwen3.5-9B + FireRedTTS 替换原 LLM/TTS；修复 FireRedTTS SYNTH_LOCK 跨 yield 死锁（「几轮后沉默」）与浏览器 WS 断线无重连。</p></div>
+    <div class="tl-item"><div class="d">10-27</div><h3>TTS 换道 VoxCPM2 + 24 样本离线评测</h3><p>eot-bench/小宇宙输入 24 条离线推理全通过，首包延迟 1.1–3.6s；Web 服务迁 :8090，内网非安全上下文麦克风问题以浏览器 flag 解决。</p></div>
+    <div class="tl-item"><div class="d">10-28</div><h3>深色录音室控制台 UI + 实时设置</h3><p>全宽横向布局、声呐语音球、波形监视条；update_config WS 事件实时生效（人设 / TTS 参数 / 记忆轮数，含边界钳制）。</p></div>
+    <div class="tl-item"><div class="d">10-29</div><h3>快慢脑 Agent 架构 + 门控攻坚</h3><p>双循环 Agent（委派 / 空档期交付 / 确定性取消）；VoxCPM2 音色锚定 + 自训 LoRA；PVAD 主说话人门控全量实现并连续修复打断风暴、播放中沉默、注册库污染螺旋等七起故障。</p></div>
+    <div class="tl-item"><div class="d">10-30</div><h3>收敛与收官：抢话 / 提及注入 / FRC 模式</h3><p>PVAD 门控实测浏览器链路同人 ECAPA 仅 0.15–0.57 判定默认下线；工具调用提速（thinking=off + 搜索直连，15–25s → 6–9s）；当晚完成抢话宽限窗、任务状态按提及注入、FRC 双 EOT 前端模式三项，全量回归通过。</p></div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">04</span><h2>质量保障</h2></div>
+  <div class="tbl-wrap"><table class="tbl">
+    <tr><th>测试</th><th>覆盖</th><th>结果</th></tr>
+    <tr><td class="mono">agent_e2e_test</td><td>委派 → 后台 → 空档期交付；闲聊不打扰；改口取消</td><td><span class="pill">11/11</span></td></tr>
+    <tr><td class="mono">frc_mode_test</td><td>单话轮提交；1.2s 句中停顿不切分、不抢话</td><td><span class="pill">7/7</span></td></tr>
+    <tr><td class="mono">agent_smoke</td><td>Runtime 交付仲裁、四个工具、慢脑端到端</td><td><span class="pill">24/24</span></td></tr>
+    <tr><td class="mono">config_ws_test</td><td>设置面板边界值 + 真实话轮（宽限 flush 路径）</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td class="mono">blip_turn_test / bargein_storm_test</td><td>话轮误杀回归 / 回声风暴回归</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td class="mono">cancel_repro · ecapa_window_calib · voxcpm_consistency_test</td><td>行为探针与校准（设计依据留存）</td><td><span class="pill">通过</span></td></tr>
+  </table></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">05</span><h2>问题梳理与经验教训</h2></div>
+  <p style="color:var(--muted);font-size:14px;">五天累计 24 条故障修复记录（<span class="mono">docs/修改日志.md</span>，每条含根因 / 修改 / 验证 / 边界）。跨条目的共性教训：</p>
+  <div class="lesson"><div class="n">01</div><p><b>浏览器 WebRTC 链路系统性破坏声学判据。</b>干净音频标定的阈值（ECAPA 0.5、3 连续语音块）到线上全部失效——同人经 AEC 后余弦仅 0.15–0.57。声学方案必须在线上链路标定，且优先 fail-open；这正是 PVAD 门控最终默认下线的依据。</p></div>
+  <div class="lesson"><div class="n">02</div><p><b>跨服务异步结果必须带代际校验。</b>宽限窗与双 EOT 都被「旧请求晚到作用于新状态」击穿过；单调计数器比 bool 标志可靠。</p></div>
+  <div class="lesson"><div class="n">03</div><p><b>未说出口的话绝不能进历史。</b>截断残段与宽限窗内未播文本都会污染下一轮生成——两个独立 bug 同根源，前者直接导致委派失败。</p></div>
+  <div class="lesson"><div class="n">04</div><p><b>确定性逻辑放 Runtime，概率性逻辑放模型。</b>auto_cancel、交付仲裁、提及注入做成确定性的远比指望模型「懂事」可靠；提示词规则的服从率永远低于 100%。</p></div>
+  <div class="lesson"><div class="n">05</div><p><b>每次提速都要跑行为回归。</b>thinking=off 提速三倍但偶发跳过计算工具；思考模式 max_tokens 过低会产出空答案。</p></div>
+  <div class="lesson"><div class="n">06</div><p><b>回归套件是自动化开发唯一的审稿人。</b>收官夜两个 bug（宽限窗内短回复不播出、心算跳工具）都是回归测试抓到的，不是人工检视发现的。</p></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">06</span><h2>演示指引与后续方向</h2></div>
+  <div class="cards">
+    <div class="card">
+      <div class="tag">现场演示</div>
+      <h3>一切在跑，开箱即演</h3>
+      <p><span class="mono">tmux attach -t soulx</span> · 浏览器开 <span class="mono">:8090</span>。Settings → Turn Engine 即时切换 soulx / frc；说「帮我查一下……」委派后台、期间自由闲聊、说「算了」取消；全量回归约 15 分钟跑完六套。冷启动 <span class="mono">start_services.sh</span>（ultraVAD 加载约 4 分钟）。</p>
+    </div>
+    <div class="card">
+      <div class="tag">后续方向</div>
+      <h3>四个待办</h3>
+      <p>① 抢话的彻底解法在语义 EOT，评估 FRC 引擎为主力档的体验；② 幻听话轮判据（paraformer 在回声残留上的短碎片幻觉）仍缺，倾向 pvad 概率 + 音频取证；③ 「闲聊不汇报」的文本出口硬保证、FRC 模式换流式 ASR 补实时转写；④ 慢脑工具面扩展（日程 / 提醒 / 多任务并行）。</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <span>SoulX-Duplug 全双工语音对话系统 · 项目总结</span>
+  <span>详录：docs/修改日志.md（24 条）· docs/代码解读.md</span>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  var cv = document.getElementById("wave");
+  function draw() {
+    var dpr = window.devicePixelRatio || 1;
+    var w = cv.clientWidth, h = cv.clientHeight;
+    cv.width = w * dpr; cv.height = h * dpr;
+    var ctx = cv.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    var col = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
+    ctx.fillStyle = col;
+    // 确定性伪随机波形：一句用户语音的包络（起振-持续-收尾）
+    var bar = 3, gap = 3, i = 0;
+    for (var x = 0; x + bar <= w; x += bar + gap, i++) {
+      var t = i / 46;
+      var env = Math.min(1, t * 6) * Math.exp(-Math.max(0, t - 0.75) * 5);
+      var n = Math.sin(i * 12.9898) * 43758.5453;
+      n = n - Math.floor(n);
+      var bh = (0.18 + 0.82 * n) * env * (h - 6);
+      if (bh < 1) bh = 1;
+      ctx.globalAlpha = 0.28 + 0.6 * env;
+      ctx.fillRect(x, (h - bh) / 2, bar, bh);
+    }
+    ctx.globalAlpha = 1;
+  }
+  draw();
+  var r;
+  window.addEventListener("resize", function () { clearTimeout(r); r = setTimeout(draw, 150); });
+})();
+</script>
