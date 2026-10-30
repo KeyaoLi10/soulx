@@ -482,7 +482,7 @@ class FrcEngine:
 
     def _emit(self, event, data):
         try:
-            from app import emit_to_room
+            from emitter import emit_to_room
             emit_to_room(self.client_id, event, data)
         except Exception:
             pass

@@ -87,6 +87,26 @@ Visit http://localhost:8090 to chat with the full-duplex spoken dialogue system.
 
 You can also replace the LLM+TTS component with any other half-duplex spoken dialogue model according to your needs.
 
+## Code Layout
+
+The web app (`app.py`, run by `deploy.sh`) is the orchestrator; cohesive layers
+live in their own modules:
+
+| Module | Responsibility |
+|---|---|
+| `app.py` | FastAPI wiring, WebSocket endpoint, turn-controller receive loop, speech pipeline (`pipeline_worker` / `_run_speech_pipeline`), session lifecycle |
+| `settings.py` | `Config`, `DEFAULT_SETTINGS` (web UI panel defaults), `sanitize_updates()` validation |
+| `emitter.py` | `emit_to_room()` — thread-safe WebSocket push onto the main event loop |
+| `pvad_gate.py` | Main-speaker gate (ECAPA identity vs enrolled speaker) consulted at barge-in / turn completion |
+| `frc_engine.py` | Optional FireRedChat-architecture turn engine (`turn_engine=frc`) |
+| `agent/` | Fast/slow brain: `runtime.py` (AgentRuntime, delivery arbiter, auto-cancel/auto-delegate backstops), `slow_brain.py` (background agent loop), `tools.py` (web_search / fetch_page / python_repl / get_datetime) |
+| `clients/` | HTTP/WS clients for the LLM, TTS, turn server (VAD) and pvad sidecar services |
+| `frontend/` | Static web UI (no build step) |
+
+`emitter` and `pvad_gate` must not import `app` back (circular); app wires the
+two hooks they need (`emitter.set_session_lookup`, `pvad_gate.get_history`)
+right after creating its singletons.
+
 
 
 ## Acknowledgment
