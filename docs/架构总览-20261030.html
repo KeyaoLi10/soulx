@@ -1,0 +1,271 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SoulX-Duplug 系统架构</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;900&family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout concept: 架构参考页——竖向分层堆栈图为主轴，双引擎并列分叉，
+   令"层"本身成为视觉结构；沿用产品"录音室控制台"的墨青+霓虹青身份。 */
+:root {
+  --paper: #f6f8f8;
+  --card: #ffffff;
+  --ink: #1b2427;
+  --muted: #5c6d72;
+  --accent: #0e7490;
+  --accent-deep: #0a556b;
+  --accent-soft: #e3eff2;
+  --warn: #a85b08;
+  --line: #d7dee0;
+  --code-bg: #edf2f3;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #10181b; --card: #172226; --ink: #dee7e9; --muted: #8ba1a7;
+    --accent: #3fbbda; --accent-deep: #6fd0e7; --accent-soft: #1a2c33;
+    --warn: #e2a95e; --line: #28363c; --code-bg: #0c1417;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #10181b; --card: #172226; --ink: #dee7e9; --muted: #8ba1a7;
+  --accent: #3fbbda; --accent-deep: #6fd0e7; --accent-soft: #1a2c33;
+  --warn: #e2a95e; --line: #28363c; --code-bg: #0c1417;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--paper); color: var(--ink);
+  font: 400 15px/1.75 "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  padding: 0 20px;
+}
+.wrap { max-width: 920px; margin: 0 auto; }
+h1, h2 { font-family: "Noto Serif SC", "Songti SC", serif; text-wrap: balance; }
+h1 { font-size: 32px; font-weight: 900; margin: 0 0 6px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 900; margin: 0 0 14px; }
+h3 { font: 600 15px/1.5 "Noto Sans SC", sans-serif; margin: 0 0 4px; }
+p { margin: 0 0 8px; }
+code, .mono { font-family: "JetBrains Mono", "Noto Sans SC", monospace; font-variant-numeric: tabular-nums; }
+code { background: var(--code-bg); border-radius: 4px; padding: 0 5px; font-size: .88em; }
+
+header { padding: 42px 0 0; }
+.eyebrow { font-family: "JetBrains Mono", monospace; font-size: 12px; letter-spacing: .18em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; }
+.statusline { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 12px 0 0; font-size: 13px; color: var(--muted); }
+#wave { display: block; width: 100%; height: 40px; margin: 16px 0 0; }
+.lede { font-size: 16.5px; max-width: 44em; margin: 18px 0 0; }
+
+section { margin-top: 50px; }
+.sechead { display: flex; align-items: baseline; gap: 12px; border-bottom: 2px solid var(--ink); padding-bottom: 8px; margin-bottom: 18px; }
+.sechead .no { font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--accent); }
+
+/* ---- layer stack ---- */
+.stack { display: grid; gap: 0; }
+.layer { display: grid; grid-template-columns: 150px 1fr; gap: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--card); }
+.layer + .layer { margin-top: 26px; position: relative; }
+.layer + .layer::before {
+  content: "↓"; position: absolute; top: -24px; left: 50%; transform: translateX(-50%);
+  color: var(--muted); font-size: 15px;
+}
+.layer .tag {
+  background: var(--accent-soft); color: var(--accent-deep); padding: 14px 12px;
+  font: 600 12.5px/1.5 "Noto Sans SC", sans-serif; display: flex; flex-direction: column; justify-content: center; gap: 2px;
+  border-right: 1px solid var(--line);
+}
+.layer .tag .en { font-family: "JetBrains Mono", monospace; font-weight: 400; font-size: 10.5px; opacity: .75; letter-spacing: .08em; }
+.layer .body { padding: 12px 16px; display: grid; gap: 10px; }
+.node { border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; background: var(--paper); }
+.node b { display: block; font-size: 13.5px; }
+.node span { font-size: 12.5px; color: var(--muted); line-height: 1.65; display: block; }
+.node.core { border-color: var(--accent); border-width: 1.5px; background: var(--accent-soft); }
+.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.port { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--accent); white-space: nowrap; }
+.chip { display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; font-size: 11px; color: var(--muted); font-family: "JetBrains Mono", monospace; margin-left: 6px; }
+
+/* ---- tables ---- */
+.tbl { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--card); }
+.tbl-wrap { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; overflow-x: auto; }
+.tbl th, .tbl td { padding: 8px 13px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tbl th { font-size: 12px; color: var(--muted); font-weight: 500; background: var(--paper); white-space: nowrap; }
+.tbl tr:last-child td { border-bottom: none; }
+.tbl .mono { font-size: 12px; }
+.gpu { display: inline-block; font-family: "JetBrains Mono", monospace; font-size: 11px; border-radius: 4px; padding: 0 6px; background: var(--accent-soft); color: var(--accent-deep); white-space: nowrap; }
+
+/* ---- engine compare ---- */
+pre.flow {
+  background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 11px 13px; overflow-x: auto; margin: 8px 0 0;
+  font-family: "JetBrains Mono", monospace; font-size: 11.8px; line-height: 1.7;
+}
+pre.flow .c { color: var(--muted); }
+pre.flow .k { color: var(--accent-deep); font-weight: 600; }
+
+/* ---- invariants ---- */
+.inv { display: grid; grid-template-columns: 34px 1fr; gap: 12px; padding: 11px 0; border-bottom: 1px dashed var(--line); }
+.inv:last-child { border-bottom: none; }
+.inv .n { font-family: "JetBrains Mono", monospace; font-weight: 600; color: var(--warn); }
+.inv p { margin: 0; font-size: 14px; }
+
+footer { margin: 54px 0 38px; padding-top: 14px; border-top: 2px solid var(--ink); font-size: 12.5px; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+
+@media (max-width: 640px) {
+  .layer { grid-template-columns: 1fr; }
+  .layer .tag { border-right: none; border-bottom: 1px solid var(--line); flex-direction: row; gap: 8px; align-items: baseline; }
+  .duo { grid-template-columns: 1fr; }
+  h1 { font-size: 26px; }
+}
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">SoulX-Duplug · Architecture Reference</div>
+  <h1>系统架构总览</h1>
+  <canvas id="wave" aria-hidden="true"></canvas>
+  <div class="statusline">
+    <span>2026-10-30 · dev <span class="mono">2ffdc10</span></span>
+    <span>10 服务在线 · 4 GPU + CPU</span>
+    <span>双轮次引擎 · 快慢脑 Agent</span>
+  </div>
+  <p class="lede">0.6B 流式语义轮次预测模型挂在 Qwen3.5-9B + VoxCPM2 级联前端上：轮次层可在 SoulX 状态机与 FireRedChat 双 EOT 架构间会话级热切换，应用层以快慢脑双循环承载即时交互与后台任务，全链路共享同一条语音出口。</p>
+</header>
+
+<section>
+  <div class="sechead"><span class="no">01</span><h2>分层堆栈</h2></div>
+  <div class="stack">
+
+    <div class="layer">
+      <div class="tag">接入层<span class="en">CLIENT</span></div>
+      <div class="body"><div class="node"><b>浏览器（WebRTC 处理链）</b><span>echoCancellation + noiseSuppression + autoGainControl；上行 16 kHz mono float32 / 160 ms WS 二进制帧，下行 24 kHz PCM 分块回放；app 层心跳 ping/pong 检测半死 TCP</span></div></div>
+    </div>
+
+    <div class="layer">
+      <div class="tag">轮次层<span class="en">TURN ENGINES</span></div>
+      <div class="body duo">
+        <div class="node"><b>soulx（默认）<span class="port">turn :8000 · GPU5</span></b><span>SoulX-Duplug-0.6B（glm-4-voice tokenizer → projector → Qwen3-0.6B 扩词表+LoRA）逐 chunk 状态机 idle/nonidle/speak + paraformer 转写；话轮触发分 <b>complete</b>（预测即出，零确认）/ <b>wait</b>（5 块 ≈0.8s 静音确认）；每会话独立 buffer / KV / 60s GC</span></div>
+        <div class="node"><b>frc（FireRedChat 架构）<span class="port">FrcEngine · web app 内</span></b><span>pvad :8086 通用 VAD 端点检测（onset 3 块 + 2.5s 前滚，EOS 0.4s 静音）→ <b>ultraVAD :8082 × :6007 /v1/score 双通道语义 EOT</b>，min 融合 ≥0.2 快速提交、否则 hold 至 EOS+6s，复语取消 → FireRedASR :8010 整句转写</span></div>
+      </div>
+    </div>
+
+    <div class="layer">
+      <div class="tag">应用层<span class="en">WEB APP :8090</span></div>
+      <div class="body">
+        <div class="node core"><b>pipeline_worker · _run_speech_pipeline 统一语音出口</b><span>ASR → 主说话人门控（pvad，默认 off，fail-open）→ pending 提交 → 历史 → 生成 → TTS 流式推送；<b>complete 触发 0.9s 宽限保持窗</b>：生成进 held_chunks 对用户不可见，复语即静默丢弃整次（未说出不进历史），窗口过期 _flush_held() 逐段播出；播放期 barge-in 3 块迟滞、每 episode 单次打断</span></div>
+        <div class="node"><b>AgentRuntime（确定性仲裁）</b><span>任务表 / 议程；交付时机 = 用户空闲 + 无播放 + 无生成的空档期，经同一语音出口以 user 角色系统提示注入；<b>auto_cancel</b> 改口正则先行取消；任务状态按提及注入（_TASK_MENTION_RE，闲聊不汇报）；工具轮次不进持久历史</span></div>
+      </div>
+    </div>
+
+    <div class="layer">
+      <div class="tag">模型层<span class="en">LLM ×2</span></div>
+      <div class="body duo">
+        <div class="node"><b>快脑 <span class="port">:6007 · GPU6</span></b><span>Qwen3.5-9B thinking=off；/chat 普通流、/agent_chat S/R/T 三通道（可说文本/推理/工具 JSON）+ delegate_task / cancel_task 原生 tool calling、/v1/score 首 token 概率打分（frc 语义 EOT 通道，一次 prefill ≈60ms）</span></div>
+        <div class="node"><b>慢脑 <span class="port">:6008 · GPU1</span></b><span>Qwen3.5-9B 同脚本第二实例，默认 thinking=off（SLOW_BRAIN_THINKING=1 切回）；后台 agent 循环 4 工具：web_search（DDG 经 curl 直连，限流回落百度）/ fetch_page / python_repl 子进程沙箱 / get_datetime</span></div>
+      </div>
+    </div>
+
+    <div class="layer">
+      <div class="tag">语音层<span class="en">TTS</span></div>
+      <div class="body duo">
+        <div class="node"><b>VoxCPM2（默认）<span class="port">:8085 · GPU7</span></b><span>自训 LoRA（r=32）+ 参考音色锚定（prompt cache 一次全段复用，段间 ECAPA 0.65–0.75）；48 kHz 生成经 soxr 流式重采样 24 kHz；首块 80ms，RTF 0.32</span></div>
+        <div class="node"><b>FireRedTTS（回退）<span class="port">:8081 · GPU7</span></b><span>TTS_ENGINE=firered 切换；与 full_duplex FRC agent 共用实例</span></div>
+      </div>
+    </div>
+
+    <div class="layer">
+      <div class="tag">辅助层<span class="en">SIDECAR</span></div>
+      <div class="body"><div class="node"><b>pvad sidecar <span class="port">:8086 · CPU</span></b><span>ONNX 个性化 VAD + ECAPA 说话人嵌入；soulx 模式下主说话人门控（默认 off，浏览器链路同人余弦 0.15–0.57 低于 0.5 阈值，代码保留可切回）；frc 模式下零嵌入复用作通用语音活动检测；feed 为队列 put，不进轮次路径</span></div></div>
+    </div>
+
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">02</span><h2>frc 引擎决策流</h2></div>
+  <pre class="flow">chunk → onset: <span class="k">3 块连续 prob≥0.5</span>（&lt;3 块判噪声丢弃，携 2.5s 前滚防切头）
+     → speech → EOS: <span class="k">连续 0.4s prob&lt;0.5</span>（概率滞后 1-2 块，实际 ≈0.6-0.7s）· decision_gen 自增
+     → 双通道并行（每步代际校验，防旧请求晚到）:
+         <span class="k">ultraVAD :8082</span>   20s 滚动音频窗 + 上一条助手文本
+         <span class="k">/v1/score :6007</span>  FireRedASR 转写 + 助手文本 → 是/否首 token softmax
+     → <span class="k">min 融合</span>（任一通道错误记 0）: 双确认 ≥0.2 → 快速提交
+         否则 hold 至 EOS+6.0s 封顶；期间复语 → 取消待提交、话轮继续生长
+     → 提交 → FireRedASR 整句转写（PUNC+ITN）→ <span class="k">同一条 pipeline_worker</span>（不叠加宽限）
+<span class="c"># 实测：整句 uv=0.908 llm=0.940 提交；半句 uv=0.088 llm=0.018 hold+复语取消</span>
+<span class="c"># 边界：单话轮上限 60s；依赖 :8086/:8082/:8010 在线，宕机则该会话 frc 降级</span></pre>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">03</span><h2>服务矩阵</h2></div>
+  <div class="tbl-wrap"><table class="tbl">
+    <tr><th>tmux 窗口</th><th>服务</th><th>端口</th><th>GPU</th><th>venv</th><th>备注</th></tr>
+    <tr><td class="mono">turn</td><td>SoulX turn server</td><td class="mono">8000</td><td><span class="gpu">5</span></td><td class="mono">soulx/venv</td><td>0.6B 状态机 + paraformer</td></tr>
+    <tr><td class="mono">ultravad</td><td>ultraVAD EOT</td><td class="mono">8082</td><td><span class="gpu">5</span></td><td class="mono">eot_bench/venv</td><td>frc 专用；唯一 transformers 4.57.1；加载 ~4min；&gt;20s 音频 500</td></tr>
+    <tr><td class="mono">frcasr</td><td>FireRedASR</td><td class="mono">8010</td><td><span class="gpu">5</span></td><td class="mono">full_duplex/venv</td><td>frc 专用；需 tempo env ffmpeg</td></tr>
+    <tr><td class="mono">llm</td><td>快脑（融合 LLM）</td><td class="mono">6007</td><td><span class="gpu">6</span></td><td class="mono">venv-frc-llm</td><td>/chat · /agent_chat · /v1/score</td></tr>
+    <tr><td class="mono">slowllm</td><td>慢脑</td><td class="mono">6008</td><td><span class="gpu">1</span></td><td class="mono">venv-frc-llm</td><td>同脚本第二实例</td></tr>
+    <tr><td class="mono">tts</td><td>FireRedTTS</td><td class="mono">8081</td><td><span class="gpu">7</span></td><td class="mono">full_duplex/venv</td><td>回退 + full_duplex 共用</td></tr>
+    <tr><td class="mono">voxtts</td><td>VoxCPM2 TTS</td><td class="mono">8085</td><td><span class="gpu">7</span></td><td class="mono">venv-voxcpm</td><td>默认；LoRA + 锚定音色</td></tr>
+    <tr><td class="mono">pvad</td><td>pvad sidecar</td><td class="mono">8086</td><td><span class="gpu">CPU</span></td><td class="mono">venv-frc</td><td>唯一 speechbrain/onnxruntime 栈</td></tr>
+    <tr><td class="mono">web</td><td>Web app</td><td class="mono">8090</td><td><span class="gpu">CPU</span></td><td class="mono">soulx/venv</td><td>FastAPI + WS</td></tr>
+  </table></div>
+  <p style="margin-top:10px;font-size:13px;color:var(--muted);">跨 venv 服务复用是刻意设计（各 venv 钉死互不兼容的依赖栈）——不要随手升级任何共享 venv。冷启动 <code>bash scripts/start_services.sh</code>。</p>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">04</span><h2>关键参数速查</h2></div>
+  <div class="tbl-wrap"><table class="tbl">
+    <tr><th>参数</th><th>值</th><th>位置</th></tr>
+    <tr><td>上行 chunk / 下行音频</td><td class="mono">16 kHz float32 · 160 ms ｜ 24 kHz PCM</td><td class="mono">前端 ↔ web app</td></tr>
+    <tr><td>max_wait_num（wait 路径静音）</td><td class="mono">5 块 ≈ 0.8s</td><td class="mono">repo/config/config.yaml</td></tr>
+    <tr><td>_TURN_GRACE_S（complete 宽限）</td><td class="mono">0.9s</td><td class="mono">app.py</td></tr>
+    <tr><td>_BARGEIN_MIN_CHUNKS（抢话迟滞）</td><td class="mono">3 块 = 480ms</td><td class="mono">app.py</td></tr>
+    <tr><td>FRC onset / EOS / 阈值 / 封顶</td><td class="mono">3 块 / 0.4s / 0.2 / EOS+6.0s</td><td class="mono">frc_engine.py</td></tr>
+    <tr><td>FRC 前滚 / 话轮上限 / 音频环</td><td class="mono">2.5s / 60s / 20s</td><td class="mono">frc_engine.py</td></tr>
+    <tr><td>LLM 首段 / TTS 首块</td><td class="mono">~1s / 80ms（RTF 0.32）</td><td>实测</td></tr>
+  </table></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="no">05</span><h2>设计不变量（改代码前必读）</h2></div>
+  <div class="inv"><div class="n">01</div><p><b>未说出口的话绝不进历史</b>——截断残段与宽限窗内未播文本都会污染下一轮生成（两个历史 bug 同根源）。</p></div>
+  <div class="inv"><div class="n">02</div><p><b>跨线程/跨服务异步结果必须带代际校验</b>——宽限窗与双 EOT 都被"旧请求晚到"击穿过；单调计数器优于 bool 标志。</p></div>
+  <div class="inv"><div class="n">03</div><p><b>确定性逻辑放 Runtime，概率性逻辑放模型</b>——auto_cancel、交付仲裁、提及注入都是从提示词下沉到代码的实例。</p></div>
+  <div class="inv"><div class="n">04</div><p><b>pvad 旁路不进轮次路径</b>——feed 是队列 put；信号未知一律 fail-open，sidecar 宕机对话不受影响。</p></div>
+  <div class="inv"><div class="n">05</div><p><b>两条引擎共享同一条 pipeline_worker 与语音出口</b>——前端模式只换"什么时候算说完"，不换"说完之后怎么办"。</p></div>
+</section>
+
+<footer>
+  <span>SoulX-Duplug 系统架构总览</span>
+  <span>配套：架构总览-20261030.md（文字）· 架构图-20261030.md（Mermaid）</span>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  var cv = document.getElementById("wave");
+  function draw() {
+    var dpr = window.devicePixelRatio || 1;
+    var w = cv.clientWidth, h = cv.clientHeight;
+    cv.width = w * dpr; cv.height = h * dpr;
+    var ctx = cv.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    var col = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
+    ctx.fillStyle = col;
+    var bar = 3, gap = 3, i = 0;
+    for (var x = 0; x + bar <= w; x += bar + gap, i++) {
+      var t = i / 46;
+      var env = Math.min(1, t * 6) * Math.exp(-Math.max(0, t - 0.75) * 5);
+      var n = Math.sin(i * 12.9898) * 43758.5453;
+      n = n - Math.floor(n);
+      var bh = (0.18 + 0.82 * n) * env * (h - 6);
+      if (bh < 1) bh = 1;
+      ctx.globalAlpha = 0.28 + 0.6 * env;
+      ctx.fillRect(x, (h - bh) / 2, bar, bh);
+    }
+    ctx.globalAlpha = 1;
+  }
+  draw();
+  var r;
+  window.addEventListener("resize", function () { clearTimeout(r); r = setTimeout(draw, 150); });
+})();
+</script>
