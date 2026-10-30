@@ -26,6 +26,7 @@ handler) and before each tool execution.
 """
 import datetime
 import json
+import logging
 import os
 import threading
 import time
@@ -36,6 +37,8 @@ from agent import tools as agent_tools
 from clients.llm_client import _LEAD_ROLE_JUNK  # same occasional
 # role-marker hallucination the fast brain strips (see llm_client) — the
 # slow brain's answer is spoken too, so it needs the same guard
+
+logger = logging.getLogger(__name__)
 
 SLOW_LLM_BASE = "http://127.0.0.1:6008"
 
@@ -126,6 +129,8 @@ class SlowBrain:
             {"role": "user", "content": user_msg},
         ]
         emit({"type": "started"})
+        t_start = time.monotonic()
+        logger.info("[slowbrain %s] start: %s", task_id, goal[:80])
 
         for step in range(MAX_STEPS):
             if cancel_event.is_set():
@@ -143,14 +148,24 @@ class SlowBrain:
                     "content": "工具调用次数已达上限。请立即基于已有信息给出最终答案。",
                 })
             try:
+                t_gen = time.monotonic()
                 speech, tool_calls = self._generate(
                     messages, tools=None if last else agent_tools.TOOL_SCHEMAS,
                     cancel_event=cancel_event, deadline=deadline,
+                )
+                logger.info(
+                    "[slowbrain %s] round %d/%d gen %.1fs: %d tool call(s), "
+                    "speech %d chars, ctx %d chars",
+                    task_id, step + 1, MAX_STEPS, time.monotonic() - t_gen,
+                    len(tool_calls), len(speech),
+                    sum(len(m.get("content") or "") for m in messages),
                 )
             except _Canceled:
                 emit({"type": "canceled"})
                 return None
             except Exception as e:
+                logger.info("[slowbrain %s] failed after %.1fs: llm error: %s",
+                            task_id, time.monotonic() - t_start, e)
                 emit({"type": "failed", "error": f"llm error: {e}"})
                 return None
 
@@ -158,6 +173,9 @@ class SlowBrain:
                 result = _LEAD_ROLE_JUNK.sub("", speech).strip()
                 if not result:
                     result = "抱歉，这个任务我没能完成。"
+                logger.info("[slowbrain %s] completed in %.1fs (%d rounds): %s",
+                            task_id, time.monotonic() - t_start, step + 1,
+                            result[:80])
                 emit({"type": "completed", "result": result})
                 return result
 
@@ -193,8 +211,14 @@ class SlowBrain:
                 if cache_key in round_cache:
                     observation = round_cache[cache_key]
                 else:
+                    t_tool = time.monotonic()
                     emit({"type": "progress", "desc": _describe_call(name, args)})
                     observation = agent_tools.execute_tool(name, args)
+                    logger.info("[slowbrain %s] tool %s(%.40s) %.1fs -> %d chars",
+                                task_id, name,
+                                args.get("query") or args.get("url")
+                                or args.get("code") or "",
+                                time.monotonic() - t_tool, len(observation))
                     round_cache[cache_key] = observation
                     emit({"type": "progress",
                           "desc": f"{_describe_call(name, args)} -> "
