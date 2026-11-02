@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Logs — Voice Studio</title>
+  <style>
+    /* Self-contained page reusing the console theme tokens (style.css is
+       console-layout-specific; this page is standalone). */
+    :root {
+      --bg: #0b0e14;
+      --panel: #11151d;
+      --panel-2: #151b26;
+      --border: #232a37;
+      --border-strong: #303949;
+      --text: #e6eaf2;
+      --muted: #8b94a7;
+      --faint: #5b6373;
+      --accent: #22d3ee;
+      --accent-dim: #0e7490;
+      --amber: #fbbf24;
+      --green: #34d399;
+      --red: #f87171;
+      --mono: "SF Mono", "Cascadia Code", ui-monospace, Consolas, Menlo, monospace;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0;
+        font-family: "Inter", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; }
+
+    body {
+      background:
+        radial-gradient(1200px 500px at 70% -10%, rgba(34, 211, 238, 0.05), transparent 60%),
+        var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    ::selection { background: var(--accent-dim); color: #fff; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a3242; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #39435a; }
+
+    .topbar {
+      display: flex; align-items: center; gap: 14px;
+      padding: 0 20px; height: 54px; flex-shrink: 0;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .brand { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+    .brand-name { font-weight: 700; font-size: 15px; letter-spacing: 0.02em; }
+    .brand-sub { font-size: 11px; color: var(--faint); letter-spacing: 0.08em; text-transform: uppercase; }
+
+    .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; }
+    .ctl { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+
+    select, input[type="text"], input[type="password"] {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border-strong); border-radius: 8px;
+      padding: 6px 10px; font-size: 12.5px; outline: none;
+    }
+    select:focus, input:focus { border-color: var(--accent-dim); }
+    input[type="text"] { width: 170px; font-family: var(--mono); }
+
+    .switch { position: relative; display: inline-block; width: 34px; height: 19px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; inset: 0; background: var(--border-strong);
+              border-radius: 19px; cursor: pointer; transition: background 0.2s; }
+    .slider::before { content: ""; position: absolute; height: 13px; width: 13px;
+              left: 3px; top: 3px; background: var(--muted); border-radius: 50%; transition: 0.2s; }
+    .switch input:checked + .slider { background: var(--accent-dim); }
+    .switch input:checked + .slider::before { transform: translateX(15px); background: var(--accent); }
+
+    button.btn {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border-strong); border-radius: 8px;
+      padding: 6px 14px; font-size: 12.5px; cursor: pointer; white-space: nowrap;
+    }
+    button.btn:hover { border-color: var(--accent-dim); color: var(--accent); }
+    a.back { color: var(--faint); font-size: 12px; text-decoration: none; white-space: nowrap; }
+    a.back:hover { color: var(--accent); }
+
+    .meta {
+      display: flex; gap: 16px; padding: 6px 20px;
+      font-size: 11.5px; color: var(--faint); font-family: var(--mono);
+      border-bottom: 1px solid var(--border); background: rgba(13, 17, 23, 0.6);
+      flex-shrink: 0; flex-wrap: wrap;
+    }
+    .meta .warn { color: var(--amber); }
+
+    #logBody {
+      flex: 1; overflow: auto; padding: 12px 20px 40px;
+      font-family: var(--mono); font-size: 12px; line-height: 1.55;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    #logBody .ln { display: block; }
+    #logBody .ln.err { color: var(--red); }
+    #logBody .ln.warn { color: var(--amber); }
+    #logBody .ln.ok { color: var(--green); }
+
+    #keyPrompt {
+      position: fixed; inset: 0; background: rgba(8, 11, 16, 0.88);
+      display: flex; align-items: center; justify-content: center; z-index: 10;
+    }
+    #keyPrompt.hidden { display: none; }
+    .key-card {
+      background: var(--panel); border: 1px solid var(--border-strong);
+      border-radius: var(--radius); padding: 28px 32px; width: 380px; max-width: 92vw;
+    }
+    .key-card h2 { font-size: 15px; margin-bottom: 8px; }
+    .key-card p { font-size: 12.5px; color: var(--muted); line-height: 1.6; margin-bottom: 16px; }
+    .key-card .row { display: flex; gap: 10px; }
+    .key-card input { flex: 1; }
+    .key-card .err-msg { color: var(--red); font-size: 12px; margin-top: 10px; min-height: 16px; }
+  </style>
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">Logs</span>
+      <span class="brand-sub">voice studio services</span>
+    </div>
+    <div class="toolbar">
+      <label class="ctl">file
+        <select id="logFile"></select>
+      </label>
+      <label class="ctl">tail
+        <select id="tailNum">
+          <option>100</option>
+          <option selected>300</option>
+          <option>1000</option>
+          <option>2000</option>
+        </select>
+      </label>
+      <label class="ctl">grep
+        <input type="text" id="grepText" placeholder="substring, e.g. ERROR">
+      </label>
+      <label class="ctl">live
+        <span class="switch"><input type="checkbox" id="liveToggle" checked><span class="slider"></span></span>
+      </label>
+      <button class="btn" id="refreshBtn">Refresh</button>
+      <a class="back" href="/">&larr; console</a>
+    </div>
+  </header>
+
+  <div class="meta">
+    <span id="metaInfo">loading…</span>
+    <span id="metaTruncated" class="warn hidden">showing last 512 KiB of file</span>
+  </div>
+
+  <div id="logBody"></div>
+
+  <div id="keyPrompt" class="hidden">
+    <div class="key-card">
+      <h2>Access key required</h2>
+      <p>The log API is key-gated. The key lives on the server in
+         <code>~/krisl/soulx/logs_key.txt</code>.</p>
+      <div class="row">
+        <input type="password" id="keyInput" placeholder="logs access key">
+        <button class="btn" id="keyOkBtn">Unlock</button>
+      </div>
+      <div class="err-msg" id="keyErr"></div>
+    </div>
+  </div>
+
+  <script>
+    "use strict";
+    // Remote log viewer (2026-11-02): key-gated /api/logs endpoints, polling
+    // refresh. Key is kept in localStorage only (per-browser convenience).
+    const $ = (id) => document.getElementById(id);
+    const LS_KEY = "soulx_logs_key";
+    let key = localStorage.getItem(LS_KEY) || "";
+    let timer = null;
+    const REFRESH_MS = 2000;
+
+    function fmtSize(n) {
+      if (n > 1048576) return (n / 1048576).toFixed(1) + " MB";
+      if (n > 1024) return (n / 1024).toFixed(1) + " KB";
+      return n + " B";
+    }
+    function fmtTime(ts) {
+      return new Date(ts * 1000).toLocaleString();
+    }
+
+    function lineClass(l) {
+      if (/\[ERROR\]|Traceback|CRITICAL/.test(l)) return "err";
+      if (/\[WARNING\]|WARNING:/.test(l)) return "warn";
+      if (/\b200 OK\b|startup complete|enrolled/.test(l)) return "ok";
+      return "";
+    }
+
+    async function api(path) {
+      const url = path + (path.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key);
+      const r = await fetch(url);
+      if (r.status === 401 || r.status === 503) {
+        showKeyPrompt(r.status === 503 ? "no key configured on server" : "wrong key");
+        throw new Error("unauthorized");
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }
+
+    function showKeyPrompt(msg) {
+      $("keyPrompt").classList.remove("hidden");
+      $("keyErr").textContent = msg || "";
+      $("keyInput").focus();
+    }
+
+    async function loadFileList(keepSelection) {
+      const data = await api("/api/logs");
+      const sel = $("logFile");
+      const prev = keepSelection ? sel.value : (localStorage.getItem("soulx_logs_file") || "web.log");
+      sel.innerHTML = "";
+      for (const f of data.logs) {
+        const opt = document.createElement("option");
+        opt.value = f.name;
+        opt.textContent = `${f.name} (${fmtSize(f.size)})`;
+        sel.appendChild(opt);
+      }
+      if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+      localStorage.setItem("soulx_logs_file", sel.value);
+    }
+
+    let lastData = null;
+    async function refresh() {
+      const name = $("logFile").value;
+      if (!name) return;
+      const tail = $("tailNum").value;
+      const grep = $("grepText").value.trim();
+      const q = `/api/logs/${encodeURIComponent(name)}?tail=${tail}` +
+                (grep ? `&grep=${encodeURIComponent(grep)}` : "");
+      const data = await api(q);
+      localStorage.setItem("soulx_logs_file", name);
+      const body = $("logBody");
+      const stick = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+      const changed = !lastData || lastData.mtime !== data.mtime ||
+                      lastData.lines.length !== data.lines.length ||
+                      lastData.name !== data.name;
+      if (changed || grep !== (lastData ? lastData._grep : null)) {
+        body.innerHTML = "";
+        const frag = document.createDocumentFragment();
+        for (const l of data.lines) {
+          const span = document.createElement("span");
+          span.className = "ln " + lineClass(l);
+          span.textContent = l;
+          frag.appendChild(span);
+        }
+        body.appendChild(frag);
+      }
+      data._grep = grep;
+      lastData = data;
+      $("metaInfo").textContent =
+        `${data.name} · ${fmtSize(data.size)} · updated ${fmtTime(data.mtime)}` +
+        (grep ? ` · grep "${grep}" → ${data.lines.length} lines` : ` · ${data.lines.length} lines`);
+      $("metaTruncated").classList.toggle("hidden", !data.truncated);
+      if (stick || changed) body.scrollTop = body.scrollHeight;
+    }
+
+    async function cycle() {
+      try {
+        if (!$("logFile").value) await loadFileList(true);
+        await refresh();
+      } catch (e) {
+        if (String(e.message) !== "unauthorized") {
+          $("metaInfo").textContent = "refresh failed: " + e.message;
+        }
+      }
+    }
+
+    function restartTimer() {
+      if (timer) clearInterval(timer);
+      timer = null;
+      if ($("liveToggle").checked) timer = setInterval(cycle, REFRESH_MS);
+    }
+
+    $("refreshBtn").addEventListener("click", cycle);
+    $("logFile").addEventListener("change", () => { lastData = null; cycle(); });
+    $("tailNum").addEventListener("change", () => { lastData = null; cycle(); });
+    $("grepText").addEventListener("change", cycle);
+    $("liveToggle").addEventListener("change", restartTimer);
+    $("keyOkBtn").addEventListener("click", () => {
+      key = $("keyInput").value.trim();
+      localStorage.setItem(LS_KEY, key);
+      $("keyPrompt").classList.add("hidden");
+      lastData = null;
+      cycle();
+    });
+    $("keyInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") $("keyOkBtn").click();
+    });
+
+    if (!key) showKeyPrompt("");
+    cycle();
+    restartTimer();
+  </script>
+</body>
+
+</html>

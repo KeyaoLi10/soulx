@@ -1,3 +1,5 @@
+import hmac
+import os
 import re
 import time
 import soxr
@@ -10,8 +12,10 @@ import uuid
 import json
 import asyncio
 import numpy as np
+from pathlib import Path
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 # SIGUSR1 dumps all thread tracebacks to stderr (web.log) — use when the
@@ -1265,6 +1269,104 @@ async def websocket_endpoint(websocket: WebSocket):
             vad_pool.release(session.vad)
             session_manager.remove_session(client_id)
         logger.info(f"Session cleaned up: {client_id}")
+
+
+# ==== Remote log viewer API (read-only, key-gated) ====
+# The web port is reachable from outside (scanners hit it daily — see the 404s
+# in the tmux panes), so the log endpoints require a shared key: env
+# SOULX_LOGS_KEY, or a plain key file (workspace convention — gitignored).
+# Served pages: frontend/logs.html.
+LOGS_DIR = os.environ.get(
+    "SOULX_LOGS_DIR", "/home/research/krisl/soulx/logs"
+)
+LOGS_KEY_FILE = os.environ.get(
+    "SOULX_LOGS_KEY_FILE", "/home/research/krisl/soulx/logs_key.txt"
+)
+_LOG_TAIL_BYTES = 512 * 1024   # efficient tail: read the last 512 KiB only
+_LOG_MAX_TAIL_LINES = 2000
+_LOG_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.log$")
+
+
+def _logs_api_key() -> str:
+    key = os.environ.get("SOULX_LOGS_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return Path(LOGS_KEY_FILE).read_text().strip()
+    except OSError:
+        return ""
+
+
+def _logs_key_error(request: Request):
+    """None when the request may pass; otherwise a 401/503 JSONResponse."""
+    expected = _logs_api_key()
+    if not expected:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "logs API disabled: no key configured"},
+        )
+    supplied = request.query_params.get("key", "")
+    if not hmac.compare_digest(expected, supplied):
+        return JSONResponse(
+            status_code=401, content={"error": "bad or missing key"}
+        )
+    return None
+
+
+@app.get("/api/logs")
+async def list_logs(request: Request):
+    err = _logs_key_error(request)
+    if err:
+        return err
+    files = []
+    try:
+        for p in sorted(Path(LOGS_DIR).glob("*.log"), key=lambda x: x.name):
+            st = p.stat()
+            files.append(
+                {"name": p.name, "size": st.st_size, "mtime": st.st_mtime}
+            )
+    except OSError:
+        pass
+    return {"logs": files}
+
+
+@app.get("/api/logs/{name}")
+async def read_log(
+    name: str, request: Request, tail: int = 200, grep: str = ""
+):
+    err = _logs_key_error(request)
+    if err:
+        return err
+    # strict name pattern + glob dir => no traversal, no symlink escape
+    if not _LOG_NAME_RE.match(name):
+        return JSONResponse(status_code=404, content={"error": "no such log"})
+    path = Path(LOGS_DIR) / name
+    try:
+        st = path.stat()
+        if not path.is_file():
+            raise OSError
+    except OSError:
+        return JSONResponse(status_code=404, content={"error": "no such log"})
+    tail = max(1, min(tail, _LOG_MAX_TAIL_LINES))
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - _LOG_TAIL_BYTES))
+        data = f.read()
+    lines = data.decode("utf-8", "replace").splitlines()
+    truncated = size > _LOG_TAIL_BYTES
+    if truncated and lines:
+        lines = lines[1:]   # first line is a partial read
+    if grep:
+        g = grep.lower()
+        lines = [l for l in lines if g in l.lower()]
+    return {
+        "name": name,
+        "size": size,
+        "mtime": st.st_mtime,
+        "truncated": truncated,
+        "lines": lines[-tail:],
+    }
 
 
 # ==== Static Resource Routing ====
