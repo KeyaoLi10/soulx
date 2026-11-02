@@ -33,7 +33,7 @@ tmux new-window -t soulx -n voxtts
 # system-wide, tempo conda env ships them (torchcodec 0.1.1 pairs with torch 2.6/cu124)
 # VOXCPM_LORA_PATH: self-trained VoxCPM2 LoRA (r=32); voice anchored by
 # reference cloning — see services/voxcpm_tts_server.py header
-tmux send-keys -t soulx:voxtts "CUDA_VISIBLE_DEVICES=7 VOXCPM_MODEL_PATH=/mnt/disk3/krisl/soulx/VoxCPM2 VOXCPM_LORA_PATH=/vepfs-cnbjc4e12c6d7e1f/krisl/step_0000500 LD_LIBRARY_PATH=/mnt/disk1/miniconda3/envs/tempo/lib $SOULX/venv-voxcpm/bin/python $SOULX/services/voxcpm_tts_server.py --port 8085 2>&1 | tee $LOGS/voxcpm_tts.log" C-m
+tmux send-keys -t soulx:voxtts "CUDA_VISIBLE_DEVICES=7 VOXCPM_MODEL_PATH=/mnt/disk3/krisl/soulx/VoxCPM2 VOXCPM_LORA_PATH=/vepfs-cnbjc4e12c6d7e1f/krisl/step_0000400 LD_LIBRARY_PATH=/mnt/disk1/miniconda3/envs/tempo/lib $SOULX/venv-voxcpm/bin/python $SOULX/services/voxcpm_tts_server.py --port 8085 2>&1 | tee $LOGS/voxcpm_tts.log" C-m
 
 tmux new-window -t soulx -n llm
 tmux send-keys -t soulx:llm "CUDA_VISIBLE_DEVICES=6 $FD/venv-frc-llm/bin/python $SOULX/services/qwen35_fused_server.py --port 6007 2>&1 | tee $LOGS/llm.log" C-m
