@@ -358,8 +358,10 @@ loadingConfirmBtn.addEventListener("click", async () => {
 // ==================== Chat log (right rail transcript) ====================
 // The server sends `user_transcription` with the *growing* ASR buffer while
 // the user speaks (VAD callback), plus the final text right before
-// `turn_start` (pipeline). So: keep one live user bubble that is updated in
-// place, and open a fresh assistant bubble on each `turn_start`.
+// `turn_start` (pipeline, final: true). So: keep one live user bubble that
+// is updated in place until its turn commits (frozen), then open a fresh
+// bubble per later utterance, and a fresh assistant bubble on each
+// `turn_start`.
 const chatLog = document.getElementById('chatLog');
 const MAX_LOG_MESSAGES = 200;
 let lastMsg = null; // { role: 'user'|'assistant', body: HTMLElement }
@@ -400,14 +402,24 @@ function flashBody(body) {
   window.setTimeout(() => body.classList.remove('updated'), 400);
 }
 
-function handleUserTranscription({ text }) {
+// A committed turn freezes its user bubble (2026-11-03): the server's
+// final user_transcription (final: true) means the sentence is settled,
+// so anything streamed after it (a phantom blip's partials — the 01:01
+// "是。" swallow) opens its OWN bubble instead of overwriting the real
+// sentence in place, and a selftalk_drop only ever removes that
+// unfrozen phantom bubble, never the frozen one.
+let userBubbleFinal = false;
+
+function handleUserTranscription({ text, final }) {
   if (!text) return;
-  if (lastMsg && lastMsg.role === 'user') {
+  if (lastMsg && lastMsg.role === 'user' && !userBubbleFinal) {
     // Live update of the bubble being spoken into
     lastMsg.body.textContent = text;
   } else {
     lastMsg = { role: 'user', body: addMessage('user', text) };
+    userBubbleFinal = false;
   }
+  if (final) userBubbleFinal = true;
   flashBody(lastMsg.body);
 }
 
@@ -931,16 +943,21 @@ function handlePvadReject({ kind, cos, threshold, shadow }) {
   console.log('[pvad] rejected', kind, { cos, threshold, shadow });
 }
 
-// Echo of our own TTS completed a phantom turn server-side and was dropped
-// (playback self-talk check, 2026-11-02): remove its stale live bubble —
-// the few characters the mic picked up from the speakers — so they don't
-// linger in the chat log as a user message that was never answered.
-function handleSelftalkDrop() {
-  if (lastMsg && lastMsg.role === 'user') {
+// Echo of our own TTS / a breath blip completed a phantom turn
+// server-side and was dropped (in-flight self-talk check, 2026-11-02):
+// remove its stale live bubble — the few characters the mic picked up —
+// so they don't linger in the chat log as a user message that was never
+// answered. Never touches a FROZEN bubble (a real committed sentence):
+// the phantom's partials opened their own unfrozen bubble after the
+// freeze, so only that one is stale.
+function handleSelftalkDrop({ reason } = {}) {
+  if (lastMsg && lastMsg.role === 'user' && !userBubbleFinal) {
     lastMsg.body.parentElement?.remove();
     lastMsg = null;
   }
-  flashGateNote('已忽略回声（识别到的是我自己的声音）');
+  flashGateNote(reason === 'blip'
+    ? '已忽略幻影语音片段（未检测到有效人声）'
+    : '已忽略回声（识别到的是我自己的声音）');
 }
 
 // ==================== Background Tasks (fast/slow brain agent) ====================

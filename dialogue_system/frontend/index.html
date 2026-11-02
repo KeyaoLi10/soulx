@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
   <title>Voice Studio</title>
-  <link rel="stylesheet" href="style.css?v=20261030b">
+  <link rel="stylesheet" href="style.css?v=20261103a">
 </head>
 
 <body>
@@ -143,7 +143,7 @@
             <input id="playbackGuard" type="checkbox" checked>
             <span>Playback echo guard</span>
           </label>
-          <span class="block-hint">While the assistant is speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo-like phantom turns are dropped — speaker echo / AEC residue then cannot chop the reply. Off = raw zero-hysteresis behavior (any single sound interrupts). SoulX engine only.</span>
+          <span class="block-hint">While the assistant is generating or speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo/blip phantom turns are dropped — speaker echo, AEC residue or breath noise then cannot chop the reply or hijack your sentence. Off = raw zero-hysteresis behavior (any single sound interrupts). SoulX engine only.</span>
         </div>
         <div class="field">
           <label for="ttsEngine">Engine</label>
@@ -226,7 +226,7 @@
     </aside>
   </main>
 
-  <script src="script.js?v=20261030b"></script>
+  <script src="script.js?v=20261103a"></script>
 </body>
 
 </html>

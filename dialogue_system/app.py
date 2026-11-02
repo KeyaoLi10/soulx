@@ -200,9 +200,10 @@ class ChatSession:
         # processed real speech alternates nonidle/idle (~50% duty) and
         # never sustains a consecutive run.
         self.bargein_times = deque()
-        # Nonidle chunks in the CURRENT turn episode (reset on each turn
-        # commit / 2.5 s of clear idle). Same duty-cycle idea as
-        # bargein_times but covering the WHOLE episode — a blip that
+        # Nonidle chunks in the CURRENT voice burst (reset on each turn
+        # commit, and lazily in the receive loop when nonidle resumes
+        # after a > window-sized gap). Same duty-cycle idea as
+        # bargein_times but covering the WHOLE burst — a blip that
         # completes a phantom turn (turn server commits, paraformer
         # hallucinates 1-3 characters onto the echo) reads 1-2 here,
         # while any real utterance long enough to be a turn reads 4-8
@@ -239,6 +240,13 @@ class ChatSession:
         # background-result delivery) is running in this session. The
         # delivery arbiter polls it to pick a speaking slot.
         self.gen_in_progress = False
+        # generation serial: each _begin_generation() bump invalidates the
+        # previous pipeline's finally-clear, so an interrupted old pipeline
+        # can never clear gen_in_progress out from under the new one that
+        # replaced it (the old thread's LLM loop only notices the stop at
+        # its next chunk — its finally can land seconds into the new
+        # generation)
+        self.gen_serial = 0
         # Wall-clock of the last user voice activity (barge-in chunks or a
         # completed turn) — the delivery arbiter waits for a quiet gap.
         self.last_voice_ts = 0.0
@@ -394,13 +402,47 @@ def _playback_guard_active(session):
     return not (pvad_enabled(session) and mode == "enforce")
 
 
+def _begin_generation(session) -> int:
+    """Mark a reply as generating, IN THE RECEIVE LOOP at turn-commit time
+    (2026-11-03): pipeline_worker only sets gen_in_progress after its
+    gates and LLM-generator creation (~0.5 s with agent mode), and the
+    01:26 test round showed a blip landing exactly in that gap — its
+    barge-in killed the in-flight generation and the follow-up phantom
+    turn '是。' then passed with in-flight already False. Setting the
+    flag at commit closes the hole; the returned serial makes the
+    worker's finally-clear a no-op once a newer generation began."""
+    with session.lock:
+        session.gen_serial += 1
+        session.gen_in_progress = True
+        return session.gen_serial
+
+
+def _reply_in_flight(session):
+    """Is a reply pending or playing? BOTH phases, not just playback:
+    generation (turn committed, LLM/TTS streaming, gen_in_progress —
+    nothing is audible yet, so playback_end is stale) and playback
+    (playback_end + grace). frc_engine already uses this same pair for
+    its EOT wait. The 2026-11-03 01:01 incident (session 338b1765): a
+    1-2 chunk mic blip in the GENERATION window (a) confirmed a
+    zero-evidence barge-in that killed the in-flight generation and
+    (b) completed a phantom turn '是。' that replaced the user's real
+    sentence in the UI and entered LLM history — both defenses below
+    keyed on playback_end alone and were inactive until the first TTS
+    audio chunk. The same duty-cycle discriminator applies: a real
+    follow-up utterance reads 4-8 nonidle chunks, a breath/noise blip
+    1-2."""
+    return (session.gen_in_progress
+            or time.time() < session.playback_end + _PVAD_PLAYBACK_GRACE_S)
+
+
 def _playback_bargein_deferred(session, now=None):
-    """True while assistant audio is playing but the nonidle evidence so
-    far is too sparse to interrupt on — the deferred barge-in keeps
-    counting (bargein_streak is NOT reset) and confirms on its own once
-    the window fills, so a genuine talker only loses ~1 s, once."""
+    """True while a reply is in flight (generating or playing) but the
+    nonidle evidence so far is too sparse to interrupt on — the deferred
+    barge-in keeps counting (bargein_streak is NOT reset) and confirms
+    on its own once the window fills, so a genuine talker only loses
+    ~1 s, once."""
     now = now if now is not None else time.time()
-    if now >= session.playback_end:
+    if not _reply_in_flight(session):
         return False
     if not _playback_guard_active(session):
         return False
@@ -746,18 +788,21 @@ def _agent_deliver_entry(session, client_id, entry):
         max_history=settings.get("max_history"),
         min_seg_len=settings.get("min_seg_len"),
     )
-    with session.lock:
-        session.gen_in_progress = True
+    gen_sn = _begin_generation(session)
     try:
         return _run_speech_pipeline(
             session, client_id, gen, current_stop_event, tts_client, tts_options
         )
     finally:
         with session.lock:
-            session.gen_in_progress = False
+            # only clear if no newer generation began (a turn committed
+            # mid-delivery and its pipeline replaced this one)
+            if session.gen_serial == gen_sn:
+                session.gen_in_progress = False
 
 
-def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
+def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
+                    gen_sn=None):
     """
     Main processing pipeline: ASR -> LLM -> TTS.
     Runs in a background thread for each detected utterance.
@@ -792,15 +837,18 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
         # session.interrupt() below. The text check is the one
         # discriminator that needs no enrollment: a real user's words are
         # not a recall-≥0.6 garbled subsequence of our own recent output.
-        # Scope: only while playback is (grace-)active or just after a
-        # confirmed barge-in (interrupt zeroes playback_end, but dense
-        # echo is exactly what confirms a barge-in — its turn commits
-        # ~1 s later and must still be caught) — outside these windows a
-        # user may legitimately quote the assistant; and only with the
-        # guard on and the gate off — enforce mode already rejects these
-        # turns fail-closed (pvad_turn_gate below). The receive loop's
-        # episode-count drop (path a) catches the sub-4-character
-        # hallucination fragments this text check cannot see.
+        # Scope: only while a reply is in flight — generating OR playing,
+        # see _reply_in_flight (the 2026-11-03 01:01 incident's phantom
+        # turn landed in the generation window) — or just after a
+        # confirmed barge-in (interrupt zeroes playback_end and clears
+        # gen_in_progress, but dense echo is exactly what confirms a
+        # barge-in — its turn commits ~1 s later and must still be
+        # caught) — outside these windows a user may legitimately quote
+        # the assistant; and only with the guard on and the gate off —
+        # enforce mode already rejects these turns fail-closed
+        # (pvad_turn_gate below). The receive loop's episode-count drop
+        # (path a) catches the sub-4-character hallucination fragments
+        # this text check cannot see.
         recent_interrupt = (
             session.interruption_time is not None
             and time.time() - session.interruption_time
@@ -808,9 +856,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
         )
         if (not pvad_enabled(session)
                 and _playback_guard_active(session)
-                and (time.time()
-                     < session.playback_end + _PVAD_PLAYBACK_GRACE_S
-                     or recent_interrupt)
+                and (_reply_in_flight(session) or recent_interrupt)
                 and _pvad_selftalk_text(session, asr_text)):
             emit_to_room(
                 client_id, "selftalk_drop",
@@ -851,7 +897,16 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
             return
 
         logger.info(f"[{client_id}] ASR result: {asr_text}")
-        emit_to_room(client_id, "user_transcription", {"text": asr_text})
+        # final=True tells the frontend to FREEZE the live user bubble:
+        # the turn committed, this text is final. Without it, a phantom
+        # blip's partials/final arriving before the assistant bubble
+        # opens OVERWROTE the real sentence live in place (2026-11-03
+        # 01:01: "喂，你好，可以听到吗？" visibly became "是。" — the
+        # swallow the user reported, distinct from the turn itself).
+        emit_to_room(
+            client_id, "user_transcription",
+            {"text": asr_text, "final": True},
+        )
         # Bank this turn's speech for cross-turn speaker enrollment (only
         # reaches here with non-empty ASR text and a gate pass, so noise
         # and rejected turns never enter the bank)
@@ -944,6 +999,8 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
             else None
         )
         with session.lock:
+            # normally already True from _begin_generation at commit; set
+            # again for direct calls without one
             session.gen_in_progress = True
         try:
             fully_spoken = _run_speech_pipeline(
@@ -985,7 +1042,11 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
                     )
         finally:
             with session.lock:
-                session.gen_in_progress = False
+                # only clear if no newer generation began (an interrupted
+                # older pipeline's finally must not clear the flag out
+                # from under its replacement — see gen_serial)
+                if gen_sn is None or session.gen_serial == gen_sn:
+                    session.gen_in_progress = False
 
     except Exception as e:
         logger.error(f"Error in pipeline for {client_id}: {e}", exc_info=True)
@@ -1123,9 +1184,10 @@ async def websocket_endpoint(websocket: WebSocket):
         def _frc_commit(transcript):
             # same speech pipeline as the SoulX path; no grace window —
             # the dual-EOT decision already guards against premature turns
+            sn = _begin_generation(session)
             threading.Thread(
                 target=pipeline_worker,
-                args=(client_id, transcript, Config.SAMPLE_RATE, None),
+                args=(client_id, transcript, Config.SAMPLE_RATE, None, sn),
                 daemon=True,
             ).start()
 
@@ -1223,13 +1285,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     session.bargein_streak = 0
                     session.bargein_audio = []
                     session.voice_run = 0
-                    # clear idle = the episode is certainly over (real
-                    # speech alternates nonidle/idle with <=1-chunk gaps;
-                    # the turn server's wait path commits within ~0.8 s).
-                    # Start the next episode's evidence count fresh so
-                    # blips from minutes ago cannot inflate it.
-                    if time.time() - session.last_nonidle_ts > 2.5:
-                        session.episode_nonidle = 0
                 elif isinstance(segment, list) and segment[0] is None:
                     # Barge-in signal — hysteresis first: the turn server
                     # emits nonidle per chunk, and a 1-2 chunk blip (noise /
@@ -1252,6 +1307,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     # deque is pruned to the window; idle chunks do NOT
                     # clear it — see the Session field note)
                     now = time.time()
+                    # LAZY burst reset (2026-11-03): a voice burst is a
+                    # run of nonidle chunks with <= window-sized gaps.
+                    # Resetting here (on new nonidle after a long gap)
+                    # instead of in the idle branch means the episode
+                    # count at commit time is always "chunks of the
+                    # current burst", so (a) repeated episodic blips
+                    # (~2.2 s apart, measured) each read 1-2 and never
+                    # accumulate to the threshold — an idle-branch reset
+                    # at any gap < blip cadence let the 2nd+ blip's
+                    # phantom turn through (2026-11-03 test round), and
+                    # (b) a real turn's evidence survives ANY wait-path
+                    # silence length (turn_wait_ms is tunable to 3200 ms;
+                    # a time-based reset there dropped real turns).
+                    if now - session.last_nonidle_ts > _PLAYBACK_BARGEIN_WINDOW_S:
+                        session.episode_nonidle = 0
                     session.bargein_times.append(now)
                     session.episode_nonidle += 1
                     session.last_nonidle_ts = now
@@ -1288,6 +1358,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     run, session.voice_run = session.voice_run, 0
                     session.bargein_streak = 0
                     session.bargein_audio = []
+                    # the committed utterance's nonidle evidence must not
+                    # vouch for a LATER barge-in: without this clear, a
+                    # blip arriving ~0.8 s after the user's last chunk
+                    # rides their still-unexpired window count over the
+                    # 3-in-1.6s threshold, confirms a barge-in that kills
+                    # the just-started generation, and the follow-up
+                    # phantom turn then passes with in-flight already
+                    # False (2026-11-03 01:30 test round — and the same
+                    # structure as the 01:01 live incident). Real
+                    # overlapping speech re-accumulates 3 chunks in
+                    # ~0.5 s, so only blips lose their free ride.
+                    session.bargein_times.clear()
                     # Real-speech evidence for this turn: either sustained
                     # voice is STILL ongoing (run >= 3), or it happened
                     # moments ago — the turn server often emits the text
@@ -1320,25 +1402,28 @@ async def websocket_endpoint(websocket: WebSocket):
                              "text": str(segment)[:40]},
                         )
                         continue
-                    # Playback phantom-turn drop (2026-11-02 幻影话轮修复,
-                    # path (b) of the playback guard): an echo blip can
-                    # COMPLETE a turn on the turn server even though the
-                    # barge-in itself was deferred — 1-2 nonidle chunks of
-                    # faint TTS bleed, with paraformer hallucinating 1-3
-                    # characters onto them ("有。""这么。" — measured in
-                    # playback_echo_test phase 1; text below the 4-char
-                    # floor of the self-talk check, so the pipeline-side
-                    # text drop cannot catch these). episode_nonidle is
-                    # the discriminator the retired blip-turn filter
-                    # lacked: it counts the WHOLE episode without
-                    # requiring consecutiveness, so real browser speech
-                    # (~50% duty, 4-8 nonidle per utterance) passes while
-                    # a blip episode (1-2) never does.
-                    playing = (
-                        time.time()
-                        < session.playback_end + _PVAD_PLAYBACK_GRACE_S
-                    )
-                    if (playing and _playback_guard_active(session)
+                    # In-flight phantom-turn drop (2026-11-02 幻影话轮修复,
+                    # path (b) of the playback guard; window widened to the
+                    # generation phase 2026-11-03 after session 338b1765):
+                    # an echo/noise blip can COMPLETE a turn on the turn
+                    # server even though the barge-in itself was deferred —
+                    # 1-2 nonidle chunks of faint TTS bleed or breath
+                    # residue, with paraformer hallucinating 1-3 characters
+                    # onto them ("有。""这么。""是。" — measured in
+                    # playback_echo_test phase 1 and live 01:01). The live
+                    # case landed in the GENERATION window (reply not yet
+                    # audible, playback_end stale): the phantom turn
+                    # replaced the user's real sentence in the UI and
+                    # entered history. Text below the 4-char floor of the
+                    # self-talk check, so the pipeline-side text drop
+                    # cannot catch these. episode_nonidle is the
+                    # discriminator the retired blip-turn filter lacked:
+                    # it counts the WHOLE episode without requiring
+                    # consecutiveness, so real browser speech (~50% duty,
+                    # 4-8 nonidle per utterance) passes while a blip
+                    # episode (1-2) never does.
+                    in_flight = _reply_in_flight(session)
+                    if (in_flight and _playback_guard_active(session)
                             and session.episode_nonidle
                             < _PLAYBACK_BARGEIN_NONIDLE):
                         # NOTE: deliberately NO sustained-voice fallback
@@ -1352,9 +1437,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         # post-commit trailing fragments ("……了吧") lose
                         # out, during playback only.
                         logger.info(
-                            f"[{client_id}] playback blip turn dropped "
+                            f"[{client_id}] in-flight blip turn dropped "
                             f"({session.episode_nonidle} nonidle chunk(s) "
-                            f"in episode < {_PLAYBACK_BARGEIN_NONIDLE}): "
+                            f"in episode < {_PLAYBACK_BARGEIN_NONIDLE}"
+                            f"{', generating' if session.gen_in_progress else ''}): "
                             f"{str(segment)[:40]!r}"
                         )
                         emit_to_room(
@@ -1374,10 +1460,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     turn_trigger = getattr(
                         session.vad, "last_turn_trigger", None
                     )
+                    # flag the reply as generating NOW, at commit: the
+                    # worker thread's own set comes ~0.5 s later (gates +
+                    # LLM connect) and a blip in that gap slipped both
+                    # defenses (2026-11-03 01:26 test round)
+                    gen_sn = _begin_generation(session)
                     threading.Thread(
                         target=pipeline_worker,
                         args=(client_id, segment, Config.SAMPLE_RATE,
-                              turn_trigger),
+                              turn_trigger, gen_sn),
                         daemon=True,
                     ).start()
 
