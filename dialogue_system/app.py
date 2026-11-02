@@ -332,8 +332,14 @@ print("System initialized: VAD Pool, LLM client, TTS clients ready.")
 # now lives in pvad_gate.py — these are the constants the receive loop and
 # pipeline_worker below use directly)
 
-_BARGEIN_MIN_CHUNKS = 3   # consecutive nonidle chunks before a barge-in
-                          # acts (3 x 160 ms = 480 ms of sustained speech)
+_BARGEIN_MIN_CHUNKS = 0   # consecutive nonidle chunks before a barge-in
+                          # acts. 0 = no hysteresis: the FIRST nonidle chunk
+                          # goes straight to the gate (2026-10-30 迟滞下线；
+                          # previously 3 x 160 ms = 480 ms — the duplicate
+                          # storm is still absorbed by bargein_done /
+                          # pvad_checking). Blip-turn counting (below) reads
+                          # it too, so 0 also disables that count-based
+                          # branch (filter already off via _BLIPTURN_FILTER).
 _CHUNK_MS = 160            # one upstream audio chunk (2560 samples @16k) —
                           # converts turn_wait_ms to max_wait_num chunks
 # Premature-turn grace (2026-10-30 抢话修复): a "complete"-triggered turn
