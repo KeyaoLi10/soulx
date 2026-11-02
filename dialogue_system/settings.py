@@ -76,6 +76,14 @@ DEFAULT_SETTINGS = {
     # the window (pre-2026-10-30 behavior — not recommended, that was the
     # barge-in bug).
     "turn_grace_ms": 900,
+    # Playback barge-in guard (2026-11-02 幻影打断修复): while assistant
+    # audio is playing, a barge-in needs >= 3 nonidle chunks in a 1.6 s
+    # sliding window, and a turn that commits on sparser evidence is
+    # dropped — speaker echo / AEC residue arrives as 1-2-chunk episodic
+    # blips and must not chop the TTS. Off restores the raw zero-hysteresis
+    # behavior (instant interrupt on ANY nonidle chunk, phantom turns
+    # included). SoulX engine only.
+    "playback_guard": True,
 }
 
 # Validation for update_config: (key, type, lo, hi) — ints/floats clamped to
@@ -129,4 +137,6 @@ def sanitize_updates(data) -> dict:
         clean["turn_engine"] = data["turn_engine"]
     if "agent_enabled" in data:
         clean["agent_enabled"] = bool(data["agent_enabled"])
+    if "playback_guard" in data:
+        clean["playback_guard"] = bool(data["playback_guard"])
     return clean

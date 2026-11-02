@@ -12,6 +12,7 @@ import uuid
 import json
 import asyncio
 import numpy as np
+from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -92,6 +93,8 @@ import emitter
 from emitter import emit_to_room
 import pvad_gate
 from pvad_gate import (
+    _PVAD_PLAYBACK_GRACE_S,
+    _pvad_selftalk_text,
     pvad_bank_turn_audio,
     pvad_emit_status,
     pvad_enabled,
@@ -190,6 +193,22 @@ class ChatSession:
         # window can still hold the user's just-finished turn, which made
         # the first echo/noise onset score as the main speaker.
         self.bargein_audio = []
+        # Timestamps of recent nonidle chunks (rolling _PLAYBACK_BARGEIN_
+        # WINDOW_S) — duty-cycle evidence for the playback barge-in guard
+        # (2026-11-02 幻影打断修复; see the constants block). Unlike
+        # bargein_streak this survives across idle gaps, because browser-
+        # processed real speech alternates nonidle/idle (~50% duty) and
+        # never sustains a consecutive run.
+        self.bargein_times = deque()
+        # Nonidle chunks in the CURRENT turn episode (reset on each turn
+        # commit / 2.5 s of clear idle). Same duty-cycle idea as
+        # bargein_times but covering the WHOLE episode — a blip that
+        # completes a phantom turn (turn server commits, paraformer
+        # hallucinates 1-3 characters onto the echo) reads 1-2 here,
+        # while any real utterance long enough to be a turn reads 4-8
+        # even at browser-WebRTC's ~50% duty cycle.
+        self.episode_nonidle = 0
+        self.last_nonidle_ts = 0.0
         # One barge-in episode interrupts once: without this, continuous
         # overlapping speech re-triggers interrupt() every _BARGEIN_MIN_CHUNKS
         # chunks (a stop_audio storm measured at 4x per 2s barge-in).
@@ -344,6 +363,49 @@ _BARGEIN_MIN_CHUNKS = 0   # consecutive nonidle chunks before a barge-in
                           # pvad_checking). Blip-turn counting (below) reads
                           # it too, so 0 also disables that count-based
                           # branch (filter already off via _BLIPTURN_FILTER).
+# Playback-period barge-in guard (2026-11-02 幻影打断修复): with the
+# hysteresis off AND the pvad gate off (the default), a SINGLE nonidle
+# chunk of speaker echo / AEC residue stops the TTS instantly — measured
+# 2026-11-02 22:44 (external client, quiet room): several interrupts per
+# session, each ~1 s into playback, plus a few hallucinated characters
+# streamed to the UI. The consecutive-count hysteresis is NOT restorable
+# (browser-processed real speech alternates nonidle/idle at ~50% duty and
+# never sustains 3 consecutive chunks — the 2026-10-30 finding that
+# retired the blip-turn filter), so the guard counts nonidle chunks in a
+# SLIDING WINDOW instead: duty-cycle evidence, robust to that alternation.
+# Echo residue is episodic (1 chunk every few seconds) and never reaches
+# 3-in-window; real speech at 50% duty does within ~1 s. Only applies
+# while assistant audio is actually playing (playback_end in the future)
+# and the pvad gate is not in enforce mode (enforce has its own stronger
+# fail-closed playback check); outside playback nothing needs protecting
+# and the zero-latency first-chunk path is unchanged.
+_PLAYBACK_BARGEIN_WINDOW_S = 1.6   # evidence window (~10 chunks)
+_PLAYBACK_BARGEIN_NONIDLE = 3      # nonidle chunks needed inside it
+
+
+def _playback_guard_active(session):
+    """Master switch for the playback barge-in guard: the per-session
+    `playback_guard` setting (default on, live-tunable from the Settings
+    panel) AND not in pvad enforce mode (enforce has its own stronger
+    fail-closed playback checks on both the barge-in and turn paths)."""
+    if not session.settings.get("playback_guard", True):
+        return False
+    mode = session.settings.get("pvad_mode", DEFAULT_SETTINGS["pvad_mode"])
+    return not (pvad_enabled(session) and mode == "enforce")
+
+
+def _playback_bargein_deferred(session, now=None):
+    """True while assistant audio is playing but the nonidle evidence so
+    far is too sparse to interrupt on — the deferred barge-in keeps
+    counting (bargein_streak is NOT reset) and confirms on its own once
+    the window fills, so a genuine talker only loses ~1 s, once."""
+    now = now if now is not None else time.time()
+    if now >= session.playback_end:
+        return False
+    if not _playback_guard_active(session):
+        return False
+    return len(session.bargein_times) < _PLAYBACK_BARGEIN_NONIDLE
+
 _CHUNK_MS = 160            # one upstream audio chunk (2560 samples @16k) —
                           # converts turn_wait_ms to max_wait_num chunks
 # Premature-turn grace (2026-10-30 抢话修复): a "complete"-triggered turn
@@ -720,6 +782,44 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None):
             asr_text = asr.recognize(audio_segment, sample_rate)
 
         if not asr_text.strip():
+            return
+
+        # Playback self-talk drop (2026-11-02 幻影话轮修复): with the pvad
+        # gate off (the default), the barge-in guard stops the instant
+        # chop, but an echo blip can still COMPLETE a turn on the turn
+        # server — its transcription is a few characters of what we are
+        # saying right now — and interrupt playback down at the
+        # session.interrupt() below. The text check is the one
+        # discriminator that needs no enrollment: a real user's words are
+        # not a recall-≥0.6 garbled subsequence of our own recent output.
+        # Scope: only while playback is (grace-)active or just after a
+        # confirmed barge-in (interrupt zeroes playback_end, but dense
+        # echo is exactly what confirms a barge-in — its turn commits
+        # ~1 s later and must still be caught) — outside these windows a
+        # user may legitimately quote the assistant; and only with the
+        # guard on and the gate off — enforce mode already rejects these
+        # turns fail-closed (pvad_turn_gate below). The receive loop's
+        # episode-count drop (path a) catches the sub-4-character
+        # hallucination fragments this text check cannot see.
+        recent_interrupt = (
+            session.interruption_time is not None
+            and time.time() - session.interruption_time
+            < _PVAD_PLAYBACK_GRACE_S
+        )
+        if (not pvad_enabled(session)
+                and _playback_guard_active(session)
+                and (time.time()
+                     < session.playback_end + _PVAD_PLAYBACK_GRACE_S
+                     or recent_interrupt)
+                and _pvad_selftalk_text(session, asr_text)):
+            emit_to_room(
+                client_id, "selftalk_drop",
+                {"reason": "selftalk", "text": asr_text[:60]},
+            )
+            logger.info(
+                f"[{client_id}] self-talk turn dropped during playback "
+                f"(pvad off): {asr_text[:40]!r}"
+            )
             return
 
         # Main-speaker gate, AFTER ASR: the self-talk check needs the
@@ -1103,14 +1203,33 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if segment is None:
                     if session.bargein_streak:
+                        # unconfirmed nonidle blips: either below the
+                        # (now zero) hysteresis or deferred by the
+                        # playback guard. Emitting the event lets the UI
+                        # and the regression tests see the guard engage —
+                        # a silent pass would be indistinguishable from
+                        # "echo never classified as nonidle at all".
                         logger.info(
                             f"[{client_id}] transient barge-in suppressed "
-                            f"({session.bargein_streak} chunk(s) < "
-                            f"{_BARGEIN_MIN_CHUNKS})"
+                            f"({session.bargein_streak} unconfirmed chunk(s), "
+                            f"{len(session.bargein_times)} in "
+                            f"{_PLAYBACK_BARGEIN_WINDOW_S:.1f}s window)"
+                        )
+                        emit_to_room(
+                            client_id, "bargein_deferred",
+                            {"chunks": session.bargein_streak,
+                             "window": len(session.bargein_times)},
                         )
                     session.bargein_streak = 0
                     session.bargein_audio = []
                     session.voice_run = 0
+                    # clear idle = the episode is certainly over (real
+                    # speech alternates nonidle/idle with <=1-chunk gaps;
+                    # the turn server's wait path commits within ~0.8 s).
+                    # Start the next episode's evidence count fresh so
+                    # blips from minutes ago cannot inflate it.
+                    if time.time() - session.last_nonidle_ts > 2.5:
+                        session.episode_nonidle = 0
                 elif isinstance(segment, list) and segment[0] is None:
                     # Barge-in signal — hysteresis first: the turn server
                     # emits nonidle per chunk, and a 1-2 chunk blip (noise /
@@ -1129,7 +1248,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     session.bargein_audio.append(audio_chunk)
                     if len(session.bargein_audio) > 16:  # ~2.5 s rolling
                         del session.bargein_audio[0]
-                    if session.bargein_streak >= _BARGEIN_MIN_CHUNKS:
+                    # duty-cycle evidence for the playback guard (the
+                    # deque is pruned to the window; idle chunks do NOT
+                    # clear it — see the Session field note)
+                    now = time.time()
+                    session.bargein_times.append(now)
+                    session.episode_nonidle += 1
+                    session.last_nonidle_ts = now
+                    while (session.bargein_times
+                           and session.bargein_times[0]
+                           < now - _PLAYBACK_BARGEIN_WINDOW_S):
+                        session.bargein_times.popleft()
+                    if (session.bargein_streak >= _BARGEIN_MIN_CHUNKS
+                            and not _playback_bargein_deferred(session, now)):
                         # sustained voice: trusted evidence a human is
                         # talking — also opens the blip-filter's acceptance
                         # window (the turn text may arrive a few seconds
@@ -1142,6 +1273,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Voice activity (complete turn): push the delivery
                     # arbiter's quiet-gap boundary forward
                     session.last_voice_ts = time.time()
+                    if session.bargein_streak:
+                        # a deferred barge-in dissolved into a completed
+                        # turn without ever confirming — same evidence
+                        # signal as the suppression emit above (a blip
+                        # that went straight to a turn commit never sees
+                        # an idle chunk, so the other emit can't fire)
+                        emit_to_room(
+                            client_id, "bargein_deferred",
+                            {"chunks": session.bargein_streak,
+                             "window": len(session.bargein_times),
+                             "resolved": "turn"},
+                        )
                     run, session.voice_run = session.voice_run, 0
                     session.bargein_streak = 0
                     session.bargein_audio = []
@@ -1177,6 +1320,52 @@ async def websocket_endpoint(websocket: WebSocket):
                              "text": str(segment)[:40]},
                         )
                         continue
+                    # Playback phantom-turn drop (2026-11-02 幻影话轮修复,
+                    # path (b) of the playback guard): an echo blip can
+                    # COMPLETE a turn on the turn server even though the
+                    # barge-in itself was deferred — 1-2 nonidle chunks of
+                    # faint TTS bleed, with paraformer hallucinating 1-3
+                    # characters onto them ("有。""这么。" — measured in
+                    # playback_echo_test phase 1; text below the 4-char
+                    # floor of the self-talk check, so the pipeline-side
+                    # text drop cannot catch these). episode_nonidle is
+                    # the discriminator the retired blip-turn filter
+                    # lacked: it counts the WHOLE episode without
+                    # requiring consecutiveness, so real browser speech
+                    # (~50% duty, 4-8 nonidle per utterance) passes while
+                    # a blip episode (1-2) never does.
+                    playing = (
+                        time.time()
+                        < session.playback_end + _PVAD_PLAYBACK_GRACE_S
+                    )
+                    if (playing and _playback_guard_active(session)
+                            and session.episode_nonidle
+                            < _PLAYBACK_BARGEIN_NONIDLE):
+                        # NOTE: deliberately NO sustained-voice fallback
+                        # here (unlike the retired filter below): a
+                        # confirmed barge-in opens that window too, and a
+                        # LOUD echo blip is exactly what confirms a
+                        # barge-in — measured 2026-11-03 00:23, the 6 s
+                        # fallback let every blip turn after one confirmed
+                        # echo barge-in straight through. A real first
+                        # turn passes on its own episode evidence; only
+                        # post-commit trailing fragments ("……了吧") lose
+                        # out, during playback only.
+                        logger.info(
+                            f"[{client_id}] playback blip turn dropped "
+                            f"({session.episode_nonidle} nonidle chunk(s) "
+                            f"in episode < {_PLAYBACK_BARGEIN_NONIDLE}): "
+                            f"{str(segment)[:40]!r}"
+                        )
+                        emit_to_room(
+                            client_id, "selftalk_drop",
+                            {"reason": "blip",
+                             "chunks": session.episode_nonidle,
+                             "text": str(segment)[:40]},
+                        )
+                        session.episode_nonidle = 0
+                        continue
+                    session.episode_nonidle = 0
                     # Complete Utterance — pipeline_worker applies the
                     # main-speaker gate as its first step. Capture the
                     # trigger NOW, in the receive loop: the worker thread

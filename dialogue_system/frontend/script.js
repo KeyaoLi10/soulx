@@ -294,6 +294,9 @@ function onSocketMessage(event) {
       case 'pvad_reject':
         handlePvadReject(payload);
         break;
+      case 'selftalk_drop':
+        handleSelftalkDrop(payload);
+        break;
       case 'task_update':
         handleTaskUpdate(payload);
         break;
@@ -759,6 +762,7 @@ const settingsEls = {
   pvadProb: document.getElementById('pvadProb'),
   pvadNote: document.getElementById('pvadNote'),
   agentEnabled: document.getElementById('agentEnabled'),
+  playbackGuard: document.getElementById('playbackGuard'),
   taskList: document.getElementById('taskList'),
   taskEmpty: document.getElementById('taskEmpty'),
   taskCount: document.getElementById('taskCount'),
@@ -778,6 +782,7 @@ function currentSettings() {
     pvad_mode: settingsEls.pvadMode.value,
     pvad_threshold: parseFloat(settingsEls.pvadThreshold.value) || 0.5,
     agent_enabled: settingsEls.agentEnabled.checked,
+    playback_guard: settingsEls.playbackGuard.checked,
   };
 }
 
@@ -833,6 +838,7 @@ function debouncedSend() {
       pvad_mode: s.pvad_mode,
       pvad_threshold: s.pvad_threshold,
       agent_enabled: s.agent_enabled,
+      playback_guard: s.playback_guard,
     });
   }, 400);
 }
@@ -842,7 +848,7 @@ function debouncedSend() {
 // ignores them in frc mode).
 function syncTurnTimingState() {
   const frc = settingsEls.turnEngine.value === 'frc';
-  [settingsEls.turnWaitMs, settingsEls.turnGraceMs].forEach((el) => {
+  [settingsEls.turnWaitMs, settingsEls.turnGraceMs, settingsEls.playbackGuard].forEach((el) => {
     el.disabled = frc;
     el.closest('.field').classList.toggle('frc-off', frc);
   });
@@ -923,6 +929,18 @@ function handlePvadReject({ kind, cos, threshold, shadow }) {
     !shadow
   );
   console.log('[pvad] rejected', kind, { cos, threshold, shadow });
+}
+
+// Echo of our own TTS completed a phantom turn server-side and was dropped
+// (playback self-talk check, 2026-11-02): remove its stale live bubble —
+// the few characters the mic picked up from the speakers — so they don't
+// linger in the chat log as a user message that was never answered.
+function handleSelftalkDrop() {
+  if (lastMsg && lastMsg.role === 'user') {
+    lastMsg.body.parentElement?.remove();
+    lastMsg = null;
+  }
+  flashGateNote('已忽略回声（识别到的是我自己的声音）');
 }
 
 // ==================== Background Tasks (fast/slow brain agent) ====================

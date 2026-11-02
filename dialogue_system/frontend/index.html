@@ -139,6 +139,13 @@
           <span class="block-hint">A predicted-complete turn holds the reply this long before speaking — resume speaking inside the window to cancel it. 0 disables (not recommended). SoulX engine only.</span>
         </div>
         <div class="field">
+          <label for="playbackGuard" class="toggle-row">
+            <input id="playbackGuard" type="checkbox" checked>
+            <span>Playback echo guard</span>
+          </label>
+          <span class="block-hint">While the assistant is speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo-like phantom turns are dropped — speaker echo / AEC residue then cannot chop the reply. Off = raw zero-hysteresis behavior (any single sound interrupts). SoulX engine only.</span>
+        </div>
+        <div class="field">
           <label for="ttsEngine">Engine</label>
           <select id="ttsEngine" class="input">
             <option value="voxcpm">VoxCPM2</option>
