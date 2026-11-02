@@ -14,8 +14,15 @@ nonidle/idle alternation browser WebRTC produces on real speech;
 consecutive-count hysteresis is not, which is why it was retired).
 
 What this test exercises, in order (pvad OFF, default settings):
-  1. seed a turn, then SPARSE echo blips (2 chunks every ~2.6 s, the
-     measured episodic echo cadence) during playback
+  0. seed a turn, then SPARSE breath-level blips during the GENERATION
+     window (turn committed, first TTS audio not yet emitted — the live
+     2026-11-03 01:01 incident: a 1-2 chunk blip there killed the
+     in-flight generation via barge-in AND committed a phantom turn
+     "是。" that replaced the user's sentence in the UI)
+       -> no stop_audio, exactly one turn_start (generation survives,
+          no phantom pipeline hijacks the reply)
+  1. seed another turn, then SPARSE echo blips (2 chunks every ~2.6 s,
+     the measured episodic echo cadence) during playback
        -> no stop_audio while audio chunks are still being delivered
        -> at least one bargein_deferred event (the guard actually engaged;
           without this the pass would be vacuous — echo might never have
@@ -151,6 +158,45 @@ def stream_sparse_echo(ws, seconds, gain, rng):
             time.sleep(0.16)
 
 
+class BlipSlicer:
+    """Sequential 160 ms slices of a local wav at low gain — the
+    generation-phase stand-in for the echo source (nothing is audible
+    yet, so the live trigger there is breath/mic residue, not TTS
+    echo; quiet speech slices model it)."""
+
+    def __init__(self, wav):
+        self.wav = wav
+        self.i = 0
+
+    def take(self, gain):
+        x = self.wav[self.i: self.i + CHUNK]
+        self.i += CHUNK
+        if self.i >= len(self.wav):
+            self.i = 0
+        if x.shape[0] < CHUNK:
+            x = np.resize(x, CHUNK)
+        return x * gain
+
+
+def stream_sparse_blips(ws, seconds, slicer, gain, stop_predicate=None):
+    """Episodic quiet blips from a local source (generation-phase test)."""
+    z = np.zeros(CHUNK, dtype=np.float32)
+    t_next = time.time()
+    t_end = time.time() + seconds
+    while time.time() < t_end:
+        now = time.time()
+        if now >= t_next:
+            for _ in range(BLIP_LEN):
+                send(ws, slicer.take(gain))
+                time.sleep(0.16)
+            t_next = time.time() + BLIP_PERIOD_S - BLIP_LEN * 0.16
+        else:
+            send(ws, z)
+            time.sleep(0.16)
+        if stop_predicate is not None and stop_predicate():
+            break
+
+
 def window(t_from, t_to=None):
     with events_lock:
         return [
@@ -176,6 +222,29 @@ def wait_for(t_from, predicate, timeout, ws=None):
 
 def count(evs, name, pred=lambda d: True):
     return sum(1 for _, ev, d in evs if ev == name and pred(d))
+
+
+def drain_playback(ws, quiet_s=3.0, timeout=45.0):
+    """Stream silence until assistant audio has been quiet for quiet_s.
+
+    The next seed must start on a quiet background: while a reply is still
+    draining, _reply_in_flight stays true and the seed speech — identical
+    replayed audio whose content the empathetic reply just echoed — gets
+    split by the turn server and the tail fragment self-talk-dropped
+    (measured round 4: '您太紧张了我儿。' matched the assistant's own
+    '…最让您感到紧张的事情…' at 0.71 recall). That is a test artifact of
+    replaying one file against its own reply, not a live failure mode."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        with events_lock:
+            last_audio = max(
+                (ts for ts, ev, _ in events if ev == "audio_chunk"),
+                default=t0,
+            )
+        if time.time() - last_audio >= quiet_s:
+            return
+        send(ws, np.zeros(CHUNK, dtype=np.float32))
+        time.sleep(0.16)
 
 
 def seed_turn(ws, speech, label):
@@ -232,6 +301,70 @@ def main():
         print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}")
         if not cond:
             failures.append(name)
+
+    # ---- 0. breath-level blips during the GENERATION window -------------
+    # The 2026-11-03 01:01 live incident: right after the first turn
+    # commits (pipeline running, no TTS audio yet — playback_end stale,
+    # gen_in_progress the only "in flight" signal), a 1-2 chunk mic
+    # blip (a) confirmed a zero-evidence barge-in that killed the
+    # generation and (b) completed a phantom turn "是。" whose final
+    # transcription replaced the user's real sentence in the UI and
+    # entered LLM history. Blip from the moment the pipeline starts
+    # (final user_transcription — note: BEFORE turn_start, which only
+    # fires when the LLM's first segment is about to speak) until the
+    # first assistant audio.
+    t0 = time.time()
+    stream(ws, speech)
+    ok_final = wait_for(
+        t0,
+        lambda ev, d: ev == "user_transcription" and d.get("final"),
+        25, ws=ws,
+    )
+    check("turn 0 committed (final transcription)", ok_final)
+    # Anchor the phase-0 window on the final's OWN arrival timestamp, not
+    # on when this loop noticed it: turn_start is emitted at pipeline start
+    # — right after the final user_transcription, before the first LLM
+    # chunk — and can land between the final's arrival and the 0.16 s poll
+    # noticing it. Anchoring on time.time() lost turn_start to that race
+    # (round 4: n_ts=0 with the reply demonstrably streaming to Ratio 1.00).
+    finals = [
+        ts for ts, ev, d in window(t0)
+        if ev == "user_transcription" and d.get("final")
+    ]
+    tg = max(finals) if finals else time.time()
+    slicer = BlipSlicer(speech)
+    stream_sparse_blips(
+        ws, 8.0, slicer, gain,
+        stop_predicate=lambda: any(
+            ev == "audio_chunk" for _, ev, _ in window(tg)
+        ),
+    )
+    # the real reply must survive the blips and actually speak
+    ok_reply = wait_for(tg, lambda ev, d: ev == "turn_start", 20, ws=ws)
+    stream_silence(ws, 2.0)
+    evs = window(tg)
+    n_stop = count(evs, "stop_audio")
+    n_ts = count(evs, "turn_start")
+    n_text = count(evs, "text_response")
+    n_defer = count(evs, "bargein_deferred")
+    n_selftalk = count(evs, "selftalk_drop")
+    log("GEN", f"stop_audio={n_stop} turn_start={n_ts} text={n_text} "
+               f"bargein_deferred={n_defer} selftalk_drop={n_selftalk}")
+    check(
+        "generation-phase blips cannot kill or hijack the reply",
+        n_stop == 0 and n_ts == 1 and ok_reply and n_text >= 1,
+        f"stop_audio={n_stop} turn_start={n_ts} text={n_text} "
+        f"(pre-fix live: barge-in killed the in-flight generation, then "
+        f"a phantom '是。' turn spawned a second pipeline that replaced "
+        f"the user's sentence)",
+    )
+    if n_defer + n_selftalk == 0:
+        print(
+            "[WARN] generation-phase blips did not register this run "
+            f"(bargein_deferred=0 selftalk_drop=0) — engagement "
+            f"unverified, survival assertion still holds"
+        )
+    drain_playback(ws)
 
     # ---- 1. sparse echo during playback (tonight's live scenario) -------
     _, ok1 = seed_turn(ws, speech, "turn1")
@@ -300,7 +433,7 @@ def main():
         )
 
     # drain: let the reply finish / phantom turns settle before phase 2
-    stream_silence(ws, 3.0)
+    drain_playback(ws)
 
     # ---- 2. sustained real speech MUST still barge in during playback ---
     _, ok2 = seed_turn(ws, speech, "turn2")

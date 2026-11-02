@@ -33,3 +33,4 @@ nohup.out
 # API keys (plain files, never commit)
 apikey.txt
 *tavily*
+logs_key.txt
