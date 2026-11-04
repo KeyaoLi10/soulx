@@ -80,6 +80,29 @@ class TurnModel:
         )
         self.developer_mode = self.config.infer_config.developer_mode
 
+        # pre-latch gate knobs (rationale in config/config.py InferConfig)
+        self.nonidle_prob_gate = float(self.config.infer_config.nonidle_prob_gate)
+        self.nonidle_rms_gate = float(self.config.infer_config.nonidle_rms_gate)
+        self.mistake_no_text_reset = bool(
+            self.config.infer_config.mistake_no_text_reset
+        )
+        # D's own streak threshold, deliberately > max_mistake_num (rationale
+        # in config/config.py InferConfig)
+        self.mistake_no_text_num = int(
+            self.config.infer_config.mistake_no_text_num
+        )
+        # set when an escalated mistake_no_text distrust demands a reset();
+        # consumed by state_predict right after infer() returns (reset must
+        # not happen mid-infer, see _state_predict)
+        self._pending_reset = False
+        self.commit_no_text_reset = bool(
+            self.config.infer_config.commit_no_text_reset
+        )
+        self.asr_seed_trim = bool(self.config.infer_config.asr_seed_trim)
+        # synthetic seed length of buffer_for_asr (re-seeded on every
+        # reset()/clear_turn(), never truncated — see _trim_seed)
+        self.asr_seed_len = int(1.6 * self.sampling_rate)
+
     def _init_prompt_embeds(self):
         self.input_text_tokens = torch.tensor(
             self.model.tokenizer.encode("<|task_duplex_predict|><|punctuation_off|>")
@@ -112,6 +135,24 @@ class TurnModel:
         self.action_wait_embeds = self.embed_tokens_func(self.action_wait_token)
         self.non_idle_embeds = self.embed_tokens_func(self.non_idle_token)
 
+        # The 7 state tokens, for the pre-latch probability gate
+        # (_apply_prelatch_gates): argmax over the full vocab discards how
+        # confident the model actually is about "user is speaking".
+        mc = self.config.model_config
+        self.state_token_ids = torch.tensor(
+            [
+                mc.user_idle_token_id,
+                mc.user_nonidle_token_id,
+                mc.user_backchannel_token_id,
+                mc.user_complete_token_id,
+                mc.user_incomplete_token_id,
+                mc.assistant_backchannel_token_id,
+                mc.assistant_interrupt_token_id,
+            ],
+            device=self.device,
+        )
+        self.state_token_nonidle_idx = 1
+
     def reset(self):
         self.buffer = (
             np.random.randn(
@@ -122,6 +163,9 @@ class TurnModel:
         )
         self.buffer_for_asr = np.random.randn(int(1.6 * self.sampling_rate)) * 0.00001
         self.cascade_buffer = np.random.randn(int(3.2 * self.sampling_rate)) * 0.00001
+        # how much of cascade_buffer's front is the synthetic seed (0 once
+        # the 3.2s rolling truncation in _asr has evicted it) — see _trim_seed
+        self.cascade_seed_len = len(self.cascade_buffer)
         self.speech_detected = False
         self.past_state = None
         self.history_chunks = []
@@ -163,6 +207,7 @@ class TurnModel:
             "buffer": self.buffer,
             "buffer_for_asr": self.buffer_for_asr,
             "cascade_buffer": self.cascade_buffer,
+            "cascade_seed_len": self.cascade_seed_len,
             "speech_detected": self.speech_detected,
             "past_state": self.past_state,
             "history_chunks": self.history_chunks,
@@ -177,6 +222,7 @@ class TurnModel:
         self.buffer = state.get("buffer", self.buffer)
         self.buffer_for_asr = state.get("buffer_for_asr", self.buffer_for_asr)
         self.cascade_buffer = state.get("cascade_buffer", self.cascade_buffer)
+        self.cascade_seed_len = state.get("cascade_seed_len", 0)
         self.speech_detected = state.get("speech_detected", False)
         self.past_state = state.get("past_state")
         self.history_chunks = state.get("history_chunks", [])
@@ -220,10 +266,19 @@ class TurnModel:
         confirmation length (chunks). None -> config default. The model is
         shared across sessions, so this knob travels WITH the chunk instead
         of living on the model instance.
+
+        The returned dict may carry two extra keys (omitted when empty):
+          "gate": which blip gate rewrote this chunk's outcome
+                  (prob / rms / mistake_no_text / commit_no_text)
+          "diag": {p_nonidle, rms} for every pre-latch nonidle chunk — the
+                  calibration signal for the gate thresholds (Stage 0)
         """
         assert audio_chunk.dtype == np.float32
         # print(audio_chunk.shape)
         self.buffer = np.concatenate([self.buffer, audio_chunk])
+        # per-chunk transients, consumed at the end of this call
+        self.last_gate = None
+        self.last_diag = None
         delta_text = ""
         asr_buffer = ""
         predicted_state = {
@@ -239,6 +294,10 @@ class TurnModel:
             predicted_state = self.state_predict(
                 process_chunk, audio_back, audio_ahead, max_wait_num
             )
+            if self.last_gate is not None:
+                predicted_state["gate"] = self.last_gate
+            if self.last_diag is not None:
+                predicted_state["diag"] = self.last_diag
             self._log(f"[Timing] Total chunk: {time.time() - t_start:.4f}s\n\n")
 
         return predicted_state
@@ -247,6 +306,19 @@ class TurnModel:
         state, delta_text, asr_buffer = self.infer(
             process_chunk, audio_back, audio_ahead
         )
+
+        if self._pending_reset:
+            # escalated mistake_no_text distrust (see _state_predict): the
+            # model was stuck claiming speech with no words ever — start
+            # clean. Done here, outside infer(), like the far-field reset.
+            self._pending_reset = False
+            self.reset()
+            self.last_gate = {"gate": "mistake_no_text_reset"}
+            return {
+                "state": "idle",
+                "asr_segment": "",
+                "asr_buffer": "",
+            }
 
         if (
             self.get_rms(process_chunk) < self.config.infer_config.far_field_threshold
@@ -278,8 +350,23 @@ class TurnModel:
                     self._log("Continuous silence after wait, triggering reply")
                     if self.speech_detected:
                         segment = self.cascade_asr.recognize(
-                            self.buffer_for_asr, self.sampling_rate
+                            self._trim_seed(self.buffer_for_asr, self.asr_seed_len),
+                            self.sampling_rate,
                         )
+                        if self.commit_no_text_reset and not segment.strip():
+                            # Empty recognition: nothing was actually said —
+                            # drop the turn instead of committing a phantom.
+                            self._log("wait commit suppressed: empty text")
+                            self.reset()
+                            self.last_gate = {
+                                "gate": "commit_no_text",
+                                "trigger": "wait",
+                            }
+                            return {
+                                "state": "idle",
+                                "asr_segment": delta_text,
+                                "asr_buffer": asr_buffer,
+                            }
                         # self.clear_turn()
                         self.reset()
                         return {
@@ -354,8 +441,23 @@ class TurnModel:
                     [self.buffer_for_asr, process_chunk]
                 )
                 segment = self.cascade_asr.recognize(
-                    self.buffer_for_asr, self.sampling_rate
+                    self._trim_seed(self.buffer_for_asr, self.asr_seed_len),
+                    self.sampling_rate,
                 )
+                if self.commit_no_text_reset and not segment.strip():
+                    # Empty recognition: nothing was actually said —
+                    # drop the turn instead of committing a phantom.
+                    self._log("complete commit suppressed: empty text")
+                    self.reset()
+                    self.last_gate = {
+                        "gate": "commit_no_text",
+                        "trigger": "complete",
+                    }
+                    return {
+                        "state": "idle",
+                        "asr_segment": delta_text,
+                        "asr_buffer": asr_buffer,
+                    }
                 # self.clear_turn()
                 self.reset()
                 return {
@@ -404,6 +506,7 @@ class TurnModel:
                 "state": "",
                 "history_len": 0,
                 "mistake_len": 0,
+                "distrust_cnt": 0,
                 "checkpoint": None,
             }
 
@@ -417,7 +520,7 @@ class TurnModel:
 
         delta_text = self._asr(audio_embeds)
 
-        state = self._state_predict(delta_text)
+        state = self._state_predict(delta_text, audio_chunk)
 
         del audio_embeds
         torch.cuda.empty_cache()
@@ -518,7 +621,10 @@ class TurnModel:
                 # Speech detected -> Cascade ASR
                 t_asr = time.time()
                 full_text = remove_leading_backchannel(
-                    self.cascade_asr.recognize(self.cascade_buffer, self.sampling_rate)
+                    self.cascade_asr.recognize(
+                        self._trim_seed(self.cascade_buffer, self.cascade_seed_len),
+                        self.sampling_rate,
+                    )
                 )
                 self._log(f"[Timing] Cascade ASR: {time.time() - t_asr:.4f}s")
 
@@ -660,6 +766,9 @@ class TurnModel:
             max_len = int(3.2 * self.sampling_rate)
             if len(self.cascade_buffer) > max_len:
                 self.cascade_buffer = self.cascade_buffer[-max_len:]
+                # the synthetic seed (if any) just got evicted from the
+                # front — stop trimming it off in _asr (see _trim_seed)
+                self.cascade_seed_len = 0
 
                 delta_list = self.past_state["delta_text"][-20:]
                 total_tokens = 0
@@ -699,7 +808,78 @@ class TurnModel:
 
             return delta_text
 
-    def _state_predict(self, delta_text):
+    def _idle_pred(self):
+        """A 0-dim idle-token tensor, same shape as torch.argmax's output."""
+        return torch.tensor(
+            self.config.model_config.user_idle_token_id, device=self.device
+        )
+
+    def _apply_prelatch_gates(self, logits_last, pred, state, delta_text, audio_chunk):
+        """Pre-latch blip gates: keep breath/laugh residue from latching
+        speech_detected (the "对对对。" phantom-turn root cause).
+
+        The latch in state_predict fires on the FIRST nonidle chunk with no
+        further evidence, so a breath chunk that barely wins the argmax can
+        start a phantom turn. Before the latch, a nonidle chunk must earn it
+        via any ONE of:
+          - model confidence: p(nonidle) over the 7 state tokens >= prob gate
+          - energy: chunk RMS >= rms gate
+          - words: the cascade ASR already transcribed something (delta_text)
+        Gate thresholds live in infer_config; 0 disables a gate.
+
+        Returns (state, pred). pred is overridden alongside state because the
+        next-step input embeds are built from it — the model's KV narrative
+        must match the state this state machine actually acted on (same
+        convention as the complete/incomplete arbitration below).
+        """
+        if state != "<|user_nonidle|>" or self.speech_detected:
+            return state, pred
+
+        # calibration signal (Stage 0): always measure, gating is separate —
+        # the 7-way softmax is ~free next to the forward pass it follows.
+        # float() keeps np.float32 out of the JSON response.
+        probs = torch.softmax(logits_last[self.state_token_ids].float(), dim=-1)
+        p_nonidle = float(probs[self.state_token_nonidle_idx].item())
+        rms = float(self.get_rms(audio_chunk))
+        self.last_diag = {"p_nonidle": round(p_nonidle, 4), "rms": round(rms, 5)}
+
+        if delta_text:
+            return state, pred  # ASR already saw words — real speech
+
+        if self.nonidle_prob_gate > 0.0 and p_nonidle < self.nonidle_prob_gate:
+            self._log(f"[Gate] prob: p_nonidle={p_nonidle:.3f} rms={rms:.5f}")
+            self.last_gate = {
+                "gate": "prob",
+                "p_nonidle": round(p_nonidle, 4),
+                "rms": round(rms, 5),
+            }
+            return "<|user_idle|>", self._idle_pred()
+        if self.nonidle_rms_gate > 0.0 and rms < self.nonidle_rms_gate:
+            self._log(f"[Gate] rms: p_nonidle={p_nonidle:.3f} rms={rms:.5f}")
+            self.last_gate = {
+                "gate": "rms",
+                "p_nonidle": round(p_nonidle, 4),
+                "rms": round(rms, 5),
+            }
+            return "<|user_idle|>", self._idle_pred()
+        return state, pred
+
+    def _trim_seed(self, buf, seed_len):
+        """Drop the synthetic-noise seed from a recognition input.
+
+        reset()/clear_turn() seed buffer_for_asr (1.6s) and cascade_buffer
+        (3.2s) with synthetic noise to give paraformer a noise floor. That
+        noise can never contain speech, but prepended to near-silence it is
+        exactly the input paraformer hallucinates short text from — trim it.
+        seed_len is 0 once the rolling truncation has evicted the seed
+        (cascade_buffer only); callers pass self.asr_seed_len /
+        self.cascade_seed_len accordingly.
+        """
+        if not self.asr_seed_trim or seed_len <= 0 or len(buf) <= seed_len:
+            return buf
+        return buf[seed_len:]
+
+    def _state_predict(self, delta_text, audio_chunk):
         # 4. State Prediction (Feed EOS or Text+EOS)
         t_state = time.time()
         with torch.no_grad():
@@ -712,15 +892,63 @@ class TurnModel:
             pred = torch.argmax(logits, -1)[-1]
             state = self.model.tokenizer.decode(pred)
 
+            # pre-latch blip gates — must run BEFORE the mistake_len update
+            # below so a downgraded chunk resets the streak instead of
+            # feeding it
+            state, pred = self._apply_prelatch_gates(
+                logits[-1], pred, state, delta_text, audio_chunk
+            )
+
         if state == "<|user_nonidle|>" and not delta_text:
             self.past_state["mistake_len"] += 1
         else:
             self.past_state["mistake_len"] = 0
+            if delta_text:
+                # words arrived — the nonidle run is real, forget any distrust
+                self.past_state["distrust_cnt"] = 0
 
+        mistake_trigger = (
+            self.past_state["mistake_len"]
+            >= self.config.infer_config.max_mistake_num
+        )
+        no_text_trigger = (
+            self.mistake_no_text_reset
+            and self.past_state["mistake_len"] >= self.mistake_no_text_num
+        )
         if (
             self.past_state["state"] == "<|user_nonidle|>" and state == "<|user_idle|>"
-        ) or self.past_state["mistake_len"] >= self.config.infer_config.max_mistake_num:
-            if (
+        ) or mistake_trigger:
+            if no_text_trigger and not self.past_state.get("cascade_text", "").strip():
+                # The model has claimed speech for mistake_no_text_num chunks
+                # but the cascade ASR never saw a word: distrust the nonidle
+                # and end the streak as idle — WITHOUT consuming the turn.
+                # Arm the wait path instead: the ASR runs every chunk (see
+                # infer()), so a real utterance whose text is merely lagging
+                # still commits at the wait commit once words arrive, while a
+                # blip dies there via the empty-text guard. No reset() here —
+                # a slow-ASR real onset stays latched.
+                self._log("[Gate] mistake_no_text: nonidle streak without text")
+                self.last_gate = {"gate": "mistake_no_text"}
+                pred = self._idle_pred()
+                state = "<|user_idle|>"
+                self.past_state["mistake_len"] = 0
+                self.past_state["input_embeds"] = self.embed_tokens_func(
+                    pred.unsqueeze(0)
+                )
+                self.past_state["distrust_cnt"] = (
+                    self.past_state.get("distrust_cnt", 0) + 1
+                )
+                if self.past_state["distrust_cnt"] >= 2:
+                    # Second distrust on the same run and still no word ever:
+                    # the model is stuck claiming speech over silence — the
+                    # wait path can never fire (it needs idle chunks the
+                    # model refuses to predict). Escalate to a full reset so
+                    # the session cannot hang in nonidle.
+                    self._pending_reset = True
+                else:
+                    self.monitoring_wait_silence = True
+                    self.wait_idle_cnt = 0
+            elif (
                 logits[-1, self.config.model_config.user_complete_token_id]
                 > logits[-1, self.config.model_config.user_incomplete_token_id]
             ):

@@ -154,6 +154,16 @@ async def turn_ws(ws: WebSocket):
                 )
 
             if state is not None:
+                if state.get("gate"):
+                    # blip gate fired on this chunk (prob / rms /
+                    # mistake_no_text / commit_no_text) — one line per gated
+                    # chunk, rare by construction. flush: stdout is piped
+                    # through tee.
+                    print(
+                        f"[TurnTaking] GATE session {session_id[:8]} "
+                        f"{state['gate']}",
+                        flush=True,
+                    )
                 await ws.send_text(
                     json.dumps(
                         {
@@ -167,7 +177,12 @@ async def turn_ws(ws: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        print("[TurnTaking] websocket disconnected")
+        print("[TurnTaking] websocket disconnected", flush=True)
 
     except Exception as e:
-        print(f"[TurnTaking] websocket error: {e}")
+        # flush is load-bearing: stdout is piped through tee (block-buffered)
+        # — an unflushed exception here is invisible in turn.log
+        print(f"[TurnTaking] websocket error: {e}", flush=True)
+        import traceback
+
+        traceback.print_exc()

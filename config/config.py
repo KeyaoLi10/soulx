@@ -177,6 +177,41 @@ class InferConfig:
     max_mistake_num: int = 5
     far_field_threshold: float = 0.02
     developer_mode: bool = False
+
+    # --- pre-latch blip gates (phantom-turn prevention, 2026-11-04) ---
+    # speech_detected latches on the FIRST nonidle chunk with no
+    # confidence / energy / text evidence, so a post-utterance breath chunk
+    # that barely wins the argmax can start a phantom turn (the "对对对。"
+    # incident: hallucinated commit -> LLM). A pre-latch nonidle chunk now
+    # has to earn the latch via any ONE of: model confidence (prob gate),
+    # chunk energy (rms gate), or the cascade ASR having already seen words.
+    # Rejected alternative, do NOT reintroduce: a min-consecutive-nonidle
+    # latch count. Real WebRTC speech alternates nonidle/idle at ~50% duty
+    # and never sustains 3 consecutive nonidle chunks, while the incident
+    # blip was exactly 3 consecutive — consecutive counts invert the
+    # discriminator (real speech first, blips second).
+    nonidle_prob_gate: float = 0.5  # pre-latch p(nonidle) below this -> idle; 0 disables
+    nonidle_rms_gate: float = 0.0  # pre-latch chunk RMS below this -> idle; 0 disables
+    # mistake path (nonidle streak, cascade ASR saw no word) -> downgrade the
+    # chunk to idle and ARM the wait path: a real utterance with lagging text
+    # still commits at the wait commit (the ASR runs every chunk), a blip
+    # dies there via the empty-text guard, and a model stuck on nonidle
+    # escalates to a reset on the second distrust. Independent threshold:
+    # must exceed the text lag of real short utterances (a 480ms sentence
+    # hits a 3-chunk streak on its last chunk, before paraformer emits the
+    # words), while the shared max_mistake_num stays at the value that
+    # arbitrates mid-utterance text lag — conflating the two starves
+    # multi-sentence utterances of commits (full_utterance corpus
+    # regression, 2026-11-04)
+    mistake_no_text_reset: bool = True
+    mistake_no_text_num: int = 5
+    # commit with empty recognition -> reset instead of emitting "speak"
+    commit_no_text_reset: bool = True
+    # exclude the synthetic-noise seeds (1.6s buffer_for_asr / 3.2s
+    # cascade_buffer, see reset()) from every recognize() input — pure noise
+    # is paraformer's favourite hallucination substrate
+    asr_seed_trim: bool = True
+
     single_round: bool = False
     config_path: str = "config/config.yaml"
 
