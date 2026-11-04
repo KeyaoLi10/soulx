@@ -412,9 +412,34 @@ let userBubbleFinal = false;
 // body of the last FROZEN user bubble — the fold target for a continued
 // turn (append: true)
 let lastFinalUserBody = null;
+// Streaming-partial stability gate (2026-11-05): paraformer revises its
+// live partials mid-utterance on near-homophones — "你数到哪了" briefly
+// streamed as "你说" (数/说), "你再查" as "你是"/"你在这" — and every
+// revision flashed as a phantom word in the live bubble (commits stay
+// clean; this is display-only). A partial is therefore only shown once
+// the NEXT partial confirms it as a stable prefix; a revision never
+// reaches the screen, it just replaces the internal candidate. Costs one
+// partial update (~160-320ms) of live-caption lag; the final text always
+// renders verbatim. A lone partial (the "刚才" blip family) now shows
+// nothing at all.
+let stablePartial = null;   // prefix confirmed by a later partial
+let pendingPartial = null;  // newest partial, not yet confirmed
 
 function handleUserTranscription({ text, final, append }) {
   if (!text) return;
+  if (!final && !append) {
+    if (
+      pendingPartial !== null &&
+      text.length > pendingPartial.length &&
+      text.startsWith(pendingPartial) &&
+      (stablePartial === null || pendingPartial.length > stablePartial.length)
+    ) {
+      stablePartial = pendingPartial;
+    }
+    pendingPartial = text;
+    if (stablePartial === null) return;  // nothing confirmed yet
+    text = stablePartial;
+  }
   if (append && final && lastFinalUserBody && lastFinalUserBody.isConnected) {
     // Continued utterance (server flagged it: previous user turn recent,
     // no assistant audio in between — the same merge the LLM applies via
@@ -430,13 +455,21 @@ function handleUserTranscription({ text, final, append }) {
     lastFinalUserBody.textContent += text;
     lastMsg = { role: 'user', body: lastFinalUserBody };
     userBubbleFinal = true;
+    stablePartial = pendingPartial = null;
     flashBody(lastFinalUserBody);
     scrollLog();
     return;
   }
   if (lastMsg && lastMsg.role === 'user' && !userBubbleFinal) {
-    // Live update of the bubble being spoken into
-    lastMsg.body.textContent = text;
+    // Live update of the bubble being spoken into. The stability gate
+    // often maps consecutive partials to the same display text — skip
+    // the rewrite and the pulse when nothing changed.
+    if (lastMsg.body.textContent !== text) {
+      lastMsg.body.textContent = text;
+      flashBody(lastMsg.body);
+    } else if (!final) {
+      return;
+    }
   } else {
     lastMsg = { role: 'user', body: addMessage('user', text) };
     userBubbleFinal = false;
@@ -444,8 +477,9 @@ function handleUserTranscription({ text, final, append }) {
   if (final) {
     userBubbleFinal = true;
     lastFinalUserBody = lastMsg.body;
+    stablePartial = pendingPartial = null;
+    flashBody(lastMsg.body);
   }
-  flashBody(lastMsg.body);
 }
 
 function startAssistantMessage() {
@@ -980,6 +1014,8 @@ function handleSelftalkDrop({ reason } = {}) {
     lastMsg.body.parentElement?.remove();
     lastMsg = null;
   }
+  // the dropped turn's partial candidates are stale too
+  stablePartial = pendingPartial = null;
   flashGateNote(reason === 'blip'
     ? '已忽略幻影语音片段（未检测到有效人声）'
     : '已忽略回声（识别到的是我自己的声音）');
