@@ -149,6 +149,8 @@ def stream(sid, audio, fast=False):
             rec["gate"] = resp["gate"]
         if resp.get("diag"):
             rec["diag"] = resp["diag"]
+        if resp.get("asr_segment"):
+            rec["asr"] = resp["asr_segment"]
         if resp["state"] == "speak":
             rec["text"] = resp.get("text", "")
             rec["trigger"] = resp.get("trigger", "")
