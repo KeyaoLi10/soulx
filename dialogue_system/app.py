@@ -1129,9 +1129,16 @@ async def websocket_endpoint(websocket: WebSocket):
         vad_instance.status_callback = lambda s, m: emit_to_room(
             client_id, "vad_status", {"state": s, "message": m}
         )
-        vad_instance.transcription_callback = lambda t: emit_to_room(
-            client_id, "user_transcription", {"text": t}
-        )
+        # Partial ASR text streamed from the turn server's asr_buffer.
+        # Logged too (2026-11-04): blip partials like '刚才' flash in the
+        # UI but left NO web.log trace — the forensics for them could not
+        # even confirm WHEN they appeared. The turn server dedupes
+        # unchanged buffers, so this is one line per CHANGED partial.
+        def _on_partial_transcription(text):
+            logger.info(f"[{client_id}] ASR partial: {text}")
+            emit_to_room(client_id, "user_transcription", {"text": text})
+
+        vad_instance.transcription_callback = _on_partial_transcription
         vad_instance.circle_callback = lambda s: emit_to_room(
             client_id, "circle_status", {"status": s}
         )
@@ -1608,6 +1615,225 @@ async def list_logs(request: Request):
     except OSError:
         pass
     return {"logs": files}
+
+
+# ==== Structured session timeline API (frontend/sessions.html) ====
+# The raw tail+grep viewer answers "which lines exist", not "what happened
+# in this session, in what order" — the 2026-11-04 blip forensics
+# ('对对对。' committed on 3-chunk breath residue; '刚才' partials that
+# flash in the UI but left no log trace) had to be hand-reconstructed from
+# a dozen greps. These endpoints parse web.log's tail into per-session
+# event streams:
+#   /api/logs/sessions        -> session summaries, most recent first
+#   /api/logs/sessions/{id}   -> one session's full event list
+# Key-gated like the endpoints above. NOTE: both must stay declared
+# BEFORE /api/logs/{name} or FastAPI routes them into that catch-all.
+_LOG_SESSION_TAIL_BYTES = 16 * 1024 * 1024   # parse window: last 16 MiB
+_LOG_SESSION_MAX_EVENTS = 4000               # per-session event cap
+
+_LOG_TS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) \[\w+\] ?(.*)$"
+)
+_LOG_PREFIX_RE = re.compile(
+    r"^\[([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\]"
+    r" (.*)$"
+)
+
+_LOG_EVENT_PATTERNS = [
+    (re.compile(r"^barge-in confirmed"), "bargein"),
+    (re.compile(
+        r"^transient barge-in suppressed \((\d+) unconfirmed chunk\(s\), "
+        r"(\d+) in"), "suppressed"),
+    (re.compile(r"^ASR result: (.*)"), "turn"),
+    (re.compile(r"^ASR partial: (.*)"), "partial"),
+    (re.compile(r"^LLM Chunk: (.*)"), "chunk"),
+    (re.compile(r"^Previous turn, Ratio: ([\d.]+), Truncated: (.*)"),
+     "prev_ratio"),
+    (re.compile(
+        r"^Interrupted mid-stream\. Ratio: ([\d.]+)\. Truncated message: "
+        r"(.*)"), "interrupted"),
+    (re.compile(r"^in-flight blip turn dropped \((\d+) nonidle.*?\): (.*)"),
+     "drop_inflight"),
+    (re.compile(r"^playback blip turn dropped \((\d+) nonidle.*?\): (.*)"),
+     "drop_playback"),
+    (re.compile(
+        r"^self-talk turn dropped during playback \(pvad off\): (.*)"),
+     "drop_selftalk"),
+    (re.compile(r"^premature turn dropped"), "drop_premature"),
+    (re.compile(r"^Delivering background task (\S+)"), "deliver"),
+    (re.compile(r"^auto-delegated (\S+)"), "delegate"),
+    (re.compile(r"^Session manually stopped"), "stopped"),
+    (re.compile(r"^WebSocket error: (.*)"), "error"),
+    (re.compile(r"^vad\.process took ([\d.]+)s"), "slow_warn"),
+    (re.compile(r"^Settings updated: (.*)"), "settings"),
+]
+
+_session_log_cache = {"key": None, "result": None}
+
+
+def _parse_log_sessions() -> dict:
+    """web.log tail -> {sessions, truncated, records} (mtime+size cached)."""
+    path = Path(LOGS_DIR) / "web.log"
+    try:
+        st = path.stat()
+    except OSError:
+        return {"sessions": [], "truncated": False, "records": {}}
+    cache_key = (st.st_mtime_ns, st.st_size)
+    if _session_log_cache["key"] == cache_key:
+        return _session_log_cache["result"]
+
+    import ast
+    from datetime import datetime
+
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - _LOG_SESSION_TAIL_BYTES))
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    truncated = size > _LOG_SESSION_TAIL_BYTES
+    if truncated and lines:
+        lines = lines[1:]   # first line is a partial read
+
+    records = {}     # full id -> {id, start, end, events, settings}
+    open_ids = set()
+
+    def _sess(full_id, ts):
+        rec = records.get(full_id)
+        if rec is None:
+            rec = {"id": full_id, "start": ts, "end": ts,
+                   "events": [], "settings": None}
+            records[full_id] = rec
+        if ts > rec["end"]:
+            rec["end"] = ts
+        return rec
+
+    last_event = None   # multi-line continuations (LLM chunks, tracebacks)
+    for line in lines:
+        m = _LOG_TS_RE.match(line)
+        if not m:
+            # continuation of the previous event's text, or unattributable
+            # service noise (VadClient prints, uvicorn access lines)
+            if (last_event is not None
+                    and not line.startswith(("[VadClient]", "INFO:"))):
+                last_event["text"] = (
+                    last_event.get("text", "") + "\n" + line
+                ).strip()
+            continue
+        ts = (datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+              + int(m.group(2)) / 1000.0)
+        rest = m.group(3)
+        last_event = None
+
+        pm = _LOG_PREFIX_RE.match(rest)
+        if pm is not None:
+            rec = _sess(pm.group(1), ts)
+            msg = pm.group(2)
+        elif rest.startswith("New connection: "):
+            full = rest[len("New connection: "):].split()[0]
+            open_ids.add(full)
+            _sess(full, ts)
+            continue
+        elif rest.startswith("Session cleaned up: "):
+            full = rest[len("Session cleaned up: "):].split()[0]
+            open_ids.discard(full)
+            _sess(full, ts)
+            continue
+        elif rest.startswith("[slowbrain") and len(open_ids) == 1:
+            # slowbrain lines carry no session prefix; attribute them only
+            # when exactly one session is open (multi-tab is ambiguous)
+            rec = _sess(next(iter(open_ids)), ts)
+            if len(rec["events"]) < _LOG_SESSION_MAX_EVENTS:
+                ev = {"t": round(ts, 3), "k": "slowbrain", "text": rest}
+                rec["events"].append(ev)
+                last_event = ev
+            continue
+        else:
+            continue   # uvicorn access lines, VadClient prints, ...
+
+        for rx, kind in _LOG_EVENT_PATTERNS:
+            em = rx.match(msg)
+            if em is None:
+                continue
+            if kind == "settings":
+                try:
+                    d = ast.literal_eval(em.group(1))
+                except (ValueError, SyntaxError):
+                    break
+                if isinstance(d, dict):
+                    rec["settings"] = {
+                        k: d.get(k) for k in (
+                            "pvad_mode", "turn_engine", "playback_guard",
+                            "turn_wait_ms", "turn_grace_ms", "tts_engine",
+                            "agent_enabled",
+                        )
+                    }
+                break
+            ev = {"t": round(ts, 3), "k": kind}
+            g = em.groups()
+            if kind == "suppressed":
+                ev["n"], ev["w"] = int(g[0]), int(g[1])
+            elif kind in ("prev_ratio", "interrupted"):
+                ev["ratio"], ev["text"] = float(g[0]), g[1]
+            elif kind in ("drop_inflight", "drop_playback"):
+                ev["n"], ev["text"] = int(g[0]), g[1]
+            elif kind in ("turn", "partial", "chunk", "drop_selftalk",
+                          "error"):
+                ev["text"] = g[0]
+            elif kind in ("deliver", "delegate"):
+                ev["task"] = g[0]
+            elif kind == "slow_warn":
+                ev["dt"] = float(g[0])
+            if len(rec["events"]) < _LOG_SESSION_MAX_EVENTS:
+                rec["events"].append(ev)
+                last_event = ev
+            break
+
+    summaries = []
+    for rec in records.values():
+        counts = {}
+        for e in rec["events"]:
+            counts[e["k"]] = counts.get(e["k"], 0) + 1
+        summaries.append({
+            "id": rec["id"],
+            "start": rec["start"],
+            "end": rec["end"],
+            "n_events": len(rec["events"]),
+            "counts": counts,
+            "settings": rec["settings"],
+        })
+    summaries.sort(key=lambda s: s["start"], reverse=True)
+    result = {"sessions": summaries, "truncated": truncated,
+              "records": records}
+    _session_log_cache["key"] = cache_key
+    _session_log_cache["result"] = result
+    return result
+
+
+@app.get("/api/logs/sessions")
+async def log_sessions(request: Request):
+    err = _logs_key_error(request)
+    if err:
+        return err
+    result = _parse_log_sessions()
+    return {k: v for k, v in result.items() if k != "records"}
+
+
+@app.get("/api/logs/sessions/{sid}")
+async def log_session_detail(sid: str, request: Request):
+    err = _logs_key_error(request)
+    if err:
+        return err
+    rec = _parse_log_sessions()["records"].get(sid)
+    if rec is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "no such session"})
+    return {
+        "id": rec["id"],
+        "start": rec["start"],
+        "end": rec["end"],
+        "settings": rec["settings"],
+        "events": rec["events"],
+    }
 
 
 @app.get("/api/logs/{name}")
