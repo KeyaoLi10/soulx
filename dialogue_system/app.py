@@ -16,7 +16,7 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # SIGUSR1 dumps all thread tracebacks to stderr (web.log) — use when the
@@ -142,6 +142,12 @@ class ChatSession:
 
         # Audio config
         self.input_sample_rate = Config.SAMPLE_RATE
+
+        # Timeline forensics recorders (best-effort; see _SessionAudio).
+        # mic records what the turn server saw (post-resample 16 kHz),
+        # tts records the 24 kHz stream the browser plays.
+        self.audio_mic = _SessionAudio(client_id, "mic", Config.SAMPLE_RATE)
+        self.audio_tts = _SessionAudio(client_id, "tts", 24000)
 
         # Live settings (web UI panel) — see DEFAULT_SETTINGS
         self.settings = dict(DEFAULT_SETTINGS)
@@ -583,6 +589,7 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
             # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
             total_audio_duration += len(wav_chunk) / 48000.0
             emit_to_room(client_id, "audio_chunk", wav_chunk)
+            session.audio_tts.write(bytes(wav_chunk))
             # Estimated remaining buffered playback: chunks are emitted
             # as generated while the client plays them back in real
             # time, so what is left in the buffer is (duration emitted
@@ -1110,6 +1117,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     client_id = str(uuid.uuid4())
     logger.info(f"New connection: {client_id}")
+    _audio_retention_cleanup()
 
     session = None
 
@@ -1240,6 +1248,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_chunk = soxr.resample(
                         audio_chunk, current_sr, Config.SAMPLE_RATE, quality="VHQ"
                     )
+                    session.audio_mic.write(
+                        (np.clip(audio_chunk, -1.0, 1.0) * 32767.0)
+                        .astype(np.int16)
+                        .tobytes()
+                    )
+                else:
+                    session.audio_mic.write(data)   # already int16 @16k LE
 
                 # FireRedChat frontend mode: the chunk goes to the FrcEngine
                 # (pvad speech-activity endpointing → dual EOT → FireRedASR)
@@ -1553,6 +1568,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if session.frc:
                 session.frc.stop()
             session.pvad.stop()
+            session.audio_mic.close()
+            session.audio_tts.close()
             vad_pool.release(session.vad)
             session_manager.remove_session(client_id)
         logger.info(f"Session cleaned up: {client_id}")
@@ -1572,6 +1589,103 @@ LOGS_KEY_FILE = os.environ.get(
 _LOG_TAIL_BYTES = 512 * 1024   # efficient tail: read the last 512 KiB only
 _LOG_MAX_TAIL_LINES = 2000
 _LOG_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.log$")
+
+# ==== Session audio recording (timeline forensics, 2026-11-04) ====
+# sessions.html overlays mic/TTS waveforms on the event timeline — to hear
+# WHAT a blip actually was (breath? echo? real speech?) the server records
+# both streams as raw int16 mono PCM under logs/audio/:
+#   mic — post-resample 16 kHz, exactly what the turn server saw
+#   tts — the 24 kHz stream emitted to the browser
+# Serving is key-gated like the log API (the audio is personal data).
+# Disable with SOULX_AUDIO_RECORD=0.
+AUDIO_DIR = os.environ.get("SOULX_AUDIO_DIR", str(Path(LOGS_DIR) / "audio"))
+_AUDIO_RECORD = os.environ.get("SOULX_AUDIO_RECORD", "1") != "0"
+_AUDIO_MAX_SESSION_BYTES = 96 * 1024 * 1024   # per session per kind
+_AUDIO_RETENTION_DAYS = 3
+
+
+class _SessionAudio:
+    """Best-effort raw PCM recorder for one session/kind.
+
+    Writes never block or raise into the caller: recording is forensics,
+    not a feature the conversation depends on. The first write stamps a
+    sidecar .json (start epoch + rate) so the timeline can align the
+    waveform with log-event timestamps across restarts.
+    """
+
+    def __init__(self, sid, kind, rate):
+        self.rate = rate
+        self.path = Path(AUDIO_DIR) / f"{sid}.{kind}.pcm"
+        self.start = None
+        self.n = 0
+        self._f = None
+        self._lock = threading.Lock()
+        self._capped = False
+        if not _AUDIO_RECORD:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._f = open(self.path, "ab")
+        except OSError as e:
+            logger.warning(f"audio record {kind} unavailable: {e}")
+
+    def write(self, pcm):
+        if self._f is None:
+            return
+        with self._lock:
+            if self._capped:
+                return
+            try:
+                if self.start is None:
+                    self.start = time.time()
+                    self.path.with_suffix(".json").write_text(json.dumps(
+                        {"start": self.start, "rate": self.rate}))
+                self._f.write(pcm)
+                self.n += len(pcm)
+                if self.n >= _AUDIO_MAX_SESSION_BYTES:
+                    self._capped = True
+                    logger.warning(
+                        f"audio record {self.path.name} capped at "
+                        f"{_AUDIO_MAX_SESSION_BYTES >> 20} MiB"
+                    )
+            except OSError:
+                try:
+                    self._f.close()
+                except OSError:
+                    pass
+                self._f = None
+
+    def close(self):
+        with self._lock:
+            if self._f is not None:
+                try:
+                    self._f.close()
+                except OSError:
+                    pass
+                self._f = None
+
+
+_audio_cleanup_ts = 0.0
+
+
+def _audio_retention_cleanup():
+    """Drop recordings past the retention window (throttled to hourly)."""
+    global _audio_cleanup_ts
+    now = time.time()
+    if now - _audio_cleanup_ts < 3600:
+        return
+    _audio_cleanup_ts = now
+    cutoff = now - _AUDIO_RETENTION_DAYS * 86400
+    try:
+        entries = list(Path(AUDIO_DIR).iterdir())
+    except OSError:
+        return
+    for p in entries:
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
 
 
 def _logs_api_key() -> str:
@@ -1809,6 +1923,26 @@ def _parse_log_sessions() -> dict:
     return result
 
 
+def _audio_info(sid) -> dict:
+    """Recording metadata for the timeline (absent kinds = not recorded)."""
+    out = {}
+    for kind, default_rate in (("mic", 16000), ("tts", 24000)):
+        p = Path(AUDIO_DIR) / f"{sid}.{kind}.pcm"
+        try:
+            n = p.stat().st_size
+        except OSError:
+            continue
+        rate, start = default_rate, None
+        try:
+            meta = json.loads(p.with_suffix(".json").read_text())
+            rate = int(meta.get("rate", default_rate))
+            start = meta.get("start")
+        except (OSError, ValueError, TypeError):
+            pass
+        out[kind] = {"rate": rate, "start": start, "bytes": n}
+    return out
+
+
 @app.get("/api/logs/sessions")
 async def log_sessions(request: Request):
     err = _logs_key_error(request)
@@ -1833,7 +1967,83 @@ async def log_session_detail(sid: str, request: Request):
         "end": rec["end"],
         "settings": rec["settings"],
         "events": rec["events"],
+        "audio": _audio_info(sid),
     }
+
+
+def _wav_header(n_data: int, rate: int) -> bytes:
+    """Canonical 44-byte RIFF/WAVE header, mono 16-bit PCM."""
+    return (
+        b"RIFF" + (36 + n_data).to_bytes(4, "little") + b"WAVE"
+        + b"fmt " + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")            # PCM
+        + (1).to_bytes(2, "little")            # mono
+        + rate.to_bytes(4, "little")
+        + (rate * 2).to_bytes(4, "little")     # byte rate
+        + (2).to_bytes(2, "little")            # block align
+        + (16).to_bytes(2, "little")           # bits
+        + b"data" + n_data.to_bytes(4, "little")
+    )
+
+
+_LOG_SID_RE = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+
+
+@app.get("/api/logs/sessions/{sid}/audio/{kind}")
+async def log_session_audio(sid: str, kind: str, request: Request):
+    """Serve one session's recording as WAV (Range-capable for seeking)."""
+    err = _logs_key_error(request)
+    if err:
+        return err
+    if kind not in ("mic", "tts") or not _LOG_SID_RE.match(sid):
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    pcm_path = Path(AUDIO_DIR) / f"{sid}.{kind}.pcm"
+    try:
+        n_pcm = pcm_path.stat().st_size
+    except OSError:
+        return JSONResponse(status_code=404, content={"error": "no recording"})
+    rate = 16000 if kind == "mic" else 24000
+    total = 44 + n_pcm
+    header = _wav_header(n_pcm, rate)
+
+    # The header always describes the FULL file so the browser can map
+    # byte offsets to media time even on 206 slices of a live file.
+    rng = request.headers.get("range", "").strip()
+    m = re.match(r"^bytes=(\d+)-(\d*)$", rng)
+    start, end = 0, total - 1
+    if m:
+        start = min(int(m.group(1)), total - 1)
+        if m.group(2):
+            end = min(int(m.group(2)), total - 1)
+
+    def gen():
+        pos = start
+        if pos < 44:
+            take = min(end + 1, 44) - pos
+            yield header[pos:pos + take]
+            pos += take
+        if pos <= end:
+            with open(pcm_path, "rb") as f:
+                f.seek(pos - 44)
+                remaining = end - pos + 1
+                while remaining > 0:
+                    blk = f.read(min(remaining, 1 << 18))
+                    if not blk:
+                        break
+                    remaining -= len(blk)
+                    yield blk
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "audio/wav",
+        "Content-Length": str(end - start + 1),
+        "Cache-Control": "no-store",
+    }
+    if m:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    return StreamingResponse(
+        gen(), status_code=206 if m else 200, headers=headers
+    )
 
 
 @app.get("/api/logs/{name}")

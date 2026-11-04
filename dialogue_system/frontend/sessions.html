@@ -153,6 +153,23 @@
     #tl .mk { cursor: pointer; }
     #tl .mk:hover { filter: brightness(1.5); }
 
+    /* ---- audio waveform strips (aligned to the timeline X scale) ---- */
+    #waveWrap { padding: 6px 0 10px; }
+    .wrow { display: flex; align-items: center; margin-top: 8px; }
+    .wlabel {
+      width: 76px; flex-shrink: 0; padding-right: 8px;
+      display: flex; align-items: center; justify-content: flex-end; gap: 5px;
+      font-size: 10px; color: var(--muted); font-family: var(--mono);
+      white-space: nowrap;
+    }
+    .wlabel .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .wplot { position: relative; height: 46px; flex-shrink: 0;
+             cursor: pointer; }
+    .wplot canvas { position: absolute; top: 0; left: 0; }
+    .wplot:hover { background: rgba(255, 255, 255, 0.02); }
+    .whint { font-size: 11px; color: var(--faint); padding: 6px 0 0 76px; }
+    .whint .play { color: var(--muted); }
+
     #tblWrap { flex: 1; overflow-y: auto; min-height: 0; }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
     thead th {
@@ -233,7 +250,10 @@
     <section id="main">
       <div id="shead"></div>
       <div id="filters"></div>
-      <div id="tlWrap"><svg id="tl" xmlns="http://www.w3.org/2000/svg"></svg></div>
+      <div id="tlWrap">
+        <svg id="tl" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div id="waveWrap"></div>
+      </div>
       <div id="tblWrap">
         <table>
           <thead><tr><th>t+</th><th>事件</th><th>内容</th></tr></thead>
@@ -432,15 +452,22 @@
 
     // ---- timeline -----------------------------------------------------------
     const PAD_L = 76, PAD_R = 18, PAD_T = 10, LANE_H = 36, N_LANES = 5;
+    let tlW = 800;   // plot width shared by lanes and waveform strips
+
+    // session-time <-> x are one mapping everywhere (lanes, waves, playhead)
+    const tlSpan = () => Math.max(cur.end - cur.start, 1);
+    const xOfT = (t) => PAD_L + ((t - cur.start) / tlSpan()) * (tlW - PAD_L - PAD_R);
+    const tOfX = (x) => cur.start + ((x - PAD_L) / (tlW - PAD_L - PAD_R)) * tlSpan();
 
     function renderTimeline() {
       const svg = $("tl");
       const evs = filteredEvents();
       if (!cur) { svg.innerHTML = ""; svg.setAttribute("height", 0); return; }
       const W = Math.max(($("tlWrap").clientWidth || 800) - 4, 640);
+      tlW = W;
       const H = PAD_T + N_LANES * LANE_H + 24;
-      const t0 = cur.start, span = Math.max(cur.end - cur.start, 1);
-      const X = (t) => PAD_L + ((t - t0) / span) * (W - PAD_L - PAD_R);
+      const t0 = cur.start, span = tlSpan();
+      const X = xOfT;
 
       let s = "";
       // lane backgrounds, separators, labels
@@ -514,6 +541,190 @@
                    stroke="${PURPLE}" stroke-width="2.4" fill="none"${a}>${ttl}</path>`;
     }
 
+    // ---- session audio (waveform strips + click-to-listen) -------------------
+    // The server records mic (16k, what the turn server saw) and tts (24k,
+    // what the browser heard) per session; we fetch the WAVs once per
+    // selected session, decode locally and draw min/max peaks aligned to
+    // the timeline. Clicking a strip plays from that moment; a red playhead
+    // tracks playback across lanes and waves.
+    let audioState = { mic: null, tts: null };   // per selected session
+    let rafId = null;
+
+    async function loadAudio() {
+      for (const k of ["mic", "tts"]) {
+        const st = audioState[k];
+        if (st) {
+          if (st.el) st.el.pause();
+          if (st.url) URL.revokeObjectURL(st.url);
+        }
+      }
+      audioState = { mic: null, tts: null };
+      const info = cur && cur.audio;
+      if (!info) { renderWaveforms(); return; }
+      const jobs = ["mic", "tts"].filter((k) => info[k] && info[k].bytes)
+        .map(async (kind) => {
+          try {
+            const r = await fetch(
+              `/api/logs/sessions/${encodeURIComponent(cur.id)}/audio/${kind}` +
+              `?key=${encodeURIComponent(key)}`);
+            if (!r.ok) return;
+            const buf = await r.arrayBuffer();
+            const AC = window.AudioContext || window.webkitAudioContext;
+            const ctx = new AC();
+            let decoded;
+            try { decoded = await ctx.decodeAudioData(buf); }
+            finally { ctx.close(); }
+            audioState[kind] = {
+              buffer: decoded,
+              peaks: null,
+              url: URL.createObjectURL(new Blob([buf], { type: "audio/wav" })),
+              el: null,
+              start: info[kind].start || cur.start,   // epoch of first frame
+              base: null, over: null,
+            };
+          } catch (e) { console.warn("audio " + kind + ": " + e.message); }
+        });
+      await Promise.all(jobs);
+      renderWaveforms();
+    }
+
+    function computePeaks(buffer, buckets) {
+      const ch = buffer.getChannelData(0);
+      const n = ch.length;
+      const out = new Float32Array(buckets * 2);   // min/max per bucket
+      const per = n / buckets;
+      for (let b = 0; b < buckets; b++) {
+        const s = Math.floor(b * per);
+        const e = Math.min(Math.floor((b + 1) * per), n);
+        let mn = 0, mx = 0;
+        if (s < e) {
+          mn = 1; mx = -1;
+          // stride keeps this O(buckets * 64) even for long sessions
+          const stride = Math.max(1, Math.floor((e - s) / 64));
+          for (let i = s; i < e; i += stride) {
+            const v = ch[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+          }
+        }
+        out[b * 2] = mn; out[b * 2 + 1] = mx;
+      }
+      return out;
+    }
+
+    function drawPeaks(kind) {
+      const st = audioState[kind];
+      if (!st || !st.base || !st.peaks) return;
+      const c = st.base, ctx = c.getContext("2d");
+      const w = c.width, h = c.height, mid = h / 2;
+      ctx.clearRect(0, 0, w, h);
+      ctx.strokeStyle = kind === "mic" ? "#34d399" : "#60a5fa";
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const mn = st.peaks[x * 2], mx = st.peaks[x * 2 + 1];
+        const y1 = mid - mx * (mid - 2), y2 = mid - mn * (mid - 2);
+        if (y2 - y1 < 1) { ctx.moveTo(x, mid - 0.5); ctx.lineTo(x, mid + 0.5); }
+        else { ctx.moveTo(x, y1); ctx.lineTo(x, y2); }
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    function renderWaveforms() {
+      const wrap = $("waveWrap");
+      if (!cur) { wrap.innerHTML = ""; return; }
+      const plotW = Math.max(tlW - PAD_L - PAD_R, 100);
+      wrap.innerHTML = "";
+      let any = false;
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        const color = kind === "mic" ? "#34d399" : "#60a5fa";
+        const row = document.createElement("div");
+        row.className = "wrow";
+        const label = document.createElement("div");
+        label.className = "wlabel";
+        label.innerHTML = `<span class="dot" style="background:${color}"></span>` +
+          (kind === "mic" ? "麦克风" : "助手播放");
+        row.appendChild(label);
+        if (st) {
+          any = true;
+          const plot = document.createElement("div");
+          plot.className = "wplot";
+          plot.style.width = plotW + "px";
+          const base = document.createElement("canvas");
+          const over = document.createElement("canvas");
+          for (const c of [base, over]) {
+            c.width = plotW; c.height = 46;
+            c.style.width = plotW + "px"; c.style.height = "46px";
+          }
+          plot.appendChild(base); plot.appendChild(over);
+          row.appendChild(plot);
+          const spacer = document.createElement("div");
+          spacer.style.width = PAD_R + "px";
+          spacer.style.flexShrink = "0";
+          row.appendChild(spacer);
+          st.peaks = computePeaks(st.buffer, plotW);
+          st.base = base; st.over = over;
+          drawPeaks(kind);
+          plot.addEventListener("click", (e) => {
+            const rect = plot.getBoundingClientRect();
+            playFrom(kind, tOfX(e.clientX - rect.left + PAD_L));
+          });
+        }
+        wrap.appendChild(row);
+      }
+      const hint = document.createElement("div");
+      hint.className = "whint";
+      hint.innerHTML = any
+        ? '<span class="play">点击波形从该处试听（再点同一处暂停）· 红线为播放头</span>'
+        : "该会话无录音（会话录音 2026-11-04 上线，仅新会话有）";
+      wrap.appendChild(hint);
+    }
+
+    function playFrom(kind, tSession) {
+      const st = audioState[kind];
+      if (!st) return;
+      if (!st.el) st.el = new Audio(st.url);
+      const el = st.el;
+      const tLocal = tSession - st.start;
+      if (!el.paused && Math.abs(el.currentTime - tLocal) < 0.3) {
+        el.pause();
+        return;
+      }
+      const other = audioState[kind === "mic" ? "tts" : "mic"];
+      if (other && other.el) other.el.pause();
+      try {
+        el.currentTime = Math.max(
+          0, Math.min(tLocal, st.buffer.duration - 0.05));
+      } catch (e) { /* seek before metadata */ }
+      el.play().catch(() => {});
+      if (!rafId) rafId = requestAnimationFrame(drawPlayheads);
+    }
+
+    function drawPlayheads() {
+      let playing = false;
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (!st || !st.over) continue;
+        const c = st.over, ctx = c.getContext("2d");
+        ctx.clearRect(0, 0, c.width, c.height);
+        const el = st.el;
+        if (el && !el.paused) {
+          playing = true;
+          const x = xOfT(st.start + el.currentTime) - PAD_L;
+          if (x >= 0 && x <= c.width) {
+            ctx.strokeStyle = "#f87171";
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(x, 0); ctx.lineTo(x, c.height);
+            ctx.stroke();
+          }
+        }
+      }
+      rafId = playing ? requestAnimationFrame(drawPlayheads) : null;
+    }
+
     // ---- event table ---------------------------------------------------------
     function renderTable() {
       const tbody = $("tbl");
@@ -558,6 +769,7 @@
         return;
       }
       renderHeader(); renderFilters(); renderTimeline(); renderTable();
+      loadAudio();   // async: waves appear once decoded
     }
 
     async function loadSessions() {
@@ -608,7 +820,7 @@
     let rsz = null;
     window.addEventListener("resize", () => {
       clearTimeout(rsz);
-      rsz = setTimeout(renderTimeline, 150);
+      rsz = setTimeout(() => { renderTimeline(); renderWaveforms(); }, 150);
     });
     $("refreshBtn").addEventListener("click", cycle);
     $("activeOnly").addEventListener("change", renderSidebar);
