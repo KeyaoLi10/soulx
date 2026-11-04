@@ -83,6 +83,9 @@ class TurnModel:
         # pre-latch gate knobs (rationale in config/config.py InferConfig)
         self.nonidle_prob_gate = float(self.config.infer_config.nonidle_prob_gate)
         self.nonidle_rms_gate = float(self.config.infer_config.nonidle_rms_gate)
+        self.nonidle_text_bypass = bool(
+            self.config.infer_config.nonidle_text_bypass
+        )
         self.mistake_no_text_reset = bool(
             self.config.infer_config.mistake_no_text_reset
         )
@@ -821,10 +824,18 @@ class TurnModel:
         The latch in state_predict fires on the FIRST nonidle chunk with no
         further evidence, so a breath chunk that barely wins the argmax can
         start a phantom turn. Before the latch, a nonidle chunk must earn it
-        via any ONE of:
+        via BOTH:
           - model confidence: p(nonidle) over the 7 state tokens >= prob gate
           - energy: chunk RMS >= rms gate
-          - words: the cascade ASR already transcribed something (delta_text)
+        Words (delta_text) used to bypass both gates, but the cascade ASR
+        hallucinates single words on breath chunks exactly in this pre-latch
+        window (2026-11-04 "结说。" incident: latch chunk rms 0.004,
+        p_nonidle 0.914, hallucinated "去" — the text bypass overrode a
+        failing energy gate). Real onsets have never been observed below the
+        rms gate (measured minimum 0.012 vs gate 0.01), so the bypass
+        protected a case that does not occur while opening this one.
+        nonidle_text_bypass restores the old behavior if a genuinely
+        sub-gate-energy speech regime ever shows up.
         Gate thresholds live in infer_config; 0 disables a gate.
 
         Returns (state, pred). pred is overridden alongside state because the
@@ -843,7 +854,7 @@ class TurnModel:
         rms = float(self.get_rms(audio_chunk))
         self.last_diag = {"p_nonidle": round(p_nonidle, 4), "rms": round(rms, 5)}
 
-        if delta_text:
+        if delta_text and self.nonidle_text_bypass:
             return state, pred  # ASR already saw words — real speech
 
         if self.nonidle_prob_gate > 0.0 and p_nonidle < self.nonidle_prob_gate:

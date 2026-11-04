@@ -38,6 +38,11 @@ infer_config:
   #   real onset and ~2x above the blip/silence misfires.
   nonidle_prob_gate: 0.5
   nonidle_rms_gate: 0.01
+  # words (delta_text) may NOT bypass the prob/rms gates: paraformer
+  # hallucinates words on breath exactly in the pre-latch window (the
+  # "结说。" incident: latch chunk rms 0.004 + hallucinated word), and real
+  # onsets have never been observed below the rms gate (diag min 0.012)
+  nonidle_text_bypass: false
   mistake_no_text_reset: true
   # D's streak threshold: must clear the text lag of real short utterances
   # (a 480ms sentence hits a 3-chunk no-text streak on its last chunk —

@@ -179,12 +179,11 @@ class InferConfig:
     developer_mode: bool = False
 
     # --- pre-latch blip gates (phantom-turn prevention, 2026-11-04) ---
-    # speech_detected latches on the FIRST nonidle chunk with no
+    # speech_detected used to latch on the FIRST nonidle chunk with no
     # confidence / energy / text evidence, so a post-utterance breath chunk
-    # that barely wins the argmax can start a phantom turn (the "对对对。"
-    # incident: hallucinated commit -> LLM). A pre-latch nonidle chunk now
-    # has to earn the latch via any ONE of: model confidence (prob gate),
-    # chunk energy (rms gate), or the cascade ASR having already seen words.
+    # that barely won the argmax could start a phantom turn (the "对对对。"
+    # incident). A pre-latch nonidle chunk now has to clear the prob AND rms
+    # gates below (see nonidle_text_bypass for why words no longer exempt).
     # Rejected alternative, do NOT reintroduce: a min-consecutive-nonidle
     # latch count. Real WebRTC speech alternates nonidle/idle at ~50% duty
     # and never sustains 3 consecutive nonidle chunks, while the incident
@@ -192,6 +191,13 @@ class InferConfig:
     # discriminator (real speech first, blips second).
     nonidle_prob_gate: float = 0.5  # pre-latch p(nonidle) below this -> idle; 0 disables
     nonidle_rms_gate: float = 0.0  # pre-latch chunk RMS below this -> idle; 0 disables
+    # let delta_text bypass the prob/rms gates at latch time. OFF: the cascade
+    # ASR hallucinates words on breath chunks exactly pre-latch (the
+    # "结说。" incident latched on rms 0.004 via a hallucinated word), and real
+    # onsets have never been observed below the rms gate (min 0.012 vs gate
+    # 0.01). Turn back on only if a genuinely sub-gate-energy speech regime
+    # shows up in the diag logs.
+    nonidle_text_bypass: bool = False
     # mistake path (nonidle streak, cascade ASR saw no word) -> downgrade the
     # chunk to idle and ARM the wait path: a real utterance with lagging text
     # still commits at the wait commit (the ASR runs every chunk), a blip
