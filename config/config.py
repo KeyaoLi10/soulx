@@ -218,6 +218,38 @@ class InferConfig:
     # is paraformer's favourite hallucination substrate
     asr_seed_trim: bool = True
 
+    # --- turn-boundary energy guards (mid-word slicing, 2026-11-05) ---
+    # the counting incident (75d43f7b): the wait path committed on the 5th
+    # "idle" chunk that was actually the onset of 「重」 (rms 0.0388), and a
+    # <|user_complete|> fired mid-word on the 「数」 onset (rms 0.086) —
+    # both sliced the utterance inside words, which then wrecked the ASR
+    # text (十+数 -> 二十, orphaned 数慢一点 -> 煮慢一点). Model
+    # classification alone cannot veto either; energy can.
+    # wait-path: an idle-CLASSIFIED chunk counts toward the silence
+    # confirmation only if its RMS is also below nonidle_rms_gate (reuses
+    # the existing latch calibration: breaths ~0.004 pass, real onsets
+    # >= 0.012 never do). Cost: post-speech decay chunks no longer count,
+    # real-EOT wait commits land ~160-320 ms later.
+    wait_rms_veto: bool = True
+    # complete-path: a <|user_complete|> on an energetic chunk (rms >=
+    # complete_defer_rms_gate) is held for up to complete_defer_max_chunks
+    # idle-classified chunks before committing; a nonidle/incomplete
+    # classification cancels it (the turn continues). Calibration
+    # (results/blip_gate_replay, 2026-11-05): real-EOT completes at
+    # rms <= 0.045 (fluent speaker) / <= 0.005 (live user), the mid-word
+    # misfire at 0.086 — the gate sits between. Quiet-chunk completes
+    # (the normal EOT shape) are untouched: zero latency cost.
+    complete_defer: bool = True
+    complete_defer_rms_gate: float = 0.06
+    complete_defer_max_chunks: int = 1
+    # experimental cross-turn left context: seconds of the previous turn's
+    # real audio carried behind the fresh cascade seed at reset() so the
+    # next turn's recognition re-hears a boundary that still cut mid-word
+    # (duplicated head stripped via last_commit_text — char-level, see
+    # _strip_commit_overlap). 0 = off; C+D already eliminate the observed
+    # boundary failures, keep this off unless a residual case shows up.
+    asr_seed_backoff_s: float = 0.0
+
     single_round: bool = False
     config_path: str = "config/config.yaml"
 

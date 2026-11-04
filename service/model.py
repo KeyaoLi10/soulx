@@ -106,6 +106,51 @@ class TurnModel:
         # reset()/clear_turn(), never truncated — see _trim_seed)
         self.asr_seed_len = int(1.6 * self.sampling_rate)
 
+        # --- turn-boundary energy guards (2026-11-05 计数指令事故) ---
+        # wait_rms_veto: an idle-CLASSIFIED chunk only counts toward the
+        # wait-path silence confirmation if its RMS is also below
+        # nonidle_rms_gate. Without this the 5-chunk streak can complete
+        # on a real-speech onset the model briefly misclassified as idle
+        # (2026-11-04 counting incident: the streak-closing "idle" chunk
+        # was the onset of 「重」 at rms 0.0388) — the wait commit then
+        # resets mid-word and eats the onset for the next turn. Breaths
+        # (~0.004) still count; real onsets have never been observed
+        # below the gate (min 0.012). Cost at real EOTs: the 1-2 decay
+        # chunks right after speech no longer count, so wait commits
+        # land ~160-320 ms later.
+        self.wait_rms_veto = bool(self.config.infer_config.wait_rms_veto)
+        # complete_defer: a <|user_complete|> landing on an ENERGETIC chunk
+        # (rms >= complete_defer_rms_gate) may be riding the onset of the
+        # user's next word — hold the commit for up to
+        # complete_defer_max_chunks idle-classified chunks; a nonidle or
+        # incomplete classification in the meantime cancels it (the turn
+        # continues). Calibration (results/blip_gate_replay, 2026-11-05):
+        # real-EOT complete chunks sit at rms <= 0.045 (fluent eotbench
+        # speaker) and <= 0.005 (live user), the mid-word misfire at
+        # 0.086 — the gate sits between them. A real EOT above the gate
+        # only costs max_chunks * 160 ms.
+        self.complete_defer = bool(self.config.infer_config.complete_defer)
+        self.complete_defer_rms_gate = float(
+            self.config.infer_config.complete_defer_rms_gate
+        )
+        self.complete_defer_max_chunks = int(
+            self.config.infer_config.complete_defer_max_chunks
+        )
+        # None = no complete is being deferred; otherwise the number of
+        # idle-classified chunks seen since the deferral started
+        self.pending_complete_cnt = None
+        # experimental (default 0 = off): seconds of the previous turn's
+        # REAL audio carried in front of the fresh cascade seed at
+        # reset(), so the next turn's recognition re-hears the boundary
+        # (a commit that still cuts mid-word orphans the next turn's
+        # onset — the 「煮慢一点」 mishearing of 「数慢一点」). The
+        # duplicated trailing words are stripped from the next commit
+        # via _strip_commit_overlap (char-level, zh-oriented).
+        self.asr_seed_backoff_s = float(self.config.infer_config.asr_seed_backoff_s)
+        # last committed turn text (normalized punctuation-stripped form
+        # lives only inside _strip_commit_overlap); cross-turn by design
+        self.last_commit_text = ""
+
     def _init_prompt_embeds(self):
         self.input_text_tokens = torch.tensor(
             self.model.tokenizer.encode("<|task_duplex_predict|><|punctuation_off|>")
@@ -157,6 +202,28 @@ class TurnModel:
         self.state_token_nonidle_idx = 1
 
     def reset(self):
+        # experimental cross-turn left context (asr_seed_backoff_s, default
+        # 0 = off): carry the previous turn's final seconds of REAL audio
+        # behind the fresh synthetic cascade seed, so the next turn's
+        # recognition re-hears the boundary. A commit that still cut mid-
+        # word orphans the next turn's onset — the 「煮慢一点」 mishearing
+        # of 「数慢一点」. _strip_commit_overlap removes the duplicated
+        # trailing words from the next commit's text. The synthetic seed
+        # always sits at the FRONT of the buffer, so the tail is real
+        # audio as long as any real audio exists after the seed. On the
+        # constructor's first reset() the buffers do not exist yet —
+        # nothing to carry.
+        boff = (
+            int(self.asr_seed_backoff_s * self.sampling_rate)
+            if self.asr_seed_backoff_s > 0
+            else 0
+        )
+        tail = None
+        if boff and hasattr(self, "cascade_buffer"):
+            real_len = len(self.cascade_buffer) - self.cascade_seed_len
+            if real_len > 0:
+                tail = self.cascade_buffer[len(self.cascade_buffer) - min(boff, real_len) :]
+        seed_len = int(3.2 * self.sampling_rate) - (len(tail) if tail is not None else 0)
         self.buffer = (
             np.random.randn(
                 self.config.infer_config.input.audio_back_size
@@ -165,21 +232,28 @@ class TurnModel:
             * 0.0001
         )
         self.buffer_for_asr = np.random.randn(int(1.6 * self.sampling_rate)) * 0.00001
-        self.cascade_buffer = np.random.randn(int(3.2 * self.sampling_rate)) * 0.00001
+        seed = np.random.randn(seed_len) * 0.00001
+        self.cascade_buffer = (
+            np.concatenate([seed, tail]) if tail is not None else seed
+        )
         # how much of cascade_buffer's front is the synthetic seed (0 once
         # the 3.2s rolling truncation in _asr has evicted it) — see _trim_seed
-        self.cascade_seed_len = len(self.cascade_buffer)
+        self.cascade_seed_len = len(seed)
         self.speech_detected = False
         self.past_state = None
         self.history_chunks = []
         self.wait_idle_cnt = 0
         self.monitoring_wait_silence = False
+        # a deferred <|user_complete|> never survives a reset — reset ends
+        # a turn, and pending turns are only held WITHIN one
+        self.pending_complete_cnt = None
 
     def clear_turn(self):
         self.buffer_for_asr = np.random.randn(int(1.6 * self.sampling_rate)) * 0.00001
         self.speech_detected = False
         self.wait_idle_cnt = 0
         self.monitoring_wait_silence = False
+        self.pending_complete_cnt = None
 
     def _log(self, *args, **kwargs):
         # only for debugging, too much logging will slow down the inference
@@ -216,6 +290,8 @@ class TurnModel:
             "history_chunks": self.history_chunks,
             "wait_idle_cnt": self.wait_idle_cnt,
             "monitoring_wait_silence": self.monitoring_wait_silence,
+            "pending_complete_cnt": self.pending_complete_cnt,
+            "last_commit_text": self.last_commit_text,
         }
 
     def restore_runtime(self, state):
@@ -231,6 +307,8 @@ class TurnModel:
         self.history_chunks = state.get("history_chunks", [])
         self.wait_idle_cnt = state.get("wait_idle_cnt", 0)
         self.monitoring_wait_silence = state.get("monitoring_wait_silence", False)
+        self.pending_complete_cnt = state.get("pending_complete_cnt")
+        self.last_commit_text = state.get("last_commit_text", "")
 
     def get_chunk(self):
         if (
@@ -346,8 +424,39 @@ class TurnModel:
         if state == "<|user_idle|>":
             self._log("Silence detected")
 
-            if self.monitoring_wait_silence:
-                self.wait_idle_cnt += 1
+            if self.pending_complete_cnt is not None:
+                # deferred <|user_complete|> (complete_defer): the model now
+                # agrees the user went quiet — confirm the held commit. The
+                # wait path stays out of it while a complete is being held:
+                # this turn is in complete-confirmation, not wait-confirmation.
+                self.pending_complete_cnt += 1
+                if self.pending_complete_cnt >= self.complete_defer_max_chunks:
+                    self.pending_complete_cnt = None
+                    return self._complete_commit(
+                        delta_text, asr_buffer, process_chunk
+                    )
+
+            elif self.monitoring_wait_silence:
+                # wait_rms_veto: an idle CLASSIFICATION is not silence —
+                # onsets the model mislabels still carry speech energy. A
+                # chunk only counts toward the silence confirmation if it
+                # is also below the latch RMS gate (2026-11-04 counting
+                # incident: the streak-closing "idle" chunk was 「重」's
+                # onset at rms 0.0388; breaths ~0.004 still count, real
+                # onsets have never been observed under the gate). Cost:
+                # decay chunks right after speech end no longer count
+                # either, so real-EOT wait commits land ~160-320 ms later.
+                if (
+                    not self.wait_rms_veto
+                    or self.get_rms(process_chunk) < self.nonidle_rms_gate
+                ):
+                    self.wait_idle_cnt += 1
+                elif self.wait_idle_cnt > 0:
+                    # energetic "idle" chunk broke a counting streak — the
+                    # model misclassified a speech onset as silence (see the
+                    # 2026-11-04 counting incident). Surfaced as a gate so
+                    # turn.log's GATE lines show the veto doing its job.
+                    self.last_gate = {"gate": "wait_rms_veto"}
                 effective_wait = max_wait_num or self.config.infer_config["max_wait_num"]
                 if self.wait_idle_cnt >= effective_wait:
                     self._log("Continuous silence after wait, triggering reply")
@@ -356,6 +465,7 @@ class TurnModel:
                             self._trim_seed(self.buffer_for_asr, self.asr_seed_len),
                             self.sampling_rate,
                         )
+                        segment = self._strip_commit_overlap(segment)
                         if self.commit_no_text_reset and not segment.strip():
                             # Empty recognition: nothing was actually said —
                             # drop the turn instead of committing a phantom.
@@ -370,6 +480,7 @@ class TurnModel:
                                 "asr_segment": delta_text,
                                 "asr_buffer": asr_buffer,
                             }
+                        self.last_commit_text = segment
                         # self.clear_turn()
                         self.reset()
                         return {
@@ -394,6 +505,13 @@ class TurnModel:
         elif state == "<|user_nonidle|>":
             self._log("Speech detected", self.get_rms(process_chunk.astype(np.float32)))
             self.speech_detected = True
+
+            if self.pending_complete_cnt is not None:
+                # deferred complete was premature — the user kept talking;
+                # the turn continues (the 「十|数」 misfire shape)
+                self._log("deferred complete cancelled: speech resumed")
+                self.pending_complete_cnt = None
+                self.last_gate = {"gate": "complete_defer_cancel"}
 
             if self.monitoring_wait_silence:
                 self.monitoring_wait_silence = False
@@ -440,46 +558,45 @@ class TurnModel:
         elif state == "<|user_complete|>":
             self._log("User finished speaking, should reply now")
             if self.speech_detected:
-                self.buffer_for_asr = np.concatenate(
-                    [self.buffer_for_asr, process_chunk]
-                )
-                segment = self.cascade_asr.recognize(
-                    self._trim_seed(self.buffer_for_asr, self.asr_seed_len),
-                    self.sampling_rate,
-                )
-                if self.commit_no_text_reset and not segment.strip():
-                    # Empty recognition: nothing was actually said —
-                    # drop the turn instead of committing a phantom.
-                    self._log("complete commit suppressed: empty text")
-                    self.reset()
+                if (
+                    self.complete_defer
+                    and self.get_rms(process_chunk) >= self.complete_defer_rms_gate
+                ):
+                    # energetic complete (complete_defer): this chunk may
+                    # hold the onset of the user's next word — the
+                    # 「十|数」 misfire shape (rms 0.086 on the 数 onset,
+                    # vs <= 0.045 at every real-EOT complete in
+                    # calibration). Hold the commit for idle confirmation
+                    # (cancelled by a nonidle/incomplete classification).
+                    # The chunk still lands in buffer_for_asr so the
+                    # confirmed commit recognizes the full turn; the model
+                    # narrative itself is untouched — only the returned
+                    # action waits.
+                    self._log("complete deferred: energetic chunk")
+                    self.pending_complete_cnt = 0
                     self.last_gate = {
-                        "gate": "commit_no_text",
-                        "trigger": "complete",
+                        "gate": "complete_defer",
+                        "rms": round(float(self.get_rms(process_chunk)), 4),
                     }
+                    self.buffer_for_asr = np.concatenate(
+                        [self.buffer_for_asr, process_chunk]
+                    )
                     return {
-                        "state": "idle",
+                        "state": "nonidle",
                         "asr_segment": delta_text,
                         "asr_buffer": asr_buffer,
                     }
-                # self.clear_turn()
-                self.reset()
-                return {
-                    "state": "speak",
-                    "trigger": "complete",
-                    # "complete": <|user_complete|> fired the reply the
-                    # instant the model saw fit — zero silence confirmation,
-                    # so a mid-sentence pause can look like a finished turn.
-                    # The app applies a grace window to these (see
-                    # _run_speech_pipeline) to avoid barging in.
-                    "text": segment,
-                    "asr_segment": delta_text,
-                    "asr_buffer": asr_buffer,
-                }
+                return self._complete_commit(delta_text, asr_buffer, process_chunk)
             # self.clear_turn()
             self.reset()
 
         elif state == "<|user_incomplete|>":
             self._log("User hasn't finished speaking, wait")
+            if self.pending_complete_cnt is not None:
+                # model says the user isn't done — deferred complete was
+                # premature, the turn continues
+                self.pending_complete_cnt = None
+                self.last_gate = {"gate": "complete_defer_cancel"}
             # self.reset()
             self.monitoring_wait_silence = True
             self.wait_idle_cnt = 0
@@ -494,6 +611,65 @@ class TurnModel:
             "asr_segment": delta_text,
             "asr_buffer": asr_buffer,
         }
+
+    def _complete_commit(self, delta_text, asr_buffer, process_chunk):
+        """Commit the turn a <|user_complete|> ended — the direct path
+        (complete branch) and the deferred confirmation (complete_defer,
+        idle branch) share this. Recognizes buffer_for_asr + the current
+        chunk, applies the empty-text guard, records last_commit_text for
+        the backoff dedup, resets and returns the speak event."""
+        self.buffer_for_asr = np.concatenate([self.buffer_for_asr, process_chunk])
+        segment = self.cascade_asr.recognize(
+            self._trim_seed(self.buffer_for_asr, self.asr_seed_len),
+            self.sampling_rate,
+        )
+        segment = self._strip_commit_overlap(segment)
+        if self.commit_no_text_reset and not segment.strip():
+            # Empty recognition: nothing was actually said —
+            # drop the turn instead of committing a phantom.
+            self._log("complete commit suppressed: empty text")
+            self.reset()
+            self.last_gate = {
+                "gate": "commit_no_text",
+                "trigger": "complete",
+            }
+            return {
+                "state": "idle",
+                "asr_segment": delta_text,
+                "asr_buffer": asr_buffer,
+            }
+        self.last_commit_text = segment
+        # self.clear_turn()
+        self.reset()
+        return {
+            "state": "speak",
+            "trigger": "complete",
+            # "complete": <|user_complete|> fired the reply the
+            # instant the model saw fit — zero silence confirmation,
+            # so a mid-sentence pause can look like a finished turn.
+            # The app applies a grace window to these (see
+            # _run_speech_pipeline) to avoid barging in.
+            "text": segment,
+            "asr_segment": delta_text,
+            "asr_buffer": asr_buffer,
+        }
+
+    def _strip_commit_overlap(self, segment):
+        """With asr_seed_backoff_s > 0 the previous turn's final audio is
+        re-recognized at the head of the new turn's segment — drop the
+        duplicated head by matching it against the previous commit's tail.
+        Char-level match after punctuation stripping (1 char = 1 token for
+        zh; an English word counts as one char — acceptable for an
+        experimental, default-off knob; revisit with token-level LCS if it
+        ever goes on by default)."""
+        if not (self.asr_seed_backoff_s > 0 and self.last_commit_text and segment):
+            return segment
+        prev = zh_remove_punc(self.last_commit_text)
+        cur = zh_remove_punc(segment)
+        for k in range(min(8, len(prev), len(cur)), 0, -1):
+            if prev[-k:] == cur[:k]:
+                return segment[k:].lstrip() or segment
+        return segment
 
     @torch.no_grad()
     def infer(self, audio_chunk, audio_back, audio_ahead):

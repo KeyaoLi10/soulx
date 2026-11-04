@@ -409,9 +409,31 @@ function flashBody(body) {
 // sentence in place, and a selftalk_drop only ever removes that
 // unfrozen phantom bubble, never the frozen one.
 let userBubbleFinal = false;
+// body of the last FROZEN user bubble — the fold target for a continued
+// turn (append: true)
+let lastFinalUserBody = null;
 
-function handleUserTranscription({ text, final }) {
+function handleUserTranscription({ text, final, append }) {
   if (!text) return;
+  if (append && final && lastFinalUserBody && lastFinalUserBody.isConnected) {
+    // Continued utterance (server flagged it: previous user turn recent,
+    // no assistant audio in between — the same merge the LLM applies via
+    // groupby). Fold into the previous frozen bubble instead of opening a
+    // third one, and drop the live partial bubble this continuation was
+    // streaming into (it opened its own bubble once the previous froze).
+    if (
+      lastMsg && lastMsg.role === 'user' && !userBubbleFinal &&
+      lastMsg.body !== lastFinalUserBody
+    ) {
+      lastMsg.body.closest('.msg')?.remove();
+    }
+    lastFinalUserBody.textContent += text;
+    lastMsg = { role: 'user', body: lastFinalUserBody };
+    userBubbleFinal = true;
+    flashBody(lastFinalUserBody);
+    scrollLog();
+    return;
+  }
   if (lastMsg && lastMsg.role === 'user' && !userBubbleFinal) {
     // Live update of the bubble being spoken into
     lastMsg.body.textContent = text;
@@ -419,7 +441,10 @@ function handleUserTranscription({ text, final }) {
     lastMsg = { role: 'user', body: addMessage('user', text) };
     userBubbleFinal = false;
   }
-  if (final) userBubbleFinal = true;
+  if (final) {
+    userBubbleFinal = true;
+    lastFinalUserBody = lastMsg.body;
+  }
   flashBody(lastMsg.body);
 }
 

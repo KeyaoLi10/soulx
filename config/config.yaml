@@ -54,6 +54,31 @@ infer_config:
   commit_no_text_reset: true
   asr_seed_trim: true
 
+  # turn-boundary energy guards (2026-11-05, counting incident 75d43f7b) —
+  # the wait path committed on an "idle"-classified onset chunk (重, rms
+  # 0.0388) and a complete fired mid-word on the 数 onset (rms 0.086); both
+  # sliced words in half and wrecked the ASR text. Model classification
+  # alone cannot veto either; energy can.
+  #   wait_rms_veto: idle-classified chunks count toward the wait silence
+  #   confirmation only if rms < nonidle_rms_gate (0.01, reusing the latch
+  #   calibration — breaths 0.004 pass, onsets >= 0.012 never). Cost:
+  #   post-speech decay chunks no longer count, real-EOT wait commits land
+  #   ~160-320 ms later.
+  #   complete_defer: a complete on an energetic chunk (rms >= gate) is
+  #   held for complete_defer_max_chunks idle-classified chunks; a
+  #   nonidle/incomplete classification cancels it. Calibration: real-EOT
+  #   completes rms <= 0.045 (fluent) / <= 0.005 (live user) vs the mid-word
+  #   misfire 0.086. Quiet-chunk completes (normal EOT) untouched: zero cost.
+  wait_rms_veto: true
+  complete_defer: true
+  complete_defer_rms_gate: 0.06
+  complete_defer_max_chunks: 1
+  # experimental (default off): carry the previous turn's final seconds of
+  # real audio behind the fresh cascade seed at reset() so the next turn's
+  # recognition re-hears a still-mid-word boundary (duplicated head stripped
+  # via last_commit_text). C+D already eliminate the observed failures.
+  asr_seed_backoff_s: 0.0
+
   input:
     chunk_size: 2560
     audio_back_size: 15360

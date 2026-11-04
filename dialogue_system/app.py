@@ -256,6 +256,14 @@ class ChatSession:
         # Wall-clock of the last user voice activity (barge-in chunks or a
         # completed turn) — the delivery arbiter waits for a quiet gap.
         self.last_voice_ts = 0.0
+        # UI continuation merge (2026-11-05): wall-clock of the last FINAL
+        # user transcription, and wall-clock of the last assistant audio
+        # emission. A new user turn whose last_user_turn_ts is recent and
+        # predates any assistant audio is a continued utterance the turn
+        # server split (LLM side already merges via groupby) — it gets
+        # append: true so the frontend folds it into the previous bubble.
+        self.last_user_turn_ts = 0.0
+        self.assistant_audible_ts = 0.0
         # AgentRuntime (task mgmt + delivery arbiter). Created in the
         # websocket endpoint once the session is registered.
         self.agent_runtime = None
@@ -492,6 +500,33 @@ _SUSTAINED_VOICE_WINDOW_S = 6.0
 # 判据（pvad 身份门控方向或音频取证），代码保留待判据成立后启用。
 _BLIPTURN_FILTER = False
 
+# UI continuation-merge window (2026-11-05): a turn-server split of ONE
+# user utterance lands its follow-up commit within a couple seconds of the
+# previous one (the counting incident's three bubbles spanned ~2s). The
+# LLM side already merges such turns (llm_client groupby joins consecutive
+# user messages with "\n"); this window lets the UI mirror that semantics.
+# Deliberately generous — a false positive only concatenates two adjacent
+# user bubbles that the LLM saw as one turn anyway; a false negative
+# re-splits an utterance the LLM merged.
+_USER_TURN_MERGE_WINDOW_S = 4.0
+
+
+def _is_continuation_turn(session):
+    """Should this final user transcription be appended to the previous
+    user bubble instead of opening a new one? Mirrors the LLM-side groupby
+    merge: the previous user turn is recent (within
+    _USER_TURN_MERGE_WINDOW_S) and NO assistant audio has been audible
+    since it (assistant_audible_ts < last_user_turn_ts). With no assistant
+    speech in between, two rapid user turns are one continued utterance
+    the turn server sliced — or, at worst, a quick restatement, which the
+    LLM already treats as one message."""
+    now = time.time()
+    return bool(
+        session.last_user_turn_ts
+        and now - session.last_user_turn_ts < _USER_TURN_MERGE_WINDOW_S
+        and session.assistant_audible_ts < session.last_user_turn_ts
+    )
+
 
 def _commit_pending_message(session, client_id):
     """Commit the previous generation's assistant message into LLM history,
@@ -585,6 +620,11 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
                 return True
             if first_emit_time is None:
                 first_emit_time = time.time()
+                # assistant audio is now audible (or about to be, within
+                # client buffer latency): any user turn committed AFTER
+                # this point is a new conversational turn, not a
+                # continuation of the previous user utterance
+                session.assistant_audible_ts = time.time()
             # Calculate audio duration: bytes / (sample_rate * channels * bytes_per_sample)
             # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
             total_audio_duration += len(wav_chunk) / 48000.0
@@ -910,10 +950,19 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         # opens OVERWROTE the real sentence live in place (2026-11-03
         # 01:01: "喂，你好，可以听到吗？" visibly became "是。" — the
         # swallow the user reported, distinct from the turn itself).
+        # append=True marks a CONTINUATION of the previous user turn —
+        # same semantics the LLM side applies via groupby (llm_client
+        # add_message merges consecutive user messages): recent previous
+        # user turn, no assistant audio audible since it, within the
+        # merge window. The frontend folds it into the previous frozen
+        # bubble instead of opening a third one (2026-11-05 counting
+        # incident: one instruction surfaced as three user bubbles).
+        append = _is_continuation_turn(session)
         emit_to_room(
             client_id, "user_transcription",
-            {"text": asr_text, "final": True},
+            {"text": asr_text, "final": True, "append": append},
         )
+        session.last_user_turn_ts = time.time()
         # Bank this turn's speech for cross-turn speaker enrollment (only
         # reaches here with non-empty ASR text and a gate pass, so noise
         # and rejected turns never enter the bank)
