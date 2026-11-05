@@ -29,12 +29,14 @@ from clients.llm_client import TOOL_QUIET  # [[quiet]] success marker this
 # acceptance fix of 2026-10-30 in llm_client.generate_agent_with_history.
 
 MAX_RUNNING_TASKS = 2
-MAX_DELIVERY_ATTEMPTS = 2
 # retries for deliveries killed before ANY audio was audible (stop inside
 # the LLM generation window): the user never heard a word, so it is not a
-# rejection and must not consume MAX_DELIVERY_ATTEMPTS. Bounded separately
-# because every retry re-injects the result note into LLM history — a user
-# who keeps talking at every natural gap must not loop notes in forever.
+# rejection and must be retried. Bounded because every retry re-injects
+# the result note into LLM history — a user who keeps talking at every
+# natural gap must not loop notes in forever. An interruption AFTER audio
+# was audible is a rejection and is terminal (2026-11-05 user directive:
+# 播报到中间打断不重试 — the result stays answerable via the note/task
+# view, the user will ask if they still want it).
 MAX_SILENT_DELIVERY_RETRIES = 3
 ARBITER_POLL_S = 0.5
 # after this many seconds a completed-but-undeliverable result is delivered
@@ -470,20 +472,20 @@ class AgentRuntime:
                 # interrupted BEFORE any audio was audible (typically a
                 # barge-in landing inside the delivery generation window):
                 # the user never heard the report, so this is not a
-                # rejection — retry without consuming the rejection
+                # rejection — retry at the next natural gap on the silent
                 # budget. Measured 2026-11-05 17:22: two consecutive
-                # generation-window kills exhausted MAX_DELIVERY_ATTEMPTS
-                # and the result was never proactively reported.
+                # generation-window kills exhausted the old attempt
+                # budget and the result was never proactively reported.
                 entry["silent_kills"] = entry.get("silent_kills", 0) + 1
                 with self.lock:
                     self.agenda.insert(0, entry)
-            elif (fully_spoken is False
-                    and entry["attempts"] < MAX_DELIVERY_ATTEMPTS):
-                # interrupted mid-report, i.e. the user HEARD it and cut
-                # in: try again at the next natural gap, but only once more
-                with self.lock:
-                    self.agenda.insert(0, entry)
             else:
+                # terminal: fully spoken; OR interrupted after audio was
+                # audible — the user HEARD the report and cut in, which is
+                # a rejection and must not retry (2026-11-05 17:36: the
+                # re-delivered report was cut off mid-speech and the user
+                # expected no further attempt); OR the silent budget is
+                # exhausted.
                 with self.lock:
                     t = self.tasks.get(entry["task_id"])
                     # both outcomes count as "spoken to the user"

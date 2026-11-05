@@ -87,6 +87,40 @@ class QwenLLM_stream:
 
         self.sessions[client_id] = merged[-self.MAX_BUFFER_SESSION :]
 
+    def pop_message(self, client_id: int, role: str, content: str) -> bool:
+        """Retract one message (by exact role+content) from the TAIL of a
+        session. add_message merges consecutive same-role messages with
+        "\\n", so a message appended next to `content` may share one entry
+        with it — in that case only the `content` portion is stripped.
+        Returns True if anything was removed.
+
+        Used by the delivery path to retract a result note whose delivery
+        was killed before any audio was audible: while the note sits in
+        history, the user's next ordinary reply reads it and speaks the
+        result, and the re-enqueued retry then says it AGAIN (measured
+        2026-11-05 17:36: full report spoken by the user-turn pipeline,
+        then re-delivered in full — the user heard it twice)."""
+        session = self.get_session(client_id)
+        if not session:
+            return False
+        msg = session[-1]
+        if msg["role"] != role:
+            return False
+        c = msg["content"]
+        if c == content:
+            del session[-1]
+            return True
+        if c.startswith(content + "\n"):
+            msg["content"] = c[len(content) + 1:]
+            return True
+        if c.endswith("\n" + content):
+            msg["content"] = c[: len(c) - len(content) - 1]
+            return True
+        if ("\n" + content + "\n") in c:
+            msg["content"] = c.replace("\n" + content + "\n", "\n", 1)
+            return True
+        return False
+
     def pop_segment(self, buffer: str, min_len: int = None):
         if min_len is None:
             min_len = self.MIN_LEN_FOR_SEG

@@ -579,12 +579,14 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
 
     - True  — the generation ran to completion;
     - False — interrupted AFTER audio was emitted (the user heard at least
-      part of it; for the delivery arbiter this counts as a rejection and
-      consumes a MAX_DELIVERY_ATTEMPTS slot);
+      part of it; for the delivery arbiter this is a rejection — terminal,
+      no retry: they will ask if they still want it);
     - None  — stopped before ANY audio was emitted (stop inside the LLM
       generator, or during the first synthesis, or a premature-turn drop):
       the user never heard a word, so the delivery arbiter must NOT count
-      it as a rejection — it retries on a separate silent budget instead.
+      it as a rejection — it retries on a separate silent budget instead
+      (and _agent_deliver_entry retracts the result note so the report
+      has exactly one outlet at a time).
 
     Used by BOTH speech outlets — the user-turn pipeline and the
     background-result delivery — so the whole system has exactly one way
@@ -866,10 +868,11 @@ def _agent_can_deliver(session):
 def _agent_deliver_entry(session, client_id, entry):
     """Speak one completed background task result through the normal speech
     pipeline. Tri-state return, passed straight through to the arbiter:
-    True = fully spoken; False = interrupted after audio was audible
-    (counts as a rejection, consumes a delivery attempt); None = stopped
-    before any audio existed (the user never heard the report — the
-    arbiter retries on its separate silent budget)."""
+    True = fully spoken; False = interrupted after audio was audible (a
+    rejection — terminal, no retry); None = stopped before any audio
+    existed (the user never heard the report — the arbiter retries on its
+    separate silent budget, and the result note is retracted so the
+    user-turn pipeline cannot speak the report meanwhile)."""
     _commit_pending_message(session, client_id)
     session.interrupt()  # stop anything still lingering
     session.reset_interrupt()
@@ -913,9 +916,22 @@ def _agent_deliver_entry(session, client_id, entry):
     )
     gen_sn = _begin_generation(session)
     try:
-        return _run_speech_pipeline(
+        ret = _run_speech_pipeline(
             session, client_id, gen, current_stop_event, tts_client, tts_options
         )
+        if ret is None:
+            # Silent kill: retract the result note. While it sits in
+            # history the user's next ordinary reply reads it and speaks
+            # the result, and the re-enqueued retry would then say it
+            # AGAIN (measured 2026-11-05 17:36: full report spoken by the
+            # user-turn pipeline, then re-delivered in full). The retry
+            # re-injects a fresh note.
+            if llm.pop_message(client_id, "user", note):
+                logger.info(
+                    f"[{client_id}] delivery killed before audio: "
+                    f"result note retracted (retry re-injects)"
+                )
+        return ret
     finally:
         with session.lock:
             # only clear if no newer generation began (a turn committed
