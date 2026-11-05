@@ -174,7 +174,9 @@ CREATE TABLE IF NOT EXISTS route_log(
 _DLV_TRANSITIONS = {
     C.DLV_PENDING: {C.DLV_RENDERING, C.DLV_SENDING, C.DLV_SUPPRESSED,
                     C.DLV_FAILED, C.DLV_RETRY_EXHAUSTED},
-    C.DLV_RENDERING: {C.DLV_SENDING, C.DLV_SUPPRESSED, C.DLV_FAILED},
+    # rendering->pending：静默掐死重试（一个字没播，重新渲染重试）
+    C.DLV_RENDERING: {C.DLV_SENDING, C.DLV_SUPPRESSED, C.DLV_FAILED,
+                      C.DLV_PENDING, C.DLV_RETRY_EXHAUSTED},
     C.DLV_SENDING: {C.DLV_SENT_UNCONFIRMED, C.DLV_SUPPRESSED, C.DLV_FAILED},
     C.DLV_SENT_UNCONFIRMED: {C.DLV_PLAYED_CONFIRMED,
                              C.DLV_INTERRUPTED_PARTIAL,
@@ -1069,10 +1071,17 @@ class AgentStore:
                 (outbox_id,)).fetchone()
             if cur is None or cur["lease_token"] != token:
                 return False
-            self._conn.execute(
-                "UPDATE outbox SET state=? WHERE outbox_id=?",
-                (state if state in ("done", "failed", "pending")
-                 else "done", outbox_id))
+            state = state if state in ("done", "failed", "pending") else "done"
+            if state == "pending":
+                # 归还：必须清 lease，否则未过期的 lease_expires_at
+                # 会挡住下一次 claim（state='pending' 但 lease 未失效）
+                self._conn.execute(
+                    "UPDATE outbox SET state='pending', lease_token=NULL, "
+                    "lease_expires_at=NULL WHERE outbox_id=?", (outbox_id,))
+            else:
+                self._conn.execute(
+                    "UPDATE outbox SET state=? WHERE outbox_id=?",
+                    (state, outbox_id))
             return True
 
     # -------------------------------------------------------------- 路由日志
@@ -1088,3 +1097,60 @@ class AgentStore:
                  json.dumps(snapshot or {}, ensure_ascii=False, default=str),
                  plan_json, None if parse_ok is None else int(parse_ok),
                  error, latency_ms, self._now()))
+
+
+    # ------------------------------------------------- 调度器辅助（P1d 加法）
+
+    def count_active_runs(self, session_id):
+        """该会话仍在执行的 run 数（running/stop_requested 且有有效 lease）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT lease_expires_at FROM runs WHERE session_id=? AND "
+                "state IN ('running','stop_requested')",
+                (session_id,)).fetchall()
+            now = time.time()
+            return sum(1 for r in rows
+                       if r["lease_expires_at"] and r["lease_expires_at"] > now)
+
+    def set_task_blocked(self, session_id, task_id, reason):
+        """依赖失败/取消 → 下游 blocked_dependency（只允许从 queued 迁移）。"""
+        with self._tx():
+            t = self.task_row(session_id, task_id)
+            if t is None or t["execution_status"] != C.EXEC_QUEUED:
+                return False
+            self._conn.execute(
+                "UPDATE tasks SET execution_status=?, updated_at=? WHERE "
+                "session_id=? AND task_id=?",
+                (C.EXEC_BLOCKED_DEPENDENCY, self._now(), session_id, task_id))
+            self._append_event(session_id, "dependency_blocked",
+                               task_id=task_id, payload={"reason": reason})
+            return True
+
+    def latest_event(self, session_id, etype, task_id=None, revision=None):
+        with self._lock:
+            q = ("SELECT * FROM events WHERE session_id=? AND type=?")
+            args = [session_id, etype]
+            if task_id:
+                q += " AND task_id=?"
+                args.append(task_id)
+            if revision is not None:
+                q += " AND revision=?"
+                args.append(revision)
+            q += " ORDER BY seq DESC LIMIT 1"
+            row = self._conn.execute(q, args).fetchone()
+            return dict(row) if row else None
+
+    # ------------------------------------------------- 锁外公共入口（P1d 加法）
+
+    def append_event(self, session_id, etype, task_id=None, revision=None,
+                     run_id=None, payload=None):
+        """scheduler/delivery 在事务外加事件的公共入口。"""
+        with self._tx():
+            return self._append_event(session_id, etype, task_id=task_id,
+                                      revision=revision, run_id=run_id,
+                                      payload=payload)
+
+    def enqueue_outbox(self, session_id, kind, payload):
+        """scheduler/delivery 在事务外投递 outbox 条目的公共入口。"""
+        with self._tx():
+            self._enqueue(session_id, kind, payload)

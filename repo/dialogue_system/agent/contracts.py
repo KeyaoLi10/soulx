@@ -39,6 +39,7 @@ EXEC_WAITING_INPUT = "waiting_input"
 EXEC_CANCEL_REQUESTED = "cancel_requested"
 EXEC_CANCELED = "canceled"
 EXEC_SUPERSEDED = "superseded"
+EXEC_BLOCKED_DEPENDENCY = "blocked_dependency"
 
 # 交付状态（手册 §5.3）
 DLV_PENDING = "pending"

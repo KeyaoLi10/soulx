@@ -503,3 +503,164 @@ class AgentRuntime:
         act = [f"{t.id}:{t.goal[:20]}" for t in self.tasks.values()
                if t.status in ("queued", "running")]
         return "; ".join(act)
+
+
+# ===========================================================================
+# AgentRuntimeV2（agent-runtime P1d，手册 §3/§8/§6.1）。上方的 legacy
+# AgentRuntime 原样保留——app.py 的 legacy/shadow 路径继续用它；enforce
+# 模式（P3 接入）才实例化本类。新控制器 = 串行状态入口 + scheduler +
+# delivery，模型调用全部在锁外。
+# ===========================================================================
+
+from agent import contracts as _C
+from agent import store as _S
+from agent.scheduler import TaskScheduler
+from agent.delivery import DeliveryManager
+
+ROUTER_DEADLINE_S = 10.0
+
+
+class AgentRuntimeV2:
+    """每会话一个实例不必要——store 以 session_id 隔离；一个进程一个
+    V2 控制器即可（手册 §8：单一序列化状态入口）。"""
+
+    def __init__(self, db_path=None, router_fn=None, runner=None,
+                 speak_fn=None, can_deliver_fn=None,
+                 grace_gate=None, mode="enforce"):
+        self.store = _S.AgentStore(db_path) if db_path else \
+            _S.AgentStore()
+        self.router = router_fn          # (session_id, text, snapshot) -> plan_json
+        self.mode = mode
+        self.grace_gate = grace_gate or (lambda sid: True)
+        self.scheduler = TaskScheduler(self.store, runner)
+        self.delivery = DeliveryManager(self.store, speak_fn,
+                                        can_deliver_fn)
+        self._pending = {}               # session_id -> plan 持有
+        self._pending_lock = threading.Lock()
+        self._plan_version = {}
+
+    # ------------------------------------------------------------- 生命周期
+
+    def ensure_session(self, session_id, timezone="Asia/Shanghai"):
+        self.store.ensure_session(session_id, timezone)
+
+    def bind_connection_epoch(self, session_id, epoch):
+        self.store.bind_connection_epoch(session_id, epoch)
+
+    def start_background(self):
+        self.scheduler.start()
+        self.delivery.start()
+
+    def stop_background(self):
+        self.scheduler.stop()
+        self.delivery.stop()
+        self.store.close()
+
+    # ------------------------------------------------------------- 请求入口
+
+    def snapshot_for_router(self, session_id):
+        """§7.1 输入快照：任务表 + 待答问题（控制轮恒看任务快照——
+        裁决：表达轮保持 _TASK_MENTION_RE 门控，不受此影响）。"""
+        tasks = self.store.task_view(session_id)
+        return {
+            "tasks": tasks,
+            "pending_questions": [
+                {"task_id": t["task_id"], "revision": t["revision"],
+                 "question_id": self.store.task_row(
+                     session_id, t["task_id"])["pending_question_id"],
+                 "question": self.store.task_row(
+                     session_id, t["task_id"])["pending_question"]}
+                for t in tasks
+                if t["execution_status"] == _C.EXEC_WAITING_INPUT],
+        }
+
+    def submit_request(self, session_id, text, source_commit_id=None,
+                       input_revision=1, engine_epoch="", connection_epoch=0):
+        """登记请求 → 快照 → 路由（锁外、只读推断，grace 内允许）。
+        返回 dict；plan 保持在 pending，等 grace 通过后 commit_pending。
+        路由失败/超时 → ok=False，终态释放，不让后续请求等（§6.2）。"""
+        self.store.ensure_session(session_id)
+        if connection_epoch:
+            self.store.bind_connection_epoch(session_id, connection_epoch)
+        request_id = self.store.register_request(
+            session_id, text, source_commit_id=source_commit_id,
+            engine_epoch=engine_epoch, input_revision=input_revision)
+        snapshot = self.snapshot_for_router(session_id)
+        t0 = time.monotonic()
+        try:
+            plan_json = self.router(session_id, text, snapshot)
+        except Exception as e:  # noqa: BLE001 — 路由失败必须是终态
+            self.store.log_route(session_id, request_id, self.mode,
+                                 snapshot=snapshot, parse_ok=False,
+                                 error=f"router exception: {e}",
+                                 latency_ms=int((time.monotonic() - t0) * 1000))
+            return {"ok": False, "request_id": request_id,
+                    "error": f"router failed: {e}"}
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        try:
+            plan = _C.parse_plan(plan_json)
+            parse_ok, error = True, None
+        except _C.PlanError as e:
+            plan, parse_ok, error = None, False, str(e)
+        self.store.log_route(session_id, request_id, self.mode,
+                             snapshot=snapshot,
+                             plan_json=plan_json if parse_ok else None,
+                             parse_ok=parse_ok, error=error,
+                             latency_ms=latency_ms)
+        if not parse_ok:
+            # 1 次 repair 由 router_fn 内部负责（P2b）；到这里仍是坏计划
+            # → 终态失败，不执行任何该批操作（§7.3）
+            return {"ok": False, "request_id": request_id,
+                    "error": f"invalid plan: {error}"}
+        ver = self._plan_version.get(session_id, 0) + 1
+        self._plan_version[session_id] = ver
+        with self._pending_lock:
+            # 前一句路由未结束、后一句已到：后句覆盖前句的 pending 计划
+            # （§6.2：前操作未提交 → 后句作为修订，提交一个最终计划）
+            self._pending[session_id] = {
+                "request_id": request_id, "plan": plan, "version": ver,
+                "text": text}
+        return {"ok": True, "request_id": request_id, "plan": plan}
+
+    def commit_pending(self, session_id):
+        """grace 通过后由 adapter 调用（§6.1：复用同一 grace 结论作为
+        业务提交门，不复制第二套计时阈值）。返回 None = 无待提交计划。"""
+        with self._pending_lock:
+            entry = self._pending.pop(session_id, None)
+        if entry is None:
+            return None
+        if not self.grace_gate(session_id):
+            # 门未开（用户仍在续说窗口内）→ 计划放回，adapter 会改走
+            # discard_pending + 重路由
+            with self._pending_lock:
+                self._pending[session_id] = entry
+            return None
+        res = self.store.commit_plan(session_id, entry["request_id"],
+                                     entry["plan"],
+                                     plan_version=entry["version"])
+        texts = self._receipt_texts(session_id, res)
+        return {"result": res, "texts": texts}
+
+    def discard_pending(self, session_id, reason="continuation"):
+        """grace 内续说且操作未提交：旧计划作废，对新输入组重做路由
+        （§6.1）。"""
+        with self._pending_lock:
+            self._pending.pop(session_id, None)
+        self.store.log_route(session_id, None, self.mode,
+                             snapshot={"discarded": reason})
+
+    def pending_exists(self, session_id):
+        with self._pending_lock:
+            return session_id in self._pending
+
+    # ------------------------------------------------------------- 回执话术
+
+    def _receipt_texts(self, session_id, res):
+        labels = {t["task_id"]: t["label"] for t in
+                  self.store.task_view(session_id)}
+        texts = []
+        for r in res.receipts:
+            t = _C.receipt_text(r, label=labels.get(r.task_id, ""))
+            if t:
+                texts.append(t)
+        return texts
