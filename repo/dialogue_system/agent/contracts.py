@@ -146,6 +146,7 @@ class FollowupTask(Op):
     parent_revision: int = 0
     result_ref: str = ""
     goal: str = ""
+    label: str = ""
     local_ref: str = ""
 
 
@@ -288,6 +289,7 @@ def _parse_op(d) -> Op:
             parent_revision=_need_int(d, "parent_revision"),
             result_ref=_need_str(d, "result_ref", 64, required=False),
             goal=_need_str(d, "goal", MAX_GOAL_CHARS),
+            label=_need_str(d, "label", MAX_LABEL_CHARS, required=False),
             local_ref=_need_str(d, "local_ref", 16),
         )
     if kind == "runtime_query":
