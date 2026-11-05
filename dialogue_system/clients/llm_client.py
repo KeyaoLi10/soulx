@@ -35,8 +35,14 @@ def strip_role_junk(text):
 
 
 class QwenLLM_stream:
-    PUNCT = r"[.!?;:。！？；：\n]"
-    MORE_PUNCT = r"[,.!?;:、，。！？；：\n]"
+    # ASCII . and , must NOT split inside a number: "风速是 5.6 米每秒" used
+    # to split at the dot into "风速是 5." | "6 米每秒" — two independent TTS
+    # clips ("五." 拖长 + 割裂的 "六米每秒", session 1dfcf9ed 2026-11-05).
+    # Lookarounds keep every other dot/comma behavior identical; a decimal
+    # dot adjacent to the buffer tail simply waits for the rest of the
+    # number (final flush at stream end yields it whole).
+    PUNCT = r"(?<!\d)\.(?!\d)|[!?;:。！？；：\n]"
+    MORE_PUNCT = r"(?<!\d)\.(?!\d)|(?<!\d),(?!\d)|[、，。！？；：\n!?;:]"
     MIN_LEN_FOR_SEG = 10
     MAX_BUFFER_LEN = 30
     MAX_BUFFER_SESSION = 5
