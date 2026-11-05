@@ -639,7 +639,10 @@ class AgentRuntimeV2:
                                      entry["plan"],
                                      plan_version=entry["version"])
         texts = self._receipt_texts(session_id, res)
-        return {"result": res, "texts": texts}
+        # plan 一并带回：adapter 需要 reply_mode/direct_question 决定
+        # 是否追加表达轮（§7.3 mixed 不能被控制操作吞掉）
+        return {"result": res, "texts": texts, "plan": entry["plan"],
+                "request_id": entry["request_id"]}
 
     def discard_pending(self, session_id, reason="continuation"):
         """grace 内续说且操作未提交：旧计划作废，对新输入组重做路由

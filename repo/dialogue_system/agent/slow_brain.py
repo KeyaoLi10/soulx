@@ -310,3 +310,243 @@ def _describe_call(name, args):
     if name == "get_datetime":
         return "查询当前时间"
     return f"调用工具 {name}"
+
+
+# ===========================================================================
+# V2 runner（手册 §10/§11）：为 AgentRuntimeV2 的 TaskScheduler 提供执行体
+# ===========================================================================
+
+# request_input：模型缺信息时的唯一求助通道（§10 needs_input）。命中即
+# 整个 run 转 waiting_input 并释放 worker——绝不让线程挂着等用户。
+REQUEST_INPUT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "request_input",
+        "description": (
+            "向用户提一个澄清问题。只在缺少关键信息、任务无法继续时调用；"
+            "问题要具体、一句话能答。调用后任务会暂停等待用户回答。"),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "要问用户的具体问题，一句话",
+                },
+                "missing_field": {
+                    "type": "string",
+                    "description": "缺少的字段名，如 日期/城市/口径",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+V2_SYSTEM_PROMPT = (
+    "你是一个语音对话系统的后台任务代理（慢脑），负责完成一个明确定义的后台任务。"
+    "你可以多步调用工具（web_search 搜索网页、fetch_page 抓取网页、"
+    "calculate 做精确计算、get_datetime 获取时间），逐步收集信息并推理。规则：\n"
+    "1. 每一步要么调用工具继续收集信息，要么直接给出最终答案，不要空转。"
+    "一轮最多调用两三个工具，优先消化已有结果而不是不断抓取新网页。\n"
+    "2. 你最多只有 3 轮工具调用机会，用完后必须基于已有信息给出最终答案。"
+    "查到的信息已经足够回答任务时，立即给出最终答案。\n"
+    "3. 最终答案将被转成语音播报给用户：使用与任务描述相同的语言；先给结论，"
+    "再给关键事实、数据或依据；两百字以内；不要 markdown、列表符号或表情。\n"
+    "4. 严格基于工具返回的真实结果作答，工具结果里没有的信息要么继续查证，"
+    "要么明确说明未找到，绝不能编造。\n"
+    "5. 任何数值计算必须先用 calculate 算出结果再作答，不要心算。\n"
+    "6. 缺少关键信息（比如用户没说要查哪天、哪个城市）而任务无法继续时，"
+    "调用 request_input 向用户提一个具体问题；不要靠猜。\n"
+    "7. 尝试多步后仍无法完成时，给出你能确认的部分结果并明确说明哪些没查到。"
+)
+
+
+def make_v2_runner(base_url=SLOW_LLM_BASE):
+    """构建 AgentRuntimeV2 的 runner（scheduler 调用，worker 线程内跑）。
+
+    runner(snapshot, cancel_event, progress_cb) -> {
+        "type": "completed"|"failed"|"needs_input"|"canceled",
+        "payload": {...}}
+    payload 遵循手册 §10 事件信封：completed 带 summary/facts/sources/
+    outcome；needs_input 带 question_id/question/missing_fields；failed 带
+    summary/limitations/outcome。空结果不得包装成 completed。
+    """
+    from agent import tools as agent_tools_v2
+    from zoneinfo import ZoneInfo
+
+    brain = SlowBrain(base_url)
+
+    def runner(snapshot, cancel_event, progress_cb):
+        task_id = snapshot.get("task_id", "?")
+        revision = snapshot.get("revision", 0)
+        goal = snapshot.get("goal", "")
+        constraints = snapshot.get("constraints") or {}
+        user_text = snapshot.get("user_text", "")
+        tz_name = snapshot.get("timezone") or "Asia/Shanghai"
+        depends = snapshot.get("depends") or []
+        budget_s = int(snapshot.get("budget_timeout_s") or TASK_TIMEOUT_S)
+        deadline = time.monotonic() + budget_s
+        question_seq = [0]
+
+        try:
+            tz = ZoneInfo(tz_name)
+            now = datetime.datetime.now(tz).strftime(
+                "%Y-%m-%d %H:%M (%A) " + tz_name)
+        except Exception:
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+
+        user_msg = f"当前时间：{now}\n\n任务：{goal}"
+        if constraints:
+            user_msg += "\n\n约束：" + json.dumps(
+                constraints, ensure_ascii=False)
+        if user_text:
+            user_msg += f"\n\n用户原话：{user_text}"
+        if depends:
+            dep_lines = []
+            for d in depends:
+                res = (d.get("result") or {}).get("summary") if isinstance(
+                    d.get("result"), dict) else None
+                line = f"- {d.get('task_id')}（修订 {d.get('revision')}）"
+                if res:
+                    line += f"：{res}"
+                else:
+                    line += "：（上游没有可用结果）"
+                dep_lines.append(line)
+            user_msg += ("\n\n依赖任务的结果（可直接引用，不必重查）：\n"
+                         + "\n".join(dep_lines))
+
+        messages = [
+            {"role": "system", "content": V2_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
+        progress_cb("started", {})
+        all_sources = []
+        limitations = []
+        t_start = time.monotonic()
+        logger.info("[slowbrain-v2 %s] start: %s", task_id, goal[:80])
+
+        for step in range(MAX_STEPS):
+            if cancel_event.is_set():
+                return {"type": "canceled", "payload": {}}
+            if time.monotonic() > deadline:
+                return {"type": "failed", "payload": {
+                    "summary": "", "limitations": ["任务超时"],
+                    "outcome": "timeout"}}
+
+            last = step == MAX_STEPS - 1
+            if last and any(m["role"] == "tool" for m in messages):
+                messages.append({
+                    "role": "user",
+                    "content": "工具调用次数已达上限。请立即基于已有信息"
+                               "给出最终答案。",
+                })
+            try:
+                speech, tool_calls = brain._generate(
+                    messages,
+                    tools=None if last else (
+                        agent_tools_v2.NEW_TOOL_SCHEMAS + [REQUEST_INPUT_TOOL]),
+                    cancel_event=cancel_event, deadline=deadline,
+                )
+            except _Canceled:
+                return {"type": "canceled", "payload": {}}
+            except Exception as e:
+                logger.info("[slowbrain-v2 %s] failed: llm error: %s",
+                            task_id, e)
+                return {"type": "failed", "payload": {
+                    "summary": "", "limitations": [f"模型调用失败：{e}"],
+                    "outcome": "failed"}}
+
+            if not tool_calls:
+                result = strip_role_junk(
+                    _LEAD_ROLE_JUNK.sub("", speech)).strip()
+                if not result:
+                    # 空结果不得包装成 completed（§10）
+                    return {"type": "failed", "payload": {
+                        "summary": "",
+                        "limitations": ["模型没有给出任何结果"],
+                        "outcome": "empty"}}
+                logger.info("[slowbrain-v2 %s] completed in %.1fs (%d rounds)",
+                            task_id, time.monotonic() - t_start, step + 1)
+                return {"type": "completed", "payload": {
+                    "summary": result,
+                    "facts": [],
+                    "sources": all_sources,
+                    "limitations": limitations,
+                    "outcome": "complete"}}
+
+            assistant_content = speech + "\n" if speech.strip() else ""
+            for name, args in tool_calls:
+                assistant_content += _render_tool_xml(name, args)
+            messages.append({"role": "assistant",
+                             "content": assistant_content.rstrip("\n")})
+
+            dropped = len(tool_calls) - MAX_CALLS_PER_ROUND
+            if dropped > 0:
+                tool_calls = tool_calls[:MAX_CALLS_PER_ROUND]
+
+            round_cache = {}
+            for ci, (name, args) in enumerate(tool_calls):
+                if cancel_event.is_set():
+                    return {"type": "canceled", "payload": {}}
+                if time.monotonic() > deadline:
+                    return {"type": "failed", "payload": {
+                        "summary": "", "limitations": ["任务超时"],
+                        "outcome": "timeout"}}
+                cache_key = (name, json.dumps(args, sort_keys=True,
+                                              ensure_ascii=False))
+                if cache_key in round_cache:
+                    messages.append({"role": "tool",
+                                     "content": round_cache[cache_key]})
+                    continue
+                if name == "request_input":
+                    question = str(args.get("question") or "").strip()
+                    if not question:
+                        messages.append({"role": "tool",
+                                         "content": "[error] question 为空"})
+                        continue
+                    question_seq[0] += 1
+                    qid = f"{task_id}-r{revision}-q{question_seq[0]}"
+                    logger.info("[slowbrain-v2 %s] needs_input: %s",
+                                task_id, question[:60])
+                    progress_cb("needs_input", {"question": question})
+                    return {"type": "needs_input", "payload": {
+                        "question_id": qid,
+                        "question": question,
+                        "missing_fields": [str(args.get("missing_field")
+                                               or "").strip()],
+                    }}
+                t_tool = time.monotonic()
+                desc = _describe_call(name, args)
+                progress_cb("progress", {"desc": desc})
+                tr = agent_tools_v2.execute_tool_v2(
+                    name, args, call_id=f"{task_id}-s{step}-c{ci}")
+                observation = tr.to_observation()
+                if tr.status not in ("ok", "empty"):
+                    limitations.append(f"{name}: {tr.error_code or tr.status}")
+                for src in (tr.sources or []):
+                    all_sources.append({
+                        "id": f"SRC{len(all_sources) + 1}",
+                        "url": src.get("url", ""),
+                        "retrieved_at": src.get("retrieved_at", ""),
+                    })
+                logger.info("[slowbrain-v2 %s] tool %s(%.40s) %.1fs -> %s",
+                            task_id, name,
+                            args.get("query") or args.get("url")
+                            or args.get("expression") or "",
+                            time.monotonic() - t_tool, tr.status)
+                progress_cb("progress", {
+                    "desc": f"{desc} -> {len(tr.data)} 字符结果（{tr.status}）"})
+                round_cache[cache_key] = observation
+                messages.append({"role": "tool", "content": observation})
+            if dropped > 0:
+                messages.append({
+                    "role": "tool",
+                    "content": (f"本轮只执行了前 {MAX_CALLS_PER_ROUND} 个工具"
+                                f"调用，其余 {dropped} 个被忽略。"),
+                })
+
+        return {"type": "failed", "payload": {
+            "summary": "", "limitations": ["超出最大步数"],
+            "outcome": "failed"}}
+
+    return runner

@@ -151,7 +151,7 @@ class QwenLLM_stream:
 
     def generate_with_history(
         self, client_id: int, stop_event=None, system_prompt=None,
-        max_history=None, min_seg_len=None,
+        max_history=None, min_seg_len=None, extra_context=None,
     ):
         """Stream the reply for a session.
 
@@ -159,6 +159,9 @@ class QwenLLM_stream:
         max_history: how many past turns to include (None = class default).
         min_seg_len: minimum characters before a segment is yielded for TTS
             (None = class default). Smaller = audio starts sooner.
+        extra_context: optional text injected as a final user-role note for
+            this generation only (agent-runtime V2 表达轮的任务语境；默认
+            None 时行为与原来完全一致).
         """
         messages = self.get_session(client_id)
         if max_history:
@@ -166,6 +169,8 @@ class QwenLLM_stream:
         conversation = [
             {"role": "system", "content": system_prompt or self.SYSTEM_PROMPT}
         ] + messages
+        if extra_context:
+            conversation.append({"role": "user", "content": extra_context})
 
         response = None
         try:

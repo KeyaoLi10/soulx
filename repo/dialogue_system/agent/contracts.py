@@ -318,14 +318,19 @@ def parse_plan(plan_json: str) -> Plan:
     if d.get("schema_version") != SCHEMA_VERSION:
         raise PlanError(f"schema_version must be {SCHEMA_VERSION}")
     ops = d.get("operations")
-    if not isinstance(ops, list) or not ops:
-        raise PlanError("operations missing/empty")
-    if len(ops) > MAX_OPS_PER_REQUEST:
-        raise PlanError(f"too many operations ({len(ops)} > {MAX_OPS_PER_REQUEST})")
-    operations = [_parse_op(o) for o in ops]
     mode = d.get("reply_mode", "direct")
     if mode not in REPLY_MODES:
         raise PlanError(f"reply_mode invalid: {mode!r}")
+    if not isinstance(ops, list):
+        raise PlanError("operations missing/not a list")
+    # 纯闲聊（direct）/纯澄清（clarify）允许空操作列表（手册 §7.4：
+    # "纯闲聊用 reply_mode=direct 且 operations 为空列表"）；带执行的
+    # 模式（receipts/mixed）必须有操作
+    if not ops and mode not in ("direct", "clarify"):
+        raise PlanError(f"operations empty under reply_mode={mode}")
+    if len(ops) > MAX_OPS_PER_REQUEST:
+        raise PlanError(f"too many operations ({len(ops)} > {MAX_OPS_PER_REQUEST})")
+    operations = [_parse_op(o) for o in ops]
     plan = Plan(
         schema_version=SCHEMA_VERSION,
         operations=operations,

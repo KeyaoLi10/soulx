@@ -60,6 +60,8 @@ def build_router_snapshot(store, session_id: str, user_text: str,
                 if q:
                     pending_question = {
                         "task_id": t["task_id"], "revision": t["revision"],
+                        "question_id": (row["pending_question_id"]
+                                        if row else "") or "",
                         "question": q,
                     }
         elif st in (C.EXEC_COMPLETED, C.EXEC_FAILED, C.EXEC_CANCELED,

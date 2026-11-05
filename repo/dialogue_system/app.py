@@ -82,6 +82,14 @@ from modules.utils.backchannel_utils import check_backchannel
 from agent.runtime import AgentRuntime, AGENT_SYSTEM_ADDON, FAST_TOOLS
 from frc_engine import FrcEngine, services_available as frc_services_available
 
+# agent-runtime V2 发布开关（手册 §19）：legacy（默认——行为与今天完全
+# 一致，语音前端一行不改）/ shadow（后台观察路由，只写日志，等快脑空闲
+# 才跑，绝不与语音生成抢 GEN_LOCK）/ enforce（V2 控制器接管控制轮）。
+# 仅环境变量控制，不出现在 UI 设置里，避免误触。
+_AGENT_RUNTIME_MODE = os.environ.get("AGENT_RUNTIME_MODE", "legacy")
+if _AGENT_RUNTIME_MODE not in ("legacy", "shadow", "enforce"):
+    _AGENT_RUNTIME_MODE = "legacy"
+
 # Refactor 2026-10-30: app.py was a ~1960-line monolith. The three cohesive
 # layers it shared everything with now live in their own modules:
 #   settings.py  — Config / DEFAULT_SETTINGS / settings validation
@@ -299,6 +307,10 @@ class ChatSession:
         # AgentRuntime (task mgmt + delivery arbiter). Created in the
         # websocket endpoint once the session is registered.
         self.agent_runtime = None
+        # agent-runtime V2 接入层（手册 §6）。仅 AGENT_RUNTIME_MODE !=
+        # legacy 时在 websocket endpoint 创建；legacy 默认恒为 None，
+        # 以下所有 V2 分支都不会执行。
+        self.agent_v2 = None
         # FrcEngine (FireRedChat-architecture turn engine, only fed audio
         # while settings turn_engine == "frc"). Created in the websocket
         # endpoint alongside the agent runtime.
@@ -322,6 +334,29 @@ class ChatSession:
         self.playback_end = 0.0
         emit_to_room(self.client_id, "stop_audio", {"message": "interrupt"})
         emit_to_room(self.client_id, "circle_status", {"status": "LISTENING"})
+
+    def cut_pending_audio(self, t=None):
+        """Forensic recording: a fully-emitted reply (pending_*) was
+        playing and playback just stopped — mark where audible playback
+        actually ended so replay does not present the emitted-but-unplayed
+        tail as having sounded (TTS emits faster than real time, RTF
+        ~0.36, so the tail can be many seconds). Called at every
+        playback-stop choke point: barge-in confirm
+        (pvad_gate._pvad_do_bargein), manual stop (duplex_stop), and the
+        user-turn / background-delivery paths right before
+        _commit_pending_message clears the pending state. In-flight
+        pipelines are NOT handled here — they cut their own run in the
+        interrupted branch of _run_speech_pipeline. t defaults to the
+        barge-in stamp if one is set (playback already stopped there),
+        else now (playback is about to stop at the interrupt that
+        follows)."""
+        with self.lock:
+            since = self.pending_start_time
+            if self.pending_message is None or not since:
+                return
+            if t is None:
+                t = self.interruption_time or time.time()
+        self.audio_tts.mark_cut(t, since)
 
     def pause(self):
         """Pauses audio playback."""
@@ -689,8 +724,11 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
                 session.assistant_audible_ts = time.time()
                 # forensic recording: a new pipeline means playback was
                 # discontinuous (user turn or barge-in in between) — the
-                # tts sidecar must not glue this reply onto the last run
-                session.audio_tts.run_break()
+                # tts sidecar must not glue this reply onto the last run.
+                # first_emit_time becomes the run's identity so a late
+                # mark_cut from THIS pipeline can never slice a newer
+                # pipeline's run (see _SessionAudio.run_break).
+                session.audio_tts.run_break(first_emit_time)
             # Calculate audio duration: bytes / (sample_rate * channels * bytes_per_sample)
             # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
             total_audio_duration += len(wav_chunk) / 48000.0
@@ -898,6 +936,9 @@ def _agent_deliver_entry(session, client_id, entry):
     existed (the user never heard the report — the arbiter retries on its
     separate silent budget, and the result note is retracted so the
     user-turn pipeline cannot speak the report meanwhile)."""
+    # forensic cut first, while the pending state still names the reply
+    # whose playback this delivery is about to stop
+    session.cut_pending_audio()
     _commit_pending_message(session, client_id)
     session.interrupt()  # stop anything still lingering
     session.reset_interrupt()
@@ -963,6 +1004,122 @@ def _agent_deliver_entry(session, client_id, entry):
             # mid-delivery and its pipeline replaced this one)
             if session.gen_serial == gen_sn:
                 session.gen_in_progress = False
+
+
+# ---------------------------------------------------------------------------
+# agent-runtime V2 接入（手册 §6/§19）。legacy 模式下本函数与下面所有
+# agent_v2 分支都不执行；enforce 的语音出口与 legacy 共用同一条
+# _run_speech_pipeline（三态语义原样传递）。
+# ---------------------------------------------------------------------------
+
+def _make_agent_v2(session, client_id):
+    """为一个会话构建 V2 控制器（AgentRuntimeV2 + PlanRouter + 窄适配层）。
+    全部语音前端能力以回调注入；adapter/runtime 不反向 import app。"""
+    import hashlib
+
+    from agent import context as agent_context
+    from agent.frontend_adapter import AgentFrontendAdapter
+    from agent.router import PlanRouter
+    from agent.runtime import AgentRuntimeV2
+    from agent.slow_brain import make_v2_runner
+
+    def _tts_pair():
+        settings = dict(session.settings)
+        tts_client = TTS_CLIENTS.get(
+            settings.get("tts_engine"),
+            TTS_CLIENTS[DEFAULT_SETTINGS["tts_engine"]])
+        tts_options = {
+            "cfg_value": settings.get("tts_cfg", 2.0),
+            "inference_timesteps": settings.get("tts_timesteps", 10),
+        }
+        return tts_client, tts_options
+
+    def _speak(item, stop_event):
+        """V2 的唯一语音出口：固定回执话术（单段）或表达轮生成器，走与
+        legacy _agent_deliver_entry 完全相同的 _run_speech_pipeline。
+        三态 True/False/None 原样返回（§13 交付语义）。"""
+        tts_client, tts_options = _tts_pair()
+        # forensic cut first, while the pending state still names the reply
+        # whose playback this delivery is about to stop
+        session.cut_pending_audio()
+        _commit_pending_message(session, client_id)
+        session.interrupt()
+        session.reset_interrupt()
+        current_stop_event = session.stop_event
+        if current_stop_event.is_set():
+            return None  # stopped before starting: nothing audible yet
+        gen = iter([item]) if isinstance(item, str) else item
+        gen_sn = _begin_generation(session)
+        try:
+            return _run_speech_pipeline(
+                session, client_id, gen, current_stop_event,
+                tts_client, tts_options)
+        finally:
+            with session.lock:
+                if session.gen_serial == gen_sn:
+                    session.gen_in_progress = False
+
+    def _grace_s():
+        # 与前端同一个 turn_grace_ms（§6.1：不复制第二套计时阈值）
+        settings = dict(session.settings)
+        return settings.get(
+            "turn_grace_ms", int(_TURN_GRACE_S * 1000)) / 1000.0
+
+    def _history():
+        return [dict(m) for m in llm.get_session(client_id)]
+
+    plan_router = PlanRouter()
+
+    def _router_fn(sid, text, snap):
+        # runtime.submit_request 的路由回调：完整 §7.1 快照 + 严格计划
+        snap_full = agent_context.build_router_snapshot(
+            runtime.store, sid, text, history=_history())
+        rr = plan_router.route(snap_full, text, history=_history())
+        if not rr.ok:
+            raise RuntimeError(rr.error or "route failed")
+        return rr.plan_json
+
+    db_dir = Path(__file__).parent / "checkpoints" / "agent_v2"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / (
+        hashlib.sha1(client_id.encode("utf-8")).hexdigest()[:16] + ".sqlite3")
+
+    runtime = AgentRuntimeV2(
+        db_path=str(db_path),
+        router_fn=_router_fn,
+        runner=make_v2_runner(),
+        speak_fn=lambda env, text, stop_event: _speak(text, stop_event),
+        can_deliver_fn=lambda sid: _agent_can_deliver(session),
+        grace_gate=lambda sid: (
+            _grace_s() <= 0
+            or time.time() - session.last_voice_ts >= _grace_s()),
+        mode=_AGENT_RUNTIME_MODE,
+    )
+    adapter = AgentFrontendAdapter(
+        session_id=client_id,
+        runtime=runtime,
+        router=plan_router,
+        snapshot_builder=lambda text, rid, hist: (
+            agent_context.build_router_snapshot(
+                runtime.store, client_id, text, request_id=rid,
+                history=hist)),
+        grace_s_fn=_grace_s,
+        last_voice_ts_fn=lambda: session.last_voice_ts,
+        speak_fn=_speak,
+        can_deliver_fn=lambda: _agent_can_deliver(session),
+        generate_fn=lambda stop_event: llm.generate_with_history(
+            client_id,
+            stop_event=stop_event,
+            system_prompt=dict(session.settings).get("system_prompt") or None,
+            max_history=dict(session.settings).get("max_history"),
+            min_seg_len=dict(session.settings).get("min_seg_len"),
+        ),
+        history_fn=_history,
+        mode=_AGENT_RUNTIME_MODE,
+    )
+    if _AGENT_RUNTIME_MODE == "enforce":
+        runtime.start_background()
+    return adapter
 
 
 def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
@@ -1083,6 +1240,9 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         #     return
 
         # Process Pending Message from previous turn if any (before adding new user message)
+        # forensic cut first, while the pending state still names the
+        # reply whose playback this interrupt is about to stop
+        session.cut_pending_audio()
         _commit_pending_message(session, client_id)
 
         # 3. Preparation for Response
@@ -1146,6 +1306,22 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
             if settings.get("agent_enabled") and session.agent_runtime
             else None
         )
+        if (_AGENT_RUNTIME_MODE == "shadow" and session.agent_v2 is not None
+                and settings.get("agent_enabled")):
+            # 只观察：后台等快脑空闲再跑路由（GEN_LOCK 共享，绝不与语音
+            # 生成抢锁），只写 route_log。下面的 legacy 生成本身不改。
+            session.agent_v2.observe(
+                asr_text, turn_trigger=turn_trigger or "",
+                source_commit_id=commit_id)
+        if (_AGENT_RUNTIME_MODE == "enforce" and session.agent_v2 is not None
+                and settings.get("agent_enabled")):
+            # V2 控制器接管本轮控制决策：路由（grace 门后提交）、模板回执
+            # 上口、表达轮，全部由 adapter 后台驱动；本 worker 不再启动
+            # legacy 生成。gen_in_progress 尚未置位，无需清理。
+            session.agent_v2.handle_utterance(
+                asr_text, turn_trigger=turn_trigger or "",
+                source_commit_id=commit_id)
+            return
         if agent_runtime:
             system_prompt = (
                 settings.get("system_prompt") or QwenLLM_stream.SYSTEM_PROMPT
@@ -1382,8 +1558,26 @@ async def websocket_endpoint(websocket: WebSocket):
             can_deliver=lambda: _agent_can_deliver(session),
             deliver=lambda entry: _agent_deliver_entry(session, client_id, entry),
         )
-        if session.settings.get("agent_enabled"):
+        # enforce 模式下不再启动 legacy runtime：V2 控制器接管控制轮，
+        # 双 runtime 同时运行会出现两个交付出口（同一结果播两遍）
+        if (session.settings.get("agent_enabled")
+                and _AGENT_RUNTIME_MODE != "enforce"):
             session.agent_runtime.start()
+
+        # agent-runtime V2 接入层：仅非 legacy 模式创建（默认 legacy 下
+        # session.agent_v2 恒为 None，上面/下面的 V2 分支均不执行）
+        if _AGENT_RUNTIME_MODE != "legacy":
+            try:
+                session.agent_v2 = _make_agent_v2(session, client_id)
+                logger.info(
+                    "[%s] agent-runtime V2 ready (mode=%s)",
+                    client_id[:8], _AGENT_RUNTIME_MODE)
+            except Exception:
+                # V2 初始化失败绝不拖垮会话——退回 legacy 行为
+                logger.exception(
+                    "[%s] agent-runtime V2 init failed; falling back to "
+                    "legacy path", client_id[:8])
+                session.agent_v2 = None
 
         # FireRedChat-architecture turn engine (only fed audio while
         # settings turn_engine == "frc"; started here so the UI switch is
@@ -1728,6 +1922,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     if event == "duplex_stop":
                         if session.interruption_time is None:
                             session.interruption_time = time.time()
+                        # the client stops playback locally on this
+                        # button — cut the recording at the same moment
+                        session.cut_pending_audio()
                         session.stop_event.set()
                         session.reset_interrupt()
                         logger.info(f"Session manually stopped by client: {client_id}")
@@ -1790,11 +1987,16 @@ async def websocket_endpoint(websocket: WebSocket):
             session.stop_event.set()
             if session.agent_runtime:
                 session.agent_runtime.shutdown()
+            if session.agent_v2 is not None:
+                session.agent_v2.close()
             if session.frc:
                 session.frc.stop()
             session.pvad.stop()
             if session.pvad_stream_gate is not None:
                 session.pvad_stream_gate.stop()
+            # playback ended the moment the client vanished — cut any
+            # pending reply's unplayed tail before closing the recorder
+            session.cut_pending_audio(time.time())
             session.audio_mic.close()
             session.audio_tts.close()
             vad_pool.release(session.vad)
@@ -1870,6 +2072,15 @@ class _SessionAudio:
         self._capped = False
         self._adopted_runs = False
         self._force_break = False
+        # Run identity (parallel to runs, in-memory only): the first-emit
+        # timestamp of the pipeline that wrote each run — how mark_cut
+        # tells "my run" from "a newer pipeline's run" exactly, without
+        # relying on epoch proximity (the run is stamped at its first
+        # WRITE, marginally after the first-emit time, so a plain epoch
+        # comparison cannot separate the two). None = not owned by any
+        # live pipeline (gap-created run, or adopted from a restart).
+        self._run_since = []
+        self._pending_since = None
         if not _AUDIO_RECORD:
             return
         try:
@@ -1905,6 +2116,7 @@ class _SessionAudio:
                     self._force_break = True
         except (OSError, ValueError, TypeError):
             pass
+        self._run_since = [None] * len(self.runs)
 
     def _save(self):
         try:
@@ -1918,8 +2130,11 @@ class _SessionAudio:
             # previous run never got any bytes: re-date it instead of
             # stacking two runs at the same offset
             self.runs[-1][1] = now
+            self._run_since[-1] = self._pending_since
         else:
             self.runs.append([pos, now])
+            self._run_since.append(self._pending_since)
+        self._pending_since = None   # consumed by this run
         self._save()
 
     def write(self, pcm):
@@ -1934,6 +2149,7 @@ class _SessionAudio:
                 if self.start is None:
                     self.start = now
                     self.runs = [[0, now]]
+                    self._run_since = [None]
                     self._save()
                 gap = self._force_break
                 if not gap and self.runs:
@@ -1960,23 +2176,34 @@ class _SessionAudio:
                     pass
                 self._f = None
 
-    def run_break(self):
+    def run_break(self, since=None):
         """Force the next write to start a new run. Called at each reply
         pipeline's first emit: a new pipeline means a user turn happened
-        in between (gap or barge-in), so playback was discontinuous."""
+        in between (gap or barge-in), so playback was discontinuous.
+        `since` is that pipeline's first-emit timestamp — it becomes the
+        new run's identity, which mark_cut checks so one pipeline can
+        never cut a newer pipeline's run."""
         with self._lock:
             self._force_break = True
+            self._pending_since = since
 
     def mark_cut(self, t, since=None):
         """Barge-in at session epoch t: audio in the last run beyond t was
         emitted but never played. `since` (the pipeline's first-emit time)
         guards the race where a newer pipeline already started its own
-        run — only cut a run this pipeline wrote into."""
+        run: each run remembers the first-emit stamp of the pipeline that
+        wrote it (run_break), so the comparison is exact — the caller's
+        own run matches, a newer pipeline's run does not. Runs with no
+        identity (audible-gap runs, adopted after restart) are cut
+        unconditionally: they can only belong to the interrupting side's
+        own reply."""
         with self._lock:
             if not self.runs:
                 return
-            off, ep = self.runs[-1][0], self.runs[-1][1]
-            if since is not None and ep > since:
+            run = self.runs[-1]
+            off, ep = run[0], run[1]
+            rsince = self._run_since[-1] if self._run_since else None
+            if since is not None and rsince is not None and rsince != since:
                 return
             pos = self._base + self.n
             played = (pos - off) / (2.0 * self.rate)
