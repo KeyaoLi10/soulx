@@ -692,11 +692,20 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
                 return True
         return False
 
+    # Did the generator ever hand us a segment? Every interrupted=True
+    # assignment below lives INSIDE the loop body — a stop that kills the
+    # generator before its first yield (barge-in during the delivery
+    # generation window, before any audio exists) exits the loop with
+    # ZERO iterations, and the pipeline would otherwise report "fully
+    # spoken" for a reply that never said a word (2026-11-05 静默事故:
+    # delivery counted as success, task result never re-delivered).
+    received_segment = False
     for i, chunk in enumerate(
         llm_reply_gen
         if hasattr(llm_reply_gen, "__iter__") and not isinstance(llm_reply_gen, str)
         else [llm_reply_gen]
     ):
+        received_segment = True
         if current_stop_event.is_set():
             interrupted = True
             break
@@ -722,6 +731,16 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
         if _speak_chunk(chunk):
             interrupted = True
             break
+
+    if not received_segment and current_stop_event.is_set():
+        # The stop landed inside the generator before it yielded anything:
+        # zero segments were spoken, so this is an interruption, not a
+        # successful run. The delivery arbiter's retry path (one re-enqueue
+        # via MAX_DELIVERY_ATTEMPTS) depends on seeing False here. Done as
+        # interrupted=True (not a bare return) so the existing interruption
+        # cleanup below runs: nothing entered history, pending state is
+        # cleared, and first_emit_time is None so no truncation happens.
+        interrupted = True
 
     if holding and not premature and not interrupted:
         # The generation finished entirely inside the grace window (short
