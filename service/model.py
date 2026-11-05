@@ -17,6 +17,17 @@ from model.model import State_Prediction_Model
 from transformers import WhisperFeatureExtractor
 
 
+def _short_state(name):
+    """Token name for the always-on STATE log lines:
+    <|user_incomplete|> -> incomplete, <|assistant_interrupt|> ->
+    assistant_interrupt (prefix kept: user_backchannel and
+    assistant_backchannel must not collide). None/empty -> start (first
+    chunk after a commit/reset — reset() wipes past_state)."""
+    if not name:
+        return "start"
+    return name.replace("<|user_", "").replace("<|", "").replace("|>", "")
+
+
 class TurnModel:
     def __init__(
         self,
@@ -348,11 +359,16 @@ class TurnModel:
         shared across sessions, so this knob travels WITH the chunk instead
         of living on the model instance.
 
-        The returned dict may carry two extra keys (omitted when empty):
+        The returned dict may carry four extra keys (omitted when empty):
           "gate": which blip gate rewrote this chunk's outcome
                   (prob / rms / mistake_no_text / commit_no_text)
           "diag": {p_nonidle, rms} for every pre-latch nonidle chunk — the
                   calibration signal for the gate thresholds (Stage 0)
+          "state_log": {from, to} when the dispatched state token changed
+                  this chunk — turn.log's always-on STATE lines, so a turn
+                  boundary can be read back without developer_mode
+          "commit": {trigger, text} when this chunk committed a turn —
+                  turn.log's always-on TURN lines
         """
         assert audio_chunk.dtype == np.float32
         # print(audio_chunk.shape)
@@ -360,6 +376,8 @@ class TurnModel:
         # per-chunk transients, consumed at the end of this call
         self.last_gate = None
         self.last_diag = None
+        self.last_state_log = None
+        self.last_commit_log = None
         delta_text = ""
         asr_buffer = ""
         predicted_state = {
@@ -379,14 +397,27 @@ class TurnModel:
                 predicted_state["gate"] = self.last_gate
             if self.last_diag is not None:
                 predicted_state["diag"] = self.last_diag
+            if self.last_state_log is not None:
+                predicted_state["state_log"] = self.last_state_log
+            if self.last_commit_log is not None:
+                predicted_state["commit"] = self.last_commit_log
             self._log(f"[Timing] Total chunk: {time.time() - t_start:.4f}s\n\n")
 
         return predicted_state
 
     def state_predict(self, process_chunk, audio_back, audio_ahead, max_wait_num=None):
+        # prev state for the always-on STATE transition record. past_state
+        # is per-session (travels through snapshot/restore_runtime) and is
+        # None right after a reset — "start" in the log.
+        prev_state = (self.past_state or {}).get("state")
         state, delta_text, asr_buffer = self.infer(
             process_chunk, audio_back, audio_ahead
         )
+        if state != prev_state:
+            self.last_state_log = {
+                "from": _short_state(prev_state),
+                "to": _short_state(state),
+            }
 
         if self._pending_reset:
             # escalated mistake_no_text distrust (see _state_predict): the
@@ -481,6 +512,10 @@ class TurnModel:
                                 "asr_buffer": asr_buffer,
                             }
                         self.last_commit_text = segment
+                        self.last_commit_log = {
+                            "trigger": "wait",
+                            "text": segment,
+                        }
                         # self.clear_turn()
                         self.reset()
                         return {
@@ -639,6 +674,7 @@ class TurnModel:
                 "asr_buffer": asr_buffer,
             }
         self.last_commit_text = segment
+        self.last_commit_log = {"trigger": "complete", "text": segment}
         # self.clear_turn()
         self.reset()
         return {

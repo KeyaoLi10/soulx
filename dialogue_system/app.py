@@ -985,7 +985,10 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         if current_stop_event.is_set():
             return
 
-        logger.info(f"[{client_id}] ASR result: {asr_text}")
+        logger.info(
+            f"[{client_id}] ASR result ({turn_trigger or 'wait'} turn): "
+            f"{asr_text}"
+        )
         # final=True tells the frontend to FREEZE the live user bubble:
         # the turn committed, this text is final. Without it, a phantom
         # blip's partials/final arriving before the assistant bubble
@@ -1953,7 +1956,7 @@ _LOG_EVENT_PATTERNS = [
     (re.compile(
         r"^transient barge-in suppressed \((\d+) unconfirmed chunk\(s\), "
         r"(\d+) in"), "suppressed"),
-    (re.compile(r"^ASR result: (.*)"), "turn"),
+    (re.compile(r"^ASR result(?: \((\w+) turn\))?: (.*)"), "turn"),
     (re.compile(r"^ASR partial: (.*)"), "partial"),
     (re.compile(r"^LLM Chunk: (.*)"), "chunk"),
     (re.compile(r"^Previous turn, Ratio: ([\d.]+), Truncated: (.*)"),
@@ -2087,7 +2090,11 @@ def _parse_log_sessions() -> dict:
                 ev["n"], ev["text"] = int(g[0]), g[1]
             elif kind in ("turn", "partial", "chunk", "drop_selftalk",
                           "error"):
-                ev["text"] = g[0]
+                # "turn" lines since 2026-11-05 carry the trigger path:
+                # "ASR result (wait turn): ..." — old lines have no group
+                ev["text"] = g[-1]
+                if kind == "turn" and g[0]:
+                    ev["trigger"] = g[0]
             elif kind in ("deliver", "delegate"):
                 ev["task"] = g[0]
             elif kind == "slow_warn":

@@ -164,6 +164,29 @@ async def turn_ws(ws: WebSocket):
                         f"{state['gate']}",
                         flush=True,
                     )
+                if state.get("state_log"):
+                    # state-token transition (idle/nonidle/incomplete/
+                    # complete/...) — one line per CHANGE, so a turn
+                    # boundary is readable in turn.log without
+                    # developer_mode. Same flush discipline as GATE.
+                    sl = state["state_log"]
+                    print(
+                        f"[TurnTaking] STATE session {session_id[:8]} "
+                        f"{sl['from']} -> {sl['to']}",
+                        flush=True,
+                    )
+                if state.get("commit"):
+                    # the turn committed on this chunk: which path fired
+                    # (complete = instant <|user_complete|>, wait =
+                    # silence-verified after <|user_incomplete|>) and the
+                    # recognized text
+                    c = state["commit"]
+                    print(
+                        f"[TurnTaking] TURN session {session_id[:8]} "
+                        f"commit trigger={c.get('trigger')} "
+                        f"text={c.get('text', '')}",
+                        flush=True,
+                    )
                 await ws.send_text(
                     json.dumps(
                         {
