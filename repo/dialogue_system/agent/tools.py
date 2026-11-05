@@ -499,3 +499,488 @@ def execute_tool(name, arguments):
         return _clip(str(fn(arguments or {})))
     except Exception as e:
         return f"tool error: {e}"
+
+
+# ===========================================================================
+# v2 工具层（agent-runtime P1c，手册 §11）。上方的 legacy TOOL_SCHEMAS /
+# TOOL_EXECUTORS / execute_tool 原样保留 —— legacy 慢脑行为不变。新 runtime
+# 默认工具集 = web_search / fetch_page / get_datetime / calculate；
+# python_repl 不进默认集，AGENT_TOOLS_PYTHON_REPL=1 显式恢复。
+# ===========================================================================
+
+import ast as _ast
+import ipaddress as _ip
+import socket as _socket
+import urllib.parse as _urlparse
+from dataclasses import dataclass, field as _dcfield
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+# ---- 统一工具返回（手册 §11）---------------------------------------------
+
+
+@dataclass
+class ToolResult:
+    call_id: str = ""
+    status: str = "ok"          # ok|empty|error|canceled|timeout|unavailable
+    data: str = ""
+    sources: list = _dcfield(default_factory=list)
+    error_code: str = ""
+    elapsed_ms: int = 0
+    truncated: bool = False
+    side_effect: str = "none"   # none|committed|unknown
+
+    def to_observation(self):
+        """给慢脑看的字符串观测；失败不得伪装成成功内容。"""
+        if self.status == "ok":
+            return self.data if not self.truncated else (
+                self.data + "\n[truncated]")
+        if self.status == "empty":
+            return "(no results)"
+        return f"[{self.status}] {self.error_code or self.status}: {self.data}"
+
+
+# ---- fetch_page v2：按连接目的地址核验 + 每跳重定向核验（SSRF） ----------
+
+FETCH_V2_MAX_REDIRECTS = 4
+FETCH_V2_MAX_BYTES = 2 * 1024 * 1024   # 响应体上限
+FETCH_V2_TIMEOUT_S = 10
+
+# 连接目的地址必须全部落在公网单播；私网/回环/链路本地(含云元数据
+# 169.254.169.254)/保留/组播/CGNAT/未指定 全部拒绝。
+def _ip_is_public(addr: str) -> bool:
+    try:
+        ip = _ip.ip_address(addr)
+    except ValueError:
+        return False
+    if isinstance(ip, _ip.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        or ip in _ip.ip_network("100.64.0.0/10")
+    )
+
+
+def _validate_public_host(hostname: str) -> list:
+    """解析并核验 hostname 的全部连接目的地址。返回地址列表；
+    任一地址不合规即抛 ValueError（不只做字符串黑名单）。"""
+    if not hostname:
+        raise ValueError("empty host")
+    # 主机名本身是 IP 的情况（含十进制/十六进制整数形式）
+    try:
+        ip = _ip.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        if not _ip_is_public(str(ip)):
+            raise ValueError(f"non-public destination {hostname}")
+        return [str(ip)]
+    if (hostname == "localhost" or hostname.endswith(".local")
+            or hostname.endswith(".internal") or hostname.endswith(".lan")):
+        raise ValueError(f"non-public host {hostname}")
+    try:
+        infos = _socket.getaddrinfo(
+            hostname, None, _socket.AF_UNSPEC, _socket.SOCK_STREAM)
+    except _socket.gaierror as e:
+        raise ValueError(f"dns resolution failed: {e}") from None
+    addrs = {info[4][0] for info in infos}
+    for a in addrs:
+        if not _ip_is_public(a):
+            raise ValueError(f"non-public destination {hostname} -> {a}")
+    return sorted(addrs)
+
+
+def fetch_page_v2(url, max_chars=MAX_TOOL_OUTPUT_CHARS,
+                  call_id="", deadline_s=FETCH_V2_TIMEOUT_S):
+    """HTTP(S) 公网读取：URL 限制、逐跳重定向核验、响应大小/输出长度/
+    deadline 限制。返回 ToolResult，不抛异常。"""
+    t0 = time.monotonic()
+    url = str(url or "").strip()
+
+    def _res(status, data="", error_code=""):
+        return ToolResult(
+            call_id=call_id, status=status, data=data, error_code=error_code,
+            elapsed_ms=int((time.monotonic() - t0) * 1000))
+
+    cur = url
+    for _hop in range(FETCH_V2_MAX_REDIRECTS + 1):
+        try:
+            parsed = _urlparse.urlsplit(cur)
+        except Exception:
+            return _res("error", "invalid url", "bad_url")
+        if parsed.scheme not in ("http", "https"):
+            return _res("error", "only http(s) allowed", "bad_scheme")
+        try:
+            _validate_public_host(parsed.hostname or "")
+        except ValueError as e:
+            # 本机/内网/元数据地址：明确拒绝，绝不返回内容
+            return _res("error", str(e), "ssrf_blocked")
+        remaining = deadline_s - (time.monotonic() - t0)
+        if remaining <= 0:
+            return _res("timeout", "deadline exceeded", "deadline")
+        try:
+            r = requests.get(
+                cur,
+                headers={"User-Agent":
+                         "Mozilla/5.0 (X11; Linux x86_64) soulx-agent/1.0"},
+                proxies=PROXIES, timeout=remaining, stream=True,
+                allow_redirects=False)
+        except requests.exceptions.Timeout:
+            return _res("timeout", "fetch timed out", "timeout")
+        except Exception as e:
+            return _res("error", f"fetch failed: {e}", "network")
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("location", "")
+            r.close()
+            if not loc:
+                return _res("error", "redirect without location", "bad_redirect")
+            cur = _urlparse.urljoin(cur, loc)
+            continue
+        try:
+            if r.status_code >= 400:
+                r.close()
+                return _res("error", f"http {r.status_code}", f"http_{r.status_code}")
+            # 流式截断：超过上限即停，不把超大响应整段读进内存
+            chunks, total = [], 0
+            for chunk in r.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > FETCH_V2_MAX_BYTES:
+                    r.close()
+                    return _res("error", "response too large", "too_large")
+                chunks.append(chunk)
+                if b"</html" in b"".join(chunks[-2:]):
+                    break
+            body = b"".join(chunks)
+        finally:
+            r.close()
+        ctype = r.headers.get("content-type", "")
+        try:
+            text = body.decode(r.encoding or "utf-8", errors="replace")
+        except Exception:
+            text = body.decode("utf-8", errors="replace")
+        if "html" in ctype:
+            ext = _TextExtractor()
+            try:
+                ext.feed(text)
+            except Exception:
+                pass
+            text = re.sub(r"\n{3,}", "\n\n", "".join(ext.parts))
+        text = text.strip()
+        if not text:
+            return _res("empty", "", "empty_body")
+        truncated = len(text) > max_chars
+        return ToolResult(
+            call_id=call_id, status="ok",
+            data=_clip(text, max_chars),
+            sources=[{"url": cur, "retrieved_at":
+                      time.strftime("%Y-%m-%dT%H:%M:%S")}],
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            truncated=truncated)
+    return _res("error", "too many redirects", "redirect_loop")
+
+
+# ---- calculate：AST 白名单纯计算（替代 python_repl 的默认能力） ----------
+
+_CALC_MAX_EXPR_CHARS = 200
+_CALC_MAX_NODES = 60
+_CALC_MAX_INT = 10 ** 15
+_CALC_MAX_EXPONENT = 10 ** 6
+
+_CALC_ALLOWED_NODES = (
+    _ast.Expression, _ast.BinOp, _ast.UnaryOp, _ast.Constant,
+    _ast.Add, _ast.Sub, _ast.Mult, _ast.Div, _ast.FloorDiv, _ast.Mod,
+    _ast.Pow, _ast.USub, _ast.UAdd, _ast.Call, _ast.Load, _ast.Name,
+)
+_CALC_FUNCS = {
+    "abs": abs, "round": round, "min": min, "max": max,
+}
+
+
+def _days_between(d1, d2):
+    a = datetime.date.fromisoformat(str(d1))
+    b = datetime.date.fromisoformat(str(d2))
+    return (b - a).days
+
+
+_CALC_FUNCS["days_between"] = _days_between
+
+
+def calculate(expression, call_id=""):
+    """算术表达式 / 日期差白名单计算。AST 解析 + 节点与数值规模限制，
+    绝不 eval 任意 Python。返回 ToolResult。"""
+    t0 = time.monotonic()
+    expr = str(expression or "").strip()
+    if not expr:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="empty_expr", data="no expression")
+    if len(expr) > _CALC_MAX_EXPR_CHARS:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="too_long",
+                          data="expression too long")
+    try:
+        tree = _ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="syntax", data=f"syntax error: {e}")
+
+    nodes = list(_ast.walk(tree))
+    if len(nodes) > _CALC_MAX_NODES:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="too_complex",
+                          data="expression too complex")
+
+    def _eval(node):
+        if isinstance(node, _ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, _ast.Constant):
+            if isinstance(node.value, str):
+                return node.value   # 仅 days_between 接受；别处运算会 TypeError
+            if isinstance(node.value, bool) or not isinstance(
+                    node.value, (int, float)):
+                raise ValueError("non-numeric literal")
+            if isinstance(node.value, int) and abs(node.value) > _CALC_MAX_INT:
+                raise ValueError("literal too large")
+            if isinstance(node.value, float) and abs(node.value) > _CALC_MAX_INT:
+                raise ValueError("literal too large")
+            return node.value
+        if isinstance(node, _ast.BinOp):
+            # ** 的指数规模单限：防 10**10**8 之类指数爆炸
+            if isinstance(node.op, _ast.Pow):
+                e = _eval(node.right)
+                if not isinstance(e, (int, float)) or abs(e) > 1000:
+                    raise ValueError("exponent too large")
+            if isinstance(node.op, (_ast.Add, _ast.Sub, _ast.Mult, _ast.Div,
+                                    _ast.FloorDiv, _ast.Mod, _ast.Pow)):
+                a, b = _eval(node.left), _eval(node.right)
+                try:
+                    if isinstance(node.op, _ast.Add):
+                        v = a + b
+                    elif isinstance(node.op, _ast.Sub):
+                        v = a - b
+                    elif isinstance(node.op, _ast.Mult):
+                        v = a * b
+                    elif isinstance(node.op, _ast.Div):
+                        v = a / b
+                    elif isinstance(node.op, _ast.FloorDiv):
+                        v = a // b
+                    elif isinstance(node.op, _ast.Mod):
+                        v = a % b
+                    else:
+                        v = a ** b
+                except ZeroDivisionError:
+                    raise ValueError("division by zero") from None
+                except OverflowError:
+                    raise ValueError("overflow") from None
+                if isinstance(v, float) and (v != v or abs(v) == float("inf")):
+                    raise ValueError("non-finite result") from None
+                if abs(v) > _CALC_MAX_INT * 1000:
+                    raise ValueError("result too large") from None
+                return v
+            raise ValueError("operator not allowed")
+        if isinstance(node, _ast.UnaryOp):
+            v = _eval(node.operand)
+            if isinstance(node.op, _ast.USub):
+                return -v
+            if isinstance(node.op, _ast.UAdd):
+                return +v
+            raise ValueError("operator not allowed")
+        if isinstance(node, _ast.Call):
+            if not isinstance(node.func, _ast.Name):
+                raise ValueError("call target not allowed")
+            if node.func.id not in _CALC_FUNCS:
+                raise ValueError(f"function not allowed: {node.func.id}")
+            if node.keywords:
+                raise ValueError("keyword args not allowed")
+            args = [_eval(a) for a in node.args]
+            if node.func.id == "days_between":
+                if len(args) != 2:
+                    raise ValueError("days_between takes 2 dates")
+                try:
+                    return _days_between(args[0], args[1])
+                except (ValueError, TypeError):
+                    raise ValueError("invalid date (YYYY-MM-DD)") from None
+            return _CALC_FUNCS[node.func.id](*args)
+        raise ValueError(f"node not allowed: {type(node).__name__}")
+
+    # 白名单之外的节点类型直接拒绝（属性/下标/lambda/推导式…）。
+    # Name 只允许作为白名单函数的调用目标——裸名/变量引用拒绝。
+    call_funcs = {n.func.id for n in nodes
+                  if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)}
+
+    def _precheck():
+        for n in nodes:
+            if isinstance(n, _ast.Name):
+                if n.id not in _CALC_FUNCS or n.id not in call_funcs:
+                    raise ValueError(f"name not allowed: {n.id}")
+                continue
+            if not isinstance(n, _CALC_ALLOWED_NODES):
+                raise ValueError(
+                    f"disallowed syntax: {type(n).__name__}")
+
+    try:
+        _precheck()
+        value = _eval(tree)
+    except (ValueError, TypeError) as e:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="rejected",
+                          data=f"calculation rejected: {e}",
+                          elapsed_ms=int((time.monotonic() - t0) * 1000))
+    if isinstance(value, float) and value == int(value) and abs(value) < 1e15:
+        value = int(value)
+    return ToolResult(call_id=call_id, status="ok", data=str(value),
+                      elapsed_ms=int((time.monotonic() - t0) * 1000))
+
+
+# ---- get_datetime v2：IANA 时区（默认 Asia/Shanghai）----------------------
+
+
+def get_datetime_v2(timezone="Asia/Shanghai", call_id=""):
+    t0 = time.monotonic()
+    tz_name = str(timezone or "Asia/Shanghai").strip()
+    try:
+        tz = _ZoneInfo(tz_name)
+    except Exception:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="bad_timezone",
+                          data=f"unknown IANA timezone: {tz_name}")
+    now = datetime.datetime.now(tz)
+    return ToolResult(
+        call_id=call_id, status="ok",
+        data=f"{now:%Y-%m-%d %H:%M:%S %A} ({tz_name})",
+        elapsed_ms=int((time.monotonic() - t0) * 1000))
+
+
+# ---- v2 注册表 -------------------------------------------------------------
+
+
+def _web_search_v2(args, call_id=""):
+    t0 = time.monotonic()
+    out = web_search(args.get("query", ""),
+                     int(args.get("max_results") or 6))
+    out = str(out)
+    status = "ok"
+    if out.startswith(("search failed", "search unavailable",
+                       "search parse failed")):
+        status, error_code = "unavailable", "search_unavailable"
+    elif out.strip() in ("no results found", ""):
+        status, error_code = "empty", "no_results"
+    else:
+        error_code = ""
+    return ToolResult(call_id=call_id, status=status, data=out,
+                      error_code=error_code,
+                      elapsed_ms=int((time.monotonic() - t0) * 1000))
+
+
+NEW_TOOL_EXECUTORS = {
+    "web_search": _web_search_v2,
+    "fetch_page": lambda args, call_id="": fetch_page_v2(
+        args.get("url", ""), call_id=call_id),
+    "get_datetime": lambda args, call_id="": get_datetime_v2(
+        args.get("timezone") or "Asia/Shanghai", call_id=call_id),
+    "calculate": lambda args, call_id="": calculate(
+        args.get("expression", ""), call_id=call_id),
+}
+
+NEW_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web. Returns numbered results with title, url "
+                "and a short snippet. Use for facts you are not sure about "
+                "or that change over time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "search query"},
+                    "max_results": {"type": "integer",
+                                    "description": "max results, default 6"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_page",
+            "description": (
+                "Fetch one public web page and return its readable plain "
+                "text. Only http(s) public addresses; private/localhost "
+                "addresses are rejected. Use when a search snippet is not "
+                "enough."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string",
+                            "description": "http(s) url to fetch"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_datetime",
+            "description": (
+                "Get the current date and time in an IANA timezone "
+                "(default Asia/Shanghai)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {"type": "string",
+                                 "description":
+                                 "IANA timezone, e.g. Asia/Shanghai"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": (
+                "Evaluate an arithmetic expression or date difference. "
+                "Allowed: + - * / // % **, abs/round/min/max, "
+                "days_between('2026-11-06','2026-12-25'). No variables, "
+                "no function definitions, no arbitrary code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string",
+                                   "description": "expression to evaluate"},
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+]
+
+if os.environ.get("AGENT_TOOLS_PYTHON_REPL", "").strip() == "1":
+    # 显式开关恢复 python_repl（任意代码子进程，非安全沙箱——手册 §11）
+    NEW_TOOL_SCHEMAS.append(TOOL_SCHEMAS[2])
+    NEW_TOOL_EXECUTORS["python_repl"] = lambda args, call_id="": ToolResult(
+        call_id=call_id, status="ok",
+        data=python_repl(args.get("code", "")))
+
+
+def execute_tool_v2(name, arguments, call_id=""):
+    """新 runtime 的工具执行入口：返回 ToolResult，不抛异常。
+    参数在此验证（不只依赖 JSON Schema 提示）。"""
+    fn = NEW_TOOL_EXECUTORS.get(name)
+    if fn is None:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="unknown_tool",
+                          data=f"unknown tool: {name}")
+    try:
+        return fn(arguments or {}, call_id=call_id)
+    except Exception as e:
+        return ToolResult(call_id=call_id, status="error",
+                          error_code="exception", data=f"tool error: {e}")
