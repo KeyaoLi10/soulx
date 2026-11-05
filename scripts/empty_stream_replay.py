@@ -15,6 +15,7 @@ fails loudly.
 Run: /home/research/krisl/soulx/venv/bin/python -I scripts/empty_stream_replay.py
 """
 import ast
+import sys
 import threading
 import time
 import types
@@ -29,6 +30,18 @@ fn = next(
     None,
 )
 assert fn is not None, "_run_speech_pipeline not found in app.py"
+fn_deliver = next(
+    (n for n in tree.body
+     if isinstance(n, ast.FunctionDef) and n.name == "_agent_deliver_entry"),
+    None,
+)
+assert fn_deliver is not None, "_agent_deliver_entry not found in app.py"
+fn_begin = next(
+    (n for n in tree.body
+     if isinstance(n, ast.FunctionDef) and n.name == "_begin_generation"),
+    None,
+)
+assert fn_begin is not None, "_begin_generation not found in app.py"
 code = ast.get_source_segment(src, fn)
 
 
@@ -49,9 +62,16 @@ ns = {
     "llm": types.SimpleNamespace(
         add_message=lambda cid, role, msg: messages.append((role, msg))
     ),
+    # deliver-path stubs (overwritten per test below)
+    "_commit_pending_message": lambda session, cid: None,
+    "TTS_CLIENTS": {},
+    "DEFAULT_SETTINGS": {"tts_engine": "mock"},
 }
 exec(compile(code, str(APP), "exec"), ns)
+exec(compile(ast.get_source_segment(src, fn_begin), str(APP), "exec"), ns)
+exec(compile(ast.get_source_segment(src, fn_deliver), str(APP), "exec"), ns)
 pipeline = ns["_run_speech_pipeline"]
+deliver = ns["_agent_deliver_entry"]
 
 
 class _AudioTTS:
@@ -251,6 +271,101 @@ ret, s = run(gen_two_segments, grace_until=time.time() + 0.25)
 check("宽限窗内完成并冲刷 -> True", True, ret,
       s.pending_message == "北京今天天气晴朗，气温在五到十七度之间。",
       len(s.assistant_chunks) == 2)
+
+# ---- part 2: pop_message (note retraction) ---------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "repo" / "dialogue_system"))
+import clients.llm_client as llm_mod  # noqa: E402
+
+NOTE = "[系统提示：后台任务 T1 已完成，以下是真实结果……]"
+
+
+def fresh_llm():
+    m = llm_mod.QwenLLM_stream()
+    m.sessions = {}
+    return m
+
+
+# 10. note alone at the tail -> popped cleanly
+m = fresh_llm()
+m.add_message(1, "assistant", "我去查一下。")
+m.add_message(1, "user", NOTE)
+ok = m.pop_message(1, "user", NOTE) and m.get_session(1) == [
+    {"role": "assistant", "content": "我去查一下。"}]
+results.append(ok)
+print(("PASS" if ok else "FAIL"), "note 独占尾部 -> 整条弹出")
+
+# 11. barge-in user text merged AFTER the note (prefix strip)
+m = fresh_llm()
+m.add_message(1, "assistant", "我去查一下。")
+m.add_message(1, "user", NOTE)
+m.add_message(1, "user", "嗯，好的好的。")   # add_message merges same-role
+ok = m.pop_message(1, "user", NOTE) and m.get_session(1) == [
+    {"role": "assistant", "content": "我去查一下。"},
+    {"role": "user", "content": "嗯，好的好的。"}]
+results.append(ok)
+print(("PASS" if ok else "FAIL"), "note 与后续 user 合并 -> 前缀剥离")
+
+# 12. note merged AFTER a previous user message (suffix strip)
+m = fresh_llm()
+m.add_message(1, "user", "查一下北京天气。")
+m.add_message(1, "user", NOTE)
+ok = m.pop_message(1, "user", NOTE) and m.get_session(1) == [
+    {"role": "user", "content": "查一下北京天气。"}]
+results.append(ok)
+print(("PASS" if ok else "FAIL"), "note 与前序 user 合并 -> 后缀剥离")
+
+# 13. tail is an unrelated message -> no-op, returns False
+m = fresh_llm()
+m.add_message(1, "assistant", " unrelated ")
+ok = (not m.pop_message(1, "user", NOTE)) and len(m.get_session(1)) == 1
+results.append(ok)
+print(("PASS" if ok else "FAIL"), "尾部无关消息 -> 不动返回 False")
+
+# ---- part 3: _agent_deliver_entry end-to-end -------------------------
+class DeliverSession(types.SimpleNamespace):
+    def interrupt(self):
+        pass
+
+    def reset_interrupt(self):
+        self.stop_event.clear()
+
+
+def mk_deliver_session():
+    s = DeliverSession(**vars(mk_session()))
+    s.stop_event = threading.Event()
+    s.settings = {"tts_engine": "mock", "tts_cfg": 2.0, "tts_timesteps": 10}
+    s.gen_serial = 0
+    s.gen_in_progress = False
+    return s
+
+
+def run_deliver(gen_factory):
+    """Drive the real _agent_deliver_entry with a real QwenLLM_stream
+    (only generate_with_history is patched). Returns (ret, llm)."""
+    s = mk_deliver_session()
+    m = fresh_llm()
+    m.generate_with_history = lambda cid, stop_event=None, **k: gen_factory(stop_event)
+    ns["llm"] = m
+    ns["TTS_CLIENTS"] = {"mock": MockTTS()}
+    events.clear()
+    entry = {"task_id": "T1", "goal": "查北京天气", "result": "晴，17度",
+             "error": None, "attempts": 0}
+    ret = deliver(s, 1, entry)
+    return ret, m
+
+
+# 14. silent-killed delivery -> None AND the note is retracted from
+#     history (the retry re-injects a fresh one)
+ret, m = run_deliver(gen_zero_yield_on_stop)
+hist = m.get_session(1)
+note_gone = not any("T1" in (msg.get("content") or "") for msg in hist)
+check("投递静默掐死 -> None 且 note 收回", None, ret, note_gone)
+
+# 15. fully-spoken delivery -> True AND the note stays in history
+ret, m = run_deliver(gen_two_segments)
+hist = m.get_session(1)
+note_kept = any("T1" in (msg.get("content") or "") for msg in hist)
+check("投递完整播出 -> True 且 note 保留", True, ret, note_kept)
 
 print()
 if all(results):
