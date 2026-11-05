@@ -593,26 +593,72 @@
             let decoded;
             try { decoded = await ctx.decodeAudioData(buf); }
             finally { ctx.close(); }
-            audioState[kind] = {
+            // Piecewise run mapping (2026-11-05): the tts sidecar records
+            // at generation speed (RTF < 1), so contiguous byte ranges are
+            // "runs" anchored at their own epoch; audible gaps between runs
+            // are real silence that the linear st.start mapping compressed
+            // away. A run's optional third element is a barge-in cut:
+            // audio past it was emitted but never played. Legacy sidecars
+            // without runs fall back to one run from "start".
+            const rate = info[kind].rate;
+            const bps = rate * 2;   // bytes per second of audio
+            let runs = (info[kind].runs || [])
+              .filter((r) => Array.isArray(r) && r.length >= 2)
+              .map((r) => [Number(r[0]), Number(r[1]),
+                           r.length > 2 ? Number(r[2]) : null])
+              .filter((r) => isFinite(r[0]) && isFinite(r[1]) && r[0] >= 0)
+              .sort((a, b) => a[0] - b[0]);
+            if (!runs.length) runs = [[0, info[kind].start || cur.start, null]];
+            const st = {
               buffer: decoded,
               url,
               el: null,
-              start: info[kind].start || cur.start,   // epoch of first frame
+              start: info[kind].start || cur.start,   // epoch of byte 0
+              runs: runs.map((r, i) => {
+                const o = Math.min(r[0] / bps, decoded.duration);
+                const next = runs[i + 1]
+                  ? Math.min(runs[i + 1][0] / bps, decoded.duration)
+                  : decoded.duration;
+                const lend = Math.max(o, next);       // local end incl. cut bytes
+                const aend = (r[2] != null && isFinite(r[2]))
+                  ? Math.min(lend, o + r[2])          // audible end
+                  : lend;
+                return { t: r[1], o, lend, aend };
+              }),
               base: null, over: null,
             };
+            audioState[kind] = st;
           } catch (e) { console.warn("audio " + kind + ": " + e.message); }
         });
       await Promise.all(jobs);
       renderWaveforms();
     }
 
+    // session epoch -> audio-local seconds (null = no audible audio then)
+    function tToLocal(st, t) {
+      let best = null;
+      for (const r of st.runs) {
+        if (t < r.t) break;               // runs are epoch-sorted
+        if (t < r.t + (r.aend - r.o)) best = r.o + (t - r.t);
+      }
+      return best;
+    }
+
+    // audio-local seconds -> session epoch (null = past a barge-in cut)
+    function localToT(st, local) {
+      for (const r of st.runs) {
+        if (local >= r.o && local < r.aend) return r.t + (local - r.o);
+      }
+      return null;
+    }
+
     // Peaks mapped through the session-time axis: pixel x covers session
-    // times [tOfX(x+PAD_L-0.5), tOfX(x+PAD_L+0.5)], converted to
-    // audio-local seconds via st.start and clamped to the buffer. Audio
-    // that doesn't span the whole session (late mic start, reconnect gap
-    // on a reused session id) leaves blank regions instead of being
-    // stretched to fit — and a click at pixel x seeks exactly the moment
-    // drawn there (2026-11-05).
+    // times [tOfX(x+PAD_L-0.5), tOfX(x+PAD_L+0.5)]; each run contributes the
+    // samples its audible window overlaps with that pixel. Audio that
+    // doesn't span the whole session (late mic start, audible gap between
+    // tts runs, reconnect gap on a reused session id, bytes past a barge-in
+    // cut) leaves blank regions instead of being stretched to fit — and a
+    // click at pixel x seeks exactly the moment drawn there (2026-11-05).
     function drawPeaks(kind) {
       const st = audioState[kind];
       if (!st || !st.base || !cur) return;
@@ -621,27 +667,30 @@
       ctx.clearRect(0, 0, w, h);
       const rate = st.buffer.sampleRate;
       const ch = st.buffer.getChannelData(0);
-      const dur = st.buffer.duration;
       ctx.strokeStyle = kind === "mic" ? "#34d399" : "#60a5fa";
       ctx.globalAlpha = 0.85;
       ctx.beginPath();
       for (let x = 0; x < w; x++) {
-        const ta = Math.max(0, tOfX(x + PAD_L - 0.5) - st.start);
-        const tb = Math.min(dur, tOfX(x + PAD_L + 0.5) - st.start);
-        if (tb <= ta) continue;   // no recording at this pixel: leave blank
-        const s = Math.floor(ta * rate);
-        const e = Math.min(Math.floor(tb * rate), ch.length);
-        let mn = 0, mx = 0;
-        if (e > s) {
-          mn = 1; mx = -1;
-          // stride keeps this O(w * 64) even for long sessions
-          const stride = Math.max(1, Math.floor((e - s) / 64));
-          for (let i = s; i < e; i += stride) {
+        const tA = tOfX(x + PAD_L - 0.5), tB = tOfX(x + PAD_L + 0.5);
+        let mn = 0, mx = 0, has = false, anyS = false;
+        for (const r of st.runs) {
+          const s0 = Math.max(r.t, tA);                 // session-time overlap
+          const s1 = Math.min(r.t + (r.aend - r.o), tB);
+          if (s1 <= s0) continue;                       // run not at this pixel
+          has = true;
+          const i0 = Math.max(0, Math.floor((r.o + (s0 - r.t)) * rate));
+          const i1 = Math.min(Math.ceil((r.o + (s1 - r.t)) * rate), ch.length);
+          if (i1 <= i0) continue;                       // recorded silence
+          anyS = true;
+          const stride = Math.max(1, Math.floor((i1 - i0) / 64));
+          for (let i = i0; i < i1; i += stride) {
             const v = ch[i];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
+            if (!anyS || v < mn) mn = v;
+            if (!anyS || v > mx) mx = v;
+            anyS = true;
           }
         }
+        if (!has) continue;   // no audible recording at this pixel: blank
         const y1 = mid - mx * (mid - 2), y2 = mid - mn * (mid - 2);
         if (y2 - y1 < 1) { ctx.moveTo(x, mid - 0.5); ctx.lineTo(x, mid + 0.5); }
         else { ctx.moveTo(x, y1); ctx.lineTo(x, y2); }
@@ -717,7 +766,10 @@
       if (!dual) return null;
       for (const kind of ["mic", "tts"]) {
         const st = audioState[kind];
-        if (st && st.el && !st.el.paused) return st.start + st.el.currentTime;
+        if (st && st.el && !st.el.paused) {
+          const t = localToT(st, st.el.currentTime);
+          if (t != null) return t;
+        }
       }
       return dual.t0 + (performance.now() - dual.wall0) / 1000;
     }
@@ -738,11 +790,10 @@
         const st = audioState[kind];
         if (!st) continue;
         if (!st.el) st.el = new Audio(st.url);
-        const local = tSession - st.start;
-        if (local < -0.05 || local > st.buffer.duration) { st.el.pause(); continue; }
-        try {
-          st.el.currentTime = Math.max(0, Math.min(local, st.buffer.duration - 0.05));
-        } catch (e) { /* seek before metadata */ }
+        const local = tToLocal(st, tSession);
+        if (local == null) { st.el.pause(); continue; }   // gap or cut
+        try { st.el.currentTime = local; }
+        catch (e) { /* seek before metadata */ }
         st.el.play().catch((e) => console.warn("playback " + kind + ": " + e.message));
       }
       if (!rafId) rafId = requestAnimationFrame(drawPlayheads);
@@ -752,19 +803,18 @@
       dual = null;   // single-track listening ends any live replay
       const st = audioState[kind];
       if (!st) return;
+      const tLocal = tToLocal(st, tSession);
+      if (tLocal == null) return;   // no audible audio at the click
       if (!st.el) st.el = new Audio(st.url);
       const el = st.el;
-      const tLocal = tSession - st.start;
       if (!el.paused && Math.abs(el.currentTime - tLocal) < 0.3) {
         el.pause();
         return;
       }
       const other = audioState[kind === "mic" ? "tts" : "mic"];
       if (other && other.el) other.el.pause();
-      try {
-        el.currentTime = Math.max(
-          0, Math.min(tLocal, st.buffer.duration - 0.05));
-      } catch (e) { /* seek before metadata */ }
+      try { el.currentTime = tLocal; }
+      catch (e) { /* seek before metadata */ }
       el.play().catch((e) => console.warn("playback: " + e.message));
       if (!rafId) rafId = requestAnimationFrame(drawPlayheads);
     }
@@ -780,12 +830,14 @@
         for (const kind of ["mic", "tts"]) {
           const st = audioState[kind];
           if (!st) continue;
-          maxRecEnd = Math.max(maxRecEnd, st.start + st.buffer.duration);
+          for (const r of st.runs) {
+            maxRecEnd = Math.max(maxRecEnd, r.t + (r.aend - r.o));
+          }
           if (!st.over) continue;
           const c = st.over, ctx = c.getContext("2d");
           ctx.clearRect(0, 0, c.width, c.height);
-          const local = t - st.start;
-          const inRange = local >= 0 && local <= st.buffer.duration;
+          const local = tToLocal(st, t);
+          const inRange = local != null;
           if (st.el && inRange) {
             if (st.el.paused) {
               try { st.el.currentTime = local; } catch (e) {}
@@ -823,7 +875,9 @@
         const el = st.el;
         if (el && !el.paused) {
           playing = true;
-          const x = xOfT(st.start + el.currentTime) - PAD_L;
+          const t = localToT(st, el.currentTime);
+          if (t == null) continue;   // past a barge-in cut: nothing to draw
+          const x = xOfT(t) - PAD_L;
           if (x >= 0 && x <= c.width) {
             ctx.strokeStyle = "#f87171";
             ctx.lineWidth = 1.5;
