@@ -18,8 +18,6 @@ results/
 *.wav
 *.zip
 
-# 上游克隆（独立 git 仓库，不作为子目录跟踪）
-repo/
 
 # 证书 / 私钥
 services/certs/
