@@ -1,3 +1,4 @@
+import json
 import re
 import requests
 from itertools import groupby
@@ -331,6 +332,133 @@ class QwenLLM_stream:
                     return
         finally:
             pass
+
+
+class ControlStreamError(Exception):
+    """/agent_chat_v2 协议违规（帧超限/非 JSON 行/非 v2 帧）。"""
+
+
+class ControlResult:
+    """一次控制轮调用的完整结果（手册 §12）。
+
+    ok 只有在收到 finish_reason=="stop" 的 done 帧且无 error 帧时才为
+    True——异常 EOF、length 截断、缺 done、连接错误都不提交控制批次。
+    """
+
+    def __init__(self, text="", reasoning="", tool_calls=None,
+                 finish_reason=None, error=None, interrupted=False):
+        self.text = text                      # text_delta 拼接
+        self.reasoning = reasoning            # reasoning_delta 拼接
+        self.tool_calls = tool_calls or []    # [{call_id, name, arguments}]
+        self.finish_reason = finish_reason    # None = 没收到 done 帧
+        self.error = error
+        self.interrupted = interrupted
+
+    @property
+    def ok(self):
+        return (self.finish_reason == "stop" and not self.error
+                and not self.interrupted)
+
+    def __repr__(self):
+        return (f"ControlResult(ok={self.ok}, finish={self.finish_reason!r}, "
+                f"error={self.error!r}, calls={len(self.tool_calls)}, "
+                f"text={len(self.text)}ch)")
+
+
+class AgentControlClient:
+    """/agent_chat_v2 的 NDJSON 客户端（手册 §12）。
+
+    逐字节缓冲、按 \\n 组帧、单帧大小上限；多字节 UTF-8 不会被换行切分
+    （\\n 不是多字节序列的一部分），逐行 decode 安全。不假设 HTTP chunk
+    边界与应用帧边界有任何对应关系。
+    """
+
+    MAX_FRAME_BYTES = 1 << 20                # 单帧 1MB 上限
+
+    def __init__(self, endpoint="http://localhost:6007/agent_chat_v2",
+                 timeout_s=30.0):
+        self.endpoint = endpoint
+        self.timeout_s = timeout_s
+
+    def _iter_frames(self, response, stop_event=None):
+        """把字节流组成 NDJSON 帧并逐帧 yield。协议违规抛
+        ControlStreamError，stop_event 置位则静默停止（缺 done 由调用方
+        通过 finish_reason is None 判定）。"""
+        buf = b""
+        for chunk in response.iter_content(chunk_size=None):
+            if stop_event is not None and stop_event.is_set():
+                return
+            if not chunk:
+                continue
+            buf += chunk
+            while True:
+                i = buf.find(b"\n")
+                if i < 0:
+                    if len(buf) > self.MAX_FRAME_BYTES:
+                        raise ControlStreamError(
+                            f"frame exceeds {self.MAX_FRAME_BYTES} bytes "
+                            "without newline")
+                    break
+                line, buf = buf[:i], buf[i + 1:]
+                if not line.strip():
+                    continue
+                if len(line) > self.MAX_FRAME_BYTES:
+                    raise ControlStreamError("frame exceeds size cap")
+                try:
+                    f = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError) as e:
+                    raise ControlStreamError(f"bad NDJSON line: {e}") from None
+                if not isinstance(f, dict) or f.get("v") != 2:
+                    raise ControlStreamError("frame is not a v2 object")
+                yield f
+
+    def run(self, messages, tools=None, thinking=False, stop_event=None,
+            temperature=None, max_tokens=None):
+        """执行一次控制轮并收集全部帧。任何网络/协议错误都折叠进
+        ControlResult.error，不抛出。"""
+        body = {"messages": messages, "thinking": thinking}
+        if tools:
+            body["tools"] = tools
+        if temperature is not None:
+            body["temperature"] = temperature
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        response = None
+        text_parts, reason_parts, calls = [], [], []
+        finish, error = None, None
+        try:
+            response = requests.post(
+                self.endpoint, json=body, stream=True, timeout=self.timeout_s)
+            response.raise_for_status()
+            for f in self._iter_frames(response, stop_event):
+                t = f.get("type")
+                if t == "text_delta":
+                    text_parts.append(f.get("text") or "")
+                elif t == "reasoning_delta":
+                    reason_parts.append(f.get("text") or "")
+                elif t == "tool_call":
+                    calls.append({
+                        "call_id": f.get("call_id"),
+                        "name": f.get("name"),
+                        "arguments": f.get("arguments") or {},
+                    })
+                elif t == "error":
+                    error = f.get("error")
+                elif t == "done":
+                    finish = f.get("finish_reason")
+        except requests.RequestException as e:
+            error = f"http: {e}"
+        except ControlStreamError as e:
+            error = f"protocol: {e}"
+        finally:
+            # 与 legacy 客户端同一教训：每条路径都关 socket，否则服务端
+            # 看不到断连、继续生成占住 GEN_LOCK
+            if response is not None:
+                response.close()
+        return ControlResult(
+            text="".join(text_parts), reasoning="".join(reason_parts),
+            tool_calls=calls, finish_reason=finish, error=error,
+            interrupted=bool(stop_event is not None and stop_event.is_set()))
 
 
 class QwenLLM_IndexTTS_stream:
