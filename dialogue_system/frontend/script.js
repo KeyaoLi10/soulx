@@ -817,6 +817,9 @@ const settingsEls = {
   turnWaitMsVal: document.getElementById('turnWaitMsVal'),
   turnGraceMs: document.getElementById('turnGraceMs'),
   turnGraceMsVal: document.getElementById('turnGraceMsVal'),
+  asrCorrect: document.getElementById('asrCorrect'),
+  asrCorrectWaitMs: document.getElementById('asrCorrectWaitMs'),
+  asrCorrectWaitMsVal: document.getElementById('asrCorrectWaitMsVal'),
   ttsCfg: document.getElementById('ttsCfg'),
   ttsCfgVal: document.getElementById('ttsCfgVal'),
   ttsSteps: document.getElementById('ttsSteps'),
@@ -854,6 +857,8 @@ function currentSettings() {
     pvad_threshold: parseFloat(settingsEls.pvadThreshold.value) || 0.5,
     agent_enabled: settingsEls.agentEnabled.checked,
     playback_guard: settingsEls.playbackGuard.checked,
+    asr_correct: settingsEls.asrCorrect.checked,
+    asr_correct_wait_ms: parseInt(settingsEls.asrCorrectWaitMs.value, 10) || 500,
   };
 }
 
@@ -910,6 +915,8 @@ function debouncedSend() {
       pvad_threshold: s.pvad_threshold,
       agent_enabled: s.agent_enabled,
       playback_guard: s.playback_guard,
+      asr_correct: s.asr_correct,
+      asr_correct_wait_ms: s.asr_correct_wait_ms,
     });
   }, 400);
 }
@@ -919,7 +926,8 @@ function debouncedSend() {
 // ignores them in frc mode).
 function syncTurnTimingState() {
   const frc = settingsEls.turnEngine.value === 'frc';
-  [settingsEls.turnWaitMs, settingsEls.turnGraceMs, settingsEls.playbackGuard].forEach((el) => {
+  [settingsEls.turnWaitMs, settingsEls.turnGraceMs, settingsEls.playbackGuard,
+   settingsEls.asrCorrect, settingsEls.asrCorrectWaitMs].forEach((el) => {
     el.disabled = frc;
     el.closest('.field').classList.toggle('frc-off', frc);
   });
@@ -936,6 +944,11 @@ settingsEls.turnWaitMs.addEventListener('input', () => {
 });
 settingsEls.turnGraceMs.addEventListener('input', () => {
   settingsEls.turnGraceMsVal.textContent = settingsEls.turnGraceMs.value + ' ms';
+  debouncedSend();
+});
+settingsEls.asrCorrect.addEventListener('change', debouncedSend);
+settingsEls.asrCorrectWaitMs.addEventListener('input', () => {
+  settingsEls.asrCorrectWaitMsVal.textContent = settingsEls.asrCorrectWaitMs.value + ' ms';
   debouncedSend();
 });
 syncTurnTimingState();

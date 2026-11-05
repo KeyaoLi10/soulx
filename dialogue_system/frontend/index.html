@@ -146,6 +146,18 @@
           <span class="block-hint">While the assistant is generating or speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo/blip phantom turns are dropped — speaker echo, AEC residue or breath noise then cannot chop the reply or hijack your sentence. Off = raw zero-hysteresis behavior (any single sound interrupts). SoulX engine only.</span>
         </div>
         <div class="field">
+          <label for="asrCorrect" class="toggle-row">
+            <input id="asrCorrect" type="checkbox" checked>
+            <span>Whole-turn ASR correction</span>
+          </label>
+          <span class="block-hint">At each turn commit the server re-recognizes the whole utterance offline and corrects the live text (bubble + what the LLM hears) — the live rolling-window text is the main source of ASR errors. Costs up to the wait below of extra latency; on timeout or failed correction the live text is kept. SoulX engine only.</span>
+        </div>
+        <div class="field">
+          <label for="asrCorrectWaitMs">ASR correction wait <span id="asrCorrectWaitMsVal" class="val">500 ms</span></label>
+          <input id="asrCorrectWaitMs" type="range" min="0" max="2000" step="100" value="500">
+          <span class="block-hint">How long the reply holds for the corrected text before falling back to the live one. Typical correction lands in 100-300 ms; 0 = never wait (correction still updates nothing then). SoulX engine only.</span>
+        </div>
+        <div class="field">
           <label for="ttsEngine">Engine</label>
           <select id="ttsEngine" class="input">
             <option value="voxcpm">VoxCPM2</option>

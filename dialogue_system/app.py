@@ -941,7 +941,7 @@ def _agent_deliver_entry(session, client_id, entry):
 
 
 def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
-                    gen_sn=None):
+                    gen_sn=None, commit_id=None):
     """
     Main processing pipeline: ASR -> LLM -> TTS.
     Runs in a background thread for each detected utterance.
@@ -950,12 +950,42 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
     ("complete" = <|user_complete|>, instant, unverified; "wait" =
     silence-verified). Only "complete" turns get the premature-turn grace
     hold in _run_speech_pipeline — that is the 抢话 fix of 2026-10-30.
+
+    commit_id: the turn server's counter for this commit — pairs the
+    async turn_final (two-pass ASR correction) with this turn.
     """
     session = session_manager.get_session(client_id)
     if not session:
         return
 
     try:
+        # 0. Two-pass ASR correction (2026-11-05 方案A): the turn server
+        # re-recognizes the WHOLE turn offline right after committing and
+        # pushes a turn_final. Hold briefly here (this background thread,
+        # never the event loop) and prefer the corrected text for
+        # everything downstream — bubble, LLM history, self-talk check,
+        # agent cancel. Live text comes from a 3.2s rolling window with
+        # speech chunks glued without pauses and LCS-diffed against
+        # history; measured on 37 real turns, whole-turn recognition with
+        # the same paraformer is markedly more accurate (typical
+        # correction latency 0.1-0.3s). Timeout or empty correction falls
+        # back to the live text — the correction is an enhancement, never
+        # a dependency.
+        if (commit_id is not None
+                and isinstance(audio_segment, str)
+                and session.settings.get("asr_correct", True)
+                and callable(getattr(session.vad, "wait_turn_final", None))):
+            wait_s = session.settings.get("asr_correct_wait_ms", 500) / 1000.0
+            t_hold = time.time()
+            corrected = session.vad.wait_turn_final(commit_id, timeout=wait_s)
+            if corrected and corrected != audio_segment:
+                logger.info(
+                    f"[{client_id}] ASR corrected in {time.time()-t_hold:.2f}s "
+                    f"({turn_trigger or 'wait'} turn): {corrected} "
+                    f"(live: {audio_segment})"
+                )
+                audio_segment = corrected
+
         # 1. ASR Phase (Automatic Speech Recognition)
         if asr is None:
             # Fallback if ASR is handled by internal TurnTaking module
@@ -1631,6 +1661,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     turn_trigger = getattr(
                         session.vad, "last_turn_trigger", None
                     )
+                    # commit_id for the two-pass ASR correction: captured
+                    # NOW for the same reason as turn_trigger — the next
+                    # vad.process() overwrites last_commit_id
+                    commit_id = getattr(
+                        session.vad, "last_commit_id", None
+                    )
                     # flag the reply as generating NOW, at commit: the
                     # worker thread's own set comes ~0.5 s later (gates +
                     # LLM connect) and a blip in that gap slipped both
@@ -1639,7 +1675,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     threading.Thread(
                         target=pipeline_worker,
                         args=(client_id, segment, Config.SAMPLE_RATE,
-                              turn_trigger, gen_sn),
+                              turn_trigger, gen_sn, commit_id),
                         daemon=True,
                     ).start()
 
@@ -2011,7 +2047,9 @@ _LOG_EVENT_PATTERNS = [
     (re.compile(
         r"^transient barge-in suppressed \((\d+) unconfirmed chunk\(s\), "
         r"(\d+) in"), "suppressed"),
-    (re.compile(r"^ASR result(?: \((\w+) turn\))?: (.*)"), "turn"),
+    (re.compile(
+        r"^ASR (?:result|corrected in [\d.]+s)(?: \((\w+) turn\))?: (.*)"),
+     "turn"),
     (re.compile(r"^ASR partial: (.*)"), "partial"),
     (re.compile(r"^LLM Chunk: (.*)"), "chunk"),
     (re.compile(r"^Previous turn, Ratio: ([\d.]+), Truncated: (.*)"),

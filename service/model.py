@@ -1,4 +1,5 @@
 import os, sys
+import threading
 import torch
 import random
 import numpy as np
@@ -80,6 +81,11 @@ class TurnModel:
             self.cascade_asr = SensevoiceASR(
                 language=config.infer_config.asr.get("language", "auto")
             )
+        # Serializes every cascade-ASR call: the modelscope pipeline is not
+        # thread-safe, and commit-time whole-turn corrections
+        # (correct_turn_text, called from a server worker thread) now run
+        # beside the websocket loop's own recognize calls.
+        self.asr_lock = threading.Lock()
 
         print("[DuplexServer] Model loaded successfully.")
 
@@ -405,6 +411,40 @@ class TurnModel:
 
         return predicted_state
 
+    def _recognize(self, audio):
+        """Serialized cascade-ASR call (asr_lock — see _init_load_model)."""
+        with self.asr_lock:
+            return self.cascade_asr.recognize(audio, self.sampling_rate)
+
+    def correct_turn_text(self, audio):
+        """Whole-turn offline re-recognition (two-pass ASR 修正, 2026-11-05).
+
+        Live text comes from a 3.2s rolling window with speech chunks glued
+        (no pauses) and LCS-diffed against history — measured on 37 real
+        turns, recognizing the natural whole-turn audio with this same
+        paraformer instance is markedly more accurate. Runs on a server
+        worker thread right after the commit message goes out; asr_lock
+        serializes against the websocket loop's recognize calls (worst
+        case it delays the next chunk's feed_audio by one recognition,
+        ~0.1-0.4s, surfaced by turn.log's SLOW feed_audio line).
+
+        audio: raw 16k float32 turn audio (engine-accumulated, pauses
+        intact — paraformer's internal VAD uses them). Returns the
+        corrected text, or "" when unusable (too short / recognition
+        failed) — callers treat "" as "keep the live text".
+        """
+        if audio is None or len(audio) < 0.3 * self.sampling_rate:
+            return ""
+        try:
+            return self._recognize(audio).strip()
+        except Exception as exc:
+            print(
+                f"[DuplexServer] turn correction failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return ""
+
     def state_predict(self, process_chunk, audio_back, audio_ahead, max_wait_num=None):
         # prev state for the always-on STATE transition record. past_state
         # is per-session (travels through snapshot/restore_runtime) and is
@@ -492,9 +532,8 @@ class TurnModel:
                 if self.wait_idle_cnt >= effective_wait:
                     self._log("Continuous silence after wait, triggering reply")
                     if self.speech_detected:
-                        segment = self.cascade_asr.recognize(
+                        segment = self._recognize(
                             self._trim_seed(self.buffer_for_asr, self.asr_seed_len),
-                            self.sampling_rate,
                         )
                         segment = self._strip_commit_overlap(segment)
                         if self.commit_no_text_reset and not segment.strip():
@@ -654,9 +693,8 @@ class TurnModel:
         chunk, applies the empty-text guard, records last_commit_text for
         the backoff dedup, resets and returns the speak event."""
         self.buffer_for_asr = np.concatenate([self.buffer_for_asr, process_chunk])
-        segment = self.cascade_asr.recognize(
+        segment = self._recognize(
             self._trim_seed(self.buffer_for_asr, self.asr_seed_len),
-            self.sampling_rate,
         )
         segment = self._strip_commit_overlap(segment)
         if self.commit_no_text_reset and not segment.strip():
@@ -836,9 +874,8 @@ class TurnModel:
                 # Speech detected -> Cascade ASR
                 t_asr = time.time()
                 full_text = remove_leading_backchannel(
-                    self.cascade_asr.recognize(
+                    self._recognize(
                         self._trim_seed(self.cascade_buffer, self.cascade_seed_len),
-                        self.sampling_rate,
                     )
                 )
                 self._log(f"[Timing] Cascade ASR: {time.time() - t_asr:.4f}s")

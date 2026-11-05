@@ -38,6 +38,13 @@ class TurnTaking:
         # sessions after 60s, so a one-shot push on set would silently
         # expire. None = server/model default.
         self.max_wait_num = None
+        # Two-pass ASR (2026-11-05 方案A): commit_id of the last "speak"
+        # response (echoed by the server's async turn_final push), and the
+        # stash of received turn_final texts keyed by commit_id. Written by
+        # the recv loop / process(); read by wait_turn_final() from the
+        # app's pipeline worker thread.
+        self.last_commit_id = None
+        self._turn_finals = {}
 
     def _emit_status(self, state, message, force=False):
         if not self.status_callback:
@@ -145,6 +152,49 @@ class TurnTaking:
                 flush=True,
             )
 
+    def _send_and_recv(self, payload_str):
+        """Send one audio payload, recv until the paired turn_state.
+
+        The turn server pushes unsolicited turn_final messages (two-pass
+        ASR correction) after a commit — they can land ahead of any later
+        chunk's response. Stash them and keep reading; only the paired
+        turn_state terminates the loop. Raises on socket errors, exactly
+        like the bare send/recv it replaced."""
+        self.ws.send(payload_str)
+        while True:
+            data = json.loads(self.ws.recv())
+            if isinstance(data, dict) and data.get("type") == "turn_final":
+                self._stash_turn_final(data)
+                continue
+            return data
+
+    def _stash_turn_final(self, data):
+        cid = data.get("commit_id")
+        if cid is None:
+            return
+        # bounded: only the last few commits' finals are ever needed (the
+        # app waits at most ~0.5s after each commit)
+        self._turn_finals[cid] = (data.get("text") or "").strip()
+        while len(self._turn_finals) > 8:
+            self._turn_finals.pop(next(iter(self._turn_finals)))
+
+    def wait_turn_final(self, commit_id, timeout=0.5, poll=0.02):
+        """Block up to `timeout` for the turn server's corrected whole-turn
+        text (two-pass ASR). Runs in the app's pipeline worker thread —
+        never call from the event loop. Returns the corrected text, or
+        None when nothing usable arrived in time (caller falls back to the
+        live text). An empty correction also returns None — the live text
+        is kept."""
+        if commit_id is None:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            text = self._turn_finals.pop(commit_id, None)
+            if text is not None:
+                return text or None
+            time.sleep(poll)
+        return None
+
     def process(self, audio_chunk: np.ndarray):
         if audio_chunk is None:
             return None
@@ -160,9 +210,7 @@ class TurnTaking:
             ).decode(),
         }
         try:
-            self.ws.send(json.dumps(payload))
-            response = self.ws.recv()
-            data = json.loads(response)
+            data = self._send_and_recv(json.dumps(payload))
         except Exception as exc:
             # Never swallow the reason silently: log it, it is the key
             # diagnostic when the turn pipeline degrades.
@@ -172,9 +220,7 @@ class TurnTaking:
                 flush=True,
             )
             self.connect()
-            self.ws.send(json.dumps(payload))
-            response = self.ws.recv()
-            data = json.loads(response)
+            data = self._send_and_recv(json.dumps(payload))
         if time.time() - t0 > 0.5:
             print(
                 f"[VadClient] slow process(): {time.time()-t0:.2f}s "
@@ -202,4 +248,5 @@ class TurnTaking:
             if asr_buffer.strip():
                 self._emit_transcription(asr_buffer)
             self.last_turn_trigger = data["state"].get("trigger") or "wait"
+            self.last_commit_id = data["state"].get("commit_id")
             return data["state"].get("text", "")

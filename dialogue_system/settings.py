@@ -87,6 +87,15 @@ DEFAULT_SETTINGS = {
     # Off restores the raw zero-hysteresis behavior (instant interrupt on
     # ANY nonidle chunk, phantom turns included). SoulX engine only.
     "playback_guard": True,
+    # Two-pass ASR correction (2026-11-05 方案A): at turn commit the turn
+    # server re-recognizes the WHOLE turn offline with its paraformer and
+    # pushes a turn_final; the pipeline worker holds up to
+    # asr_correct_wait_ms for it (live-text fallback on timeout/empty).
+    # Live text (3.2s rolling window, chunks glued without pauses) is the
+    # known ASR-error source; the whole-turn pass measured markedly
+    # better on 37 real turns at 0.08-0.26s latency. SoulX engine only.
+    "asr_correct": True,
+    "asr_correct_wait_ms": 500,
 }
 
 # Validation for update_config: (key, type, lo, hi) — ints/floats clamped to
@@ -103,6 +112,7 @@ SETTING_RULES = {
     # (0 = disabled)
     "turn_wait_ms": (int, 160, 3200),
     "turn_grace_ms": (int, 0, 3000),
+    "asr_correct_wait_ms": (int, 0, 2000),
 }
 TTS_ENGINES = ("voxcpm", "firered")
 PVAD_MODES = ("off", "shadow", "enforce")
@@ -142,4 +152,6 @@ def sanitize_updates(data) -> dict:
         clean["agent_enabled"] = bool(data["agent_enabled"])
     if "playback_guard" in data:
         clean["playback_guard"] = bool(data["playback_guard"])
+    if "asr_correct" in data:
+        clean["asr_correct"] = bool(data["asr_correct"])
     return clean

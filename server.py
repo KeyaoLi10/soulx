@@ -3,6 +3,7 @@ import base64
 import faulthandler
 import json
 import signal
+import threading
 import time
 import asyncio
 from typing import Dict
@@ -50,6 +51,51 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _correct_and_push(ws, loop, model, session_id, commit_id, audio, live_text, t_commit):
+    """Two-pass ASR correction (方案A, 2026-11-05) — runs on a daemon
+    thread so the websocket loop is never blocked by the re-recognition.
+
+    Re-recognizes the whole turn with the already-loaded paraformer and
+    pushes an unsolicited turn_final message; the client stashes it (its
+    recv loop reads until turn_state) and the web app's pipeline worker
+    waits briefly for it, updating the bubble and the LLM input when the
+    text differs from the live one. text="" (recognition unusable) is
+    still pushed — an explicit "no correction" unblocks the app's wait
+    immediately instead of burning the full timeout."""
+    text = model.correct_turn_text(audio)
+    lat = time.time() - t_commit
+    changed = bool(text) and text != live_text
+    print(
+        f"[TurnTaking] FINAL session {session_id[:8]} id={commit_id} "
+        f"lat={lat:.2f}s changed={int(changed)} text={text or live_text}",
+        flush=True,
+    )
+
+    async def _push():
+        try:
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "turn_final",
+                        "session_id": session_id,
+                        "commit_id": commit_id,
+                        "text": text,
+                        "ts": time.time(),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception:
+            # client disconnected mid-correction — nothing to deliver to
+            pass
+
+    try:
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_push()))
+    except RuntimeError:
+        # event loop already shut down (server stopping)
+        pass
 
 
 async def session_gc_loop():
@@ -187,6 +233,16 @@ async def turn_ws(ws: WebSocket):
                         f"text={c.get('text', '')}",
                         flush=True,
                     )
+                # two-pass ASR (方案A): the engine attached the whole-turn
+                # audio to the commit — pop it BEFORE json.dumps (a numpy
+                # array is not serializable), stamp the commit_id the
+                # client will pair the turn_final against, and spawn the
+                # correction AFTER the turn_state below goes out (the
+                # client's recv for THIS chunk must be answered first).
+                corr_audio = state.pop("corr_audio", None)
+                if corr_audio is not None:
+                    session.commit_seq += 1
+                    state["commit_id"] = session.commit_seq
                 await ws.send_text(
                     json.dumps(
                         {
@@ -198,6 +254,21 @@ async def turn_ws(ws: WebSocket):
                         ensure_ascii=False,
                     )
                 )
+                if corr_audio is not None:
+                    threading.Thread(
+                        target=_correct_and_push,
+                        args=(
+                            ws,
+                            asyncio.get_running_loop(),
+                            ws.app.state.model,
+                            session_id,
+                            session.commit_seq,
+                            corr_audio,
+                            (state.get("commit") or {}).get("text", ""),
+                            time.time(),
+                        ),
+                        daemon=True,
+                    ).start()
 
     except WebSocketDisconnect:
         print("[TurnTaking] websocket disconnected", flush=True)

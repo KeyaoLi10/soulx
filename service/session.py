@@ -5,6 +5,11 @@ class TurnSession:
     def __init__(self, engine):
         self.engine = engine
         self.last_state = None
+        # monotonically increasing commit counter (two-pass ASR, 方案A):
+        # stamped into each commit's turn_state (state["commit_id"]) and
+        # echoed in the async turn_final push, so the client can pair the
+        # correction with the commit that spawned it
+        self.commit_seq = 0
 
         # session lifecycle management
         now = time.time()
