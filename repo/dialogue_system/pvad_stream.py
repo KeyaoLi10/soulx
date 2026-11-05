@@ -85,6 +85,7 @@ class PvadStreamGate:
         self._suppressed = False
         self._low_run = 0
         self._last_cos = None
+        self._last_sep = None          # shadow sep_cos (speaker_sep switch)
         self._wake = threading.Event()
         self._alive = True
         self._thread = None
@@ -147,6 +148,11 @@ class PvadStreamGate:
             if cos is None:
                 self._set_state(False, None, "service-blind")  # fail-open
                 return
+            # shadow-only separation observation (speaker_sep switch,
+            # default off): reports sep_cos alongside the raw cos, never
+            # changes the suppress/release decision (see speaker_sep.py)
+            from speaker_sep import sep_shadow_round
+            self._last_sep = sep_shadow_round(session, wav)
             t_low = threshold - _STREAM_MARGIN
             if cos >= threshold:
                 self._low_run = 0
@@ -176,11 +182,19 @@ class PvadStreamGate:
             self._suppressed = suppressed
             self._last_cos = cos
         if changed:
+            sep = self._last_sep
             logger.info(
                 f"[{self.session.client_id}] pvad stream gate "
                 f"{'SUPPRESSING' if suppressed else 'releasing'} mic->ASR "
-                f"(why={why}, cos={None if cos is None else round(cos, 3)})"
+                f"(why={why}, cos={None if cos is None else round(cos, 3)}"
+                + (f", sep_cos={sep['sep_cos']}@s{sep['sep_stream']}"
+                   if sep else "") + ")"
             )
+
+    def sep_status(self) -> dict | None:
+        """Latest shadow separation observation, for pvad_status."""
+        with self._lock:
+            return self._last_sep
 
 
 def stream_gate_filter(session, wav: np.ndarray) -> np.ndarray:

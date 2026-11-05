@@ -63,6 +63,13 @@ DEFAULT_SETTINGS = {
     # unscoreable always pass (fail-open). Only active with pvad_mode
     # != off, so the default-off pvad path is untouched.
     "pvad_stream_gate": True,
+    # Speaker separation (task 2, 2026-11-06) — EXPERIMENTAL, default off.
+    # When on, the pvad stream gate additionally runs its scoring window
+    # through the MossFormer2_SS_16K sidecar (:8087, services/tse_server.py)
+    # and reports the separated-stream cos (pvad_status.sep_cos, shadow
+    # only — never changes any decision; see speaker_sep.py and
+    # docs/说话人分离验证报告-20261106.md for why it's shadow-only).
+    "speaker_sep": False,
     # Fast/slow brain agent (delegate_task → background slow brain on
     # :6008, results delivered at the next quiet gap)
     "agent_enabled": True,
@@ -165,4 +172,6 @@ def sanitize_updates(data) -> dict:
         clean["asr_correct"] = bool(data["asr_correct"])
     if "pvad_stream_gate" in data:
         clean["pvad_stream_gate"] = bool(data["pvad_stream_gate"])
+    if "speaker_sep" in data:
+        clean["speaker_sep"] = bool(data["speaker_sep"])
     return clean

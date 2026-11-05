@@ -832,6 +832,7 @@ const settingsEls = {
   pvadThreshold: document.getElementById('pvadThreshold'),
   pvadThresholdVal: document.getElementById('pvadThresholdVal'),
   pvadStreamGate: document.getElementById('pvadStreamGate'),
+  speakerSep: document.getElementById('speakerSep'),
   pvadEnrollBtn: document.getElementById('pvadEnrollBtn'),
   pvadEnrolled: document.getElementById('pvadEnrolled'),
   pvadProb: document.getElementById('pvadProb'),
@@ -857,6 +858,7 @@ function currentSettings() {
     pvad_mode: settingsEls.pvadMode.value,
     pvad_threshold: parseFloat(settingsEls.pvadThreshold.value) || 0.5,
     pvad_stream_gate: settingsEls.pvadStreamGate.checked,
+    speaker_sep: settingsEls.speakerSep.checked,
     agent_enabled: settingsEls.agentEnabled.checked,
     playback_guard: settingsEls.playbackGuard.checked,
     asr_correct: settingsEls.asrCorrect.checked,
@@ -916,6 +918,7 @@ function debouncedSend() {
       pvad_mode: s.pvad_mode,
       pvad_threshold: s.pvad_threshold,
       pvad_stream_gate: s.pvad_stream_gate,
+      speaker_sep: s.speaker_sep,
       agent_enabled: s.agent_enabled,
       playback_guard: s.playback_guard,
       asr_correct: s.asr_correct,
@@ -975,6 +978,7 @@ settingsEls.minSegLen.addEventListener('input', () => {
 // ==================== Speaker Gate (pvad sidecar) ====================
 settingsEls.pvadMode.addEventListener('change', debouncedSend);
 settingsEls.pvadStreamGate.addEventListener('change', debouncedSend);
+settingsEls.speakerSep.addEventListener('change', debouncedSend);
 settingsEls.pvadThreshold.addEventListener('input', () => {
   settingsEls.pvadThresholdVal.textContent =
     parseFloat(settingsEls.pvadThreshold.value).toFixed(2);

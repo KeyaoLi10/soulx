@@ -767,6 +767,14 @@ def pvad_emit_status(session) -> None:
                 session.pvad_stream_gate is not None
                 and session.pvad_stream_gate.suppressing()
             ),
+            # shadow separation observation (speaker_sep switch, default
+            # off): latest separated-stream cos vs the enrolled reference
+            "sep_cos": (
+                session.pvad_stream_gate.sep_status()["sep_cos"]
+                if session.pvad_stream_gate is not None
+                and session.pvad_stream_gate.sep_status() is not None
+                else None
+            ),
         },
     )
 

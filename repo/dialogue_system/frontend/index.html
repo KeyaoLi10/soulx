@@ -201,6 +201,13 @@
           </label>
           <span class="block-hint">With the gate in enforce mode and the speaker enrolled, mic audio that sustainably scores well below the enrolled voice is silenced before ASR — a background video/voice never reaches the transcript, the UI, or turn commits. Hysteresis: ~0.8 s of clearly-different audio to mute, one above-threshold score to unmute; unknown/unenrolled always passes. Only active with Speaker Gate on.</span>
         </div>
+        <div class="field">
+          <label for="speakerSep" class="toggle-row">
+            <input id="speakerSep" type="checkbox">
+            <span>Speaker separation (experimental)</span>
+          </label>
+          <span class="block-hint">Runs each speaker-gate scoring window through a MossFormer2 separation sidecar and reports the separated-stream similarity (shadow only — it never changes muting decisions, and offline validation found no gate improvement; it is an observability surface for evaluating better separation models). Requires the tse sidecar (:8087) to be running; off by default and free when off.</span>
+        </div>
         <div class="gate-row">
           <button id="pvadEnrollBtn" class="btn btn-ghost btn-sm">Re-enroll speaker</button>
           <span class="gate-prob">P<span id="pvadProb">–</span></span>
@@ -245,7 +252,7 @@
     </aside>
   </main>
 
-  <script src="script.js?v=20261105b"></script>
+  <script src="script.js?v=20261106a"></script>
 </body>
 
 </html>
