@@ -169,6 +169,10 @@
     .wplot:hover { background: rgba(255, 255, 255, 0.02); }
     .whint { font-size: 11px; color: var(--faint); padding: 6px 0 0 76px; }
     .whint .play { color: var(--muted); }
+    .whint label.dual {
+      margin-left: 14px; cursor: pointer; color: var(--muted); user-select: none;
+    }
+    .whint label.dual input { vertical-align: -1px; margin-right: 4px; cursor: pointer; }
 
     #tblWrap { flex: 1; overflow-y: auto; min-height: 0; }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -549,6 +553,13 @@
     // tracks playback across lanes and waves.
     let audioState = { mic: null, tts: null };   // per selected session
     let rafId = null;
+    // Dual-track "live replay" (2026-11-05): play mic AND tts from the same
+    // session timestamp so barge-ins sound exactly as they did live. Each
+    // stream maps to its own recording extent — outside it the stream is
+    // paused (silence), and it joins in when the clock reaches it.
+    const LS_DUAL = "soulx_timeline_dual";
+    let dualMode = localStorage.getItem(LS_DUAL) === "1";
+    let dual = null;   // {t0: session-time at replay start, wall0: perf.now()}
 
     async function loadAudio() {
       for (const k of ["mic", "tts"]) {
@@ -558,6 +569,7 @@
           if (st.url) URL.revokeObjectURL(st.url);
         }
       }
+      dual = null;   // a live replay cannot survive a session switch
       audioState = { mic: null, tts: null };
       const info = cur && cur.audio;
       if (!info) { renderWaveforms(); return; }
@@ -675,7 +687,8 @@
           drawPeaks(kind);
           plot.addEventListener("click", (e) => {
             const rect = plot.getBoundingClientRect();
-            playFrom(kind, tOfX(e.clientX - rect.left + PAD_L));
+            const t = tOfX(e.clientX - rect.left + PAD_L);
+            if (dualMode) playBoth(t); else playFrom(kind, t);
           });
         }
         wrap.appendChild(row);
@@ -683,12 +696,60 @@
       const hint = document.createElement("div");
       hint.className = "whint";
       hint.innerHTML = any
-        ? '<span class="play">点击波形从该处试听（再点同一处暂停）· 红线为播放头</span>'
+        ? '<span class="play">点击波形从该处试听（再点同一处暂停）· 红线为播放头</span>' +
+          '<label class="dual"><input type="checkbox" id="dualChk"' +
+          (dualMode ? " checked" : "") +
+          '>双轨同步 · 还原现场（同时播放麦克风与助手播放流）</label>'
         : "该会话无录音（会话录音 2026-11-04 上线，仅新会话有）";
       wrap.appendChild(hint);
+      const chk = $("dualChk");
+      if (chk) chk.addEventListener("change", () => {
+        dualMode = chk.checked;
+        localStorage.setItem(LS_DUAL, dualMode ? "1" : "0");
+      });
+    }
+
+    // Session-time "now" while a dual replay runs. A playing, in-range
+    // element is the audio truth; the wall clock (advanced from the click)
+    // is the fallback when both streams sit in unrecorded gaps — it also
+    // carries the clock across gaps until a stream rejoins.
+    function sessionNow() {
+      if (!dual) return null;
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (st && st.el && !st.el.paused) return st.start + st.el.currentTime;
+      }
+      return dual.t0 + (performance.now() - dual.wall0) / 1000;
+    }
+
+    function stopAll() {
+      dual = null;
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (st && st.el) st.el.pause();
+      }
+    }
+
+    function playBoth(tSession) {
+      // clicking where the replay already is = stop, mirroring playFrom
+      if (dual && Math.abs(sessionNow() - tSession) < 0.3) { stopAll(); return; }
+      dual = { t0: tSession, wall0: performance.now() };
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (!st) continue;
+        if (!st.el) st.el = new Audio(st.url);
+        const local = tSession - st.start;
+        if (local < -0.05 || local > st.buffer.duration) { st.el.pause(); continue; }
+        try {
+          st.el.currentTime = Math.max(0, Math.min(local, st.buffer.duration - 0.05));
+        } catch (e) { /* seek before metadata */ }
+        st.el.play().catch((e) => console.warn("playback " + kind + ": " + e.message));
+      }
+      if (!rafId) rafId = requestAnimationFrame(drawPlayheads);
     }
 
     function playFrom(kind, tSession) {
+      dual = null;   // single-track listening ends any live replay
       const st = audioState[kind];
       if (!st) return;
       if (!st.el) st.el = new Audio(st.url);
@@ -710,6 +771,50 @@
 
     function drawPlayheads() {
       let playing = false;
+      if (dual) {
+        // live replay: one shared session clock drives both strips. Each
+        // stream joins when the clock enters its recording and pauses when
+        // it leaves; drift against the master element is re-seeked.
+        const t = sessionNow();
+        let maxRecEnd = -Infinity;
+        for (const kind of ["mic", "tts"]) {
+          const st = audioState[kind];
+          if (!st) continue;
+          maxRecEnd = Math.max(maxRecEnd, st.start + st.buffer.duration);
+          if (!st.over) continue;
+          const c = st.over, ctx = c.getContext("2d");
+          ctx.clearRect(0, 0, c.width, c.height);
+          const local = t - st.start;
+          const inRange = local >= 0 && local <= st.buffer.duration;
+          if (st.el && inRange) {
+            if (st.el.paused) {
+              try { st.el.currentTime = local; } catch (e) {}
+              st.el.play().catch(() => {});
+            } else if (Math.abs(st.el.currentTime - local) > 0.25) {
+              try { st.el.currentTime = local; } catch (e) {}
+            }
+            playing = true;
+          } else if (st.el && !st.el.paused) {
+            st.el.pause();
+          }
+          if (inRange) {
+            const x = xOfT(t) - PAD_L;
+            if (x >= 0 && x <= c.width) {
+              ctx.strokeStyle = "#f87171";
+              ctx.lineWidth = 1.5;
+              ctx.beginPath();
+              ctx.moveTo(x, 0); ctx.lineTo(x, c.height);
+              ctx.stroke();
+            }
+          }
+        }
+        // both recordings fully played out: the replay is over
+        if (t > maxRecEnd + 0.5) { stopAll(); }
+        // keep the loop alive while a replay runs even if no stream is
+        // currently in range — the wall clock must carry it to the next
+        rafId = dual ? requestAnimationFrame(drawPlayheads) : null;
+        return;
+      }
       for (const kind of ["mic", "tts"]) {
         const st = audioState[kind];
         if (!st || !st.over) continue;
