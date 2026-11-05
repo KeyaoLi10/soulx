@@ -574,8 +574,17 @@ def _commit_pending_message(session, client_id):
 def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
                          tts_client, tts_options, grace_until=None):
     """Stream one LLM generation to the user: text events + TTS audio +
-    pending-message bookkeeping (interruption truncation). Returns True if
-    the generation ran to completion, False if interrupted.
+    pending-message bookkeeping (interruption truncation). Returns a
+    tri-state:
+
+    - True  — the generation ran to completion;
+    - False — interrupted AFTER audio was emitted (the user heard at least
+      part of it; for the delivery arbiter this counts as a rejection and
+      consumes a MAX_DELIVERY_ATTEMPTS slot);
+    - None  — stopped before ANY audio was emitted (stop inside the LLM
+      generator, or during the first synthesis, or a premature-turn drop):
+      the user never heard a word, so the delivery arbiter must NOT count
+      it as a rejection — it retries on a separate silent budget instead.
 
     Used by BOTH speech outlets — the user-turn pipeline and the
     background-result delivery — so the whole system has exactly one way
@@ -777,7 +786,7 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
             session.pending_audio_duration = 0.0
             session.pending_start_time = None
             session.interruption_time = None
-        return False
+        return None  # nothing was ever audible (see tri-state docstring)
 
     if interrupted:
         # If interrupted mid-stream, calculate truncation immediately using current time
@@ -826,6 +835,13 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
             session.pending_start_time = first_emit_time
             session.interruption_time = None
 
+    if interrupted and first_emit_time is None:
+        # silent kill: the stop landed before any audio was emitted, so
+        # the user never heard a word — not a rejection (tri-state
+        # docstring). Applies to the zero-segment stop (received_segment
+        # check above) and to a stop during the first synthesis.
+        return None
+
     return not interrupted
 
 
@@ -849,13 +865,17 @@ def _agent_can_deliver(session):
 
 def _agent_deliver_entry(session, client_id, entry):
     """Speak one completed background task result through the normal speech
-    pipeline. Returns True if fully spoken, False if interrupted."""
+    pipeline. Tri-state return, passed straight through to the arbiter:
+    True = fully spoken; False = interrupted after audio was audible
+    (counts as a rejection, consumes a delivery attempt); None = stopped
+    before any audio existed (the user never heard the report — the
+    arbiter retries on its separate silent budget)."""
     _commit_pending_message(session, client_id)
     session.interrupt()  # stop anything still lingering
     session.reset_interrupt()
     current_stop_event = session.stop_event
     if current_stop_event.is_set():
-        return False
+        return None  # stopped before starting: nothing audible yet
 
     # The result enters history as a user-role system note (persisted: later
     # turns can still refer to it within the history window)

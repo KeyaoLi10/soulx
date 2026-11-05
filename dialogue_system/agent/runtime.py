@@ -30,6 +30,12 @@ from clients.llm_client import TOOL_QUIET  # [[quiet]] success marker this
 
 MAX_RUNNING_TASKS = 2
 MAX_DELIVERY_ATTEMPTS = 2
+# retries for deliveries killed before ANY audio was audible (stop inside
+# the LLM generation window): the user never heard a word, so it is not a
+# rejection and must not consume MAX_DELIVERY_ATTEMPTS. Bounded separately
+# because every retry re-injects the result note into LLM history — a user
+# who keeps talking at every natural gap must not loop notes in forever.
+MAX_SILENT_DELIVERY_RETRIES = 3
 ARBITER_POLL_S = 0.5
 # after this many seconds a completed-but-undeliverable result is delivered
 # anyway at the next gap, even if the task finished long ago (no expiry: a
@@ -459,9 +465,22 @@ class AgentRuntime:
             finally:
                 with self.lock:
                     self._delivering = False
-            if not fully_spoken and entry["attempts"] < MAX_DELIVERY_ATTEMPTS:
-                # interrupted mid-report (user started talking): try again at
-                # the next natural gap, but only once more
+            if (fully_spoken is None
+                    and entry.get("silent_kills", 0) < MAX_SILENT_DELIVERY_RETRIES):
+                # interrupted BEFORE any audio was audible (typically a
+                # barge-in landing inside the delivery generation window):
+                # the user never heard the report, so this is not a
+                # rejection — retry without consuming the rejection
+                # budget. Measured 2026-11-05 17:22: two consecutive
+                # generation-window kills exhausted MAX_DELIVERY_ATTEMPTS
+                # and the result was never proactively reported.
+                entry["silent_kills"] = entry.get("silent_kills", 0) + 1
+                with self.lock:
+                    self.agenda.insert(0, entry)
+            elif (fully_spoken is False
+                    and entry["attempts"] < MAX_DELIVERY_ATTEMPTS):
+                # interrupted mid-report, i.e. the user HEARD it and cut
+                # in: try again at the next natural gap, but only once more
                 with self.lock:
                     self.agenda.insert(0, entry)
             else:
