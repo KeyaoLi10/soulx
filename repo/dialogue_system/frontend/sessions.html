@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Sessions — Voice Studio</title>
+  <style>
+    /* Self-contained page, same token set as logs.html / console theme. */
+    :root {
+      --bg: #0b0e14;
+      --panel: #11151d;
+      --panel-2: #151b26;
+      --border: #232a37;
+      --border-strong: #303949;
+      --text: #e6eaf2;
+      --muted: #8b94a7;
+      --faint: #5b6373;
+      --accent: #22d3ee;
+      --accent-dim: #0e7490;
+      --amber: #fbbf24;
+      --green: #34d399;
+      --red: #f87171;
+      --blue: #60a5fa;
+      --purple: #c084fc;
+      --mono: "SF Mono", "Cascadia Code", ui-monospace, Consolas, Menlo, monospace;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0;
+        font-family: "Inter", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; }
+
+    body {
+      background:
+        radial-gradient(1200px 500px at 70% -10%, rgba(34, 211, 238, 0.05), transparent 60%),
+        var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+
+    ::selection { background: var(--accent-dim); color: #fff; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a3242; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #39435a; }
+
+    .topbar {
+      display: flex; align-items: center; gap: 14px;
+      padding: 0 20px; height: 54px; flex-shrink: 0;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .brand { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+    .brand-name { font-weight: 700; font-size: 15px; letter-spacing: 0.02em; }
+    .brand-sub { font-size: 11px; color: var(--faint); letter-spacing: 0.08em; text-transform: uppercase; }
+
+    .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-left: auto; }
+    .ctl { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+    input[type="text"], input[type="password"] {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border-strong); border-radius: 8px;
+      padding: 6px 10px; font-size: 12.5px; outline: none;
+    }
+    input[type="text"]:focus, input:focus { border-color: var(--accent-dim); }
+    #textFilter { width: 180px; font-family: var(--mono); }
+
+    .switch { position: relative; display: inline-block; width: 34px; height: 19px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; inset: 0; background: var(--border-strong);
+              border-radius: 19px; cursor: pointer; transition: background 0.2s; }
+    .slider::before { content: ""; position: absolute; height: 13px; width: 13px;
+              left: 3px; top: 3px; background: var(--muted); border-radius: 50%; transition: 0.2s; }
+    .switch input:checked + .slider { background: var(--accent-dim); }
+    .switch input:checked + .slider::before { transform: translateX(15px); background: var(--accent); }
+
+    button.btn {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border-strong); border-radius: 8px;
+      padding: 6px 14px; font-size: 12.5px; cursor: pointer; white-space: nowrap;
+    }
+    button.btn:hover { border-color: var(--accent-dim); color: var(--accent); }
+    a.back { color: var(--faint); font-size: 12px; text-decoration: none; white-space: nowrap; }
+    a.back:hover { color: var(--accent); }
+
+    .meta {
+      display: flex; gap: 16px; padding: 6px 20px;
+      font-size: 11.5px; color: var(--faint); font-family: var(--mono);
+      border-bottom: 1px solid var(--border); background: rgba(13, 17, 23, 0.6);
+      flex-shrink: 0; flex-wrap: wrap;
+    }
+    .meta .warn { color: var(--amber); }
+
+    .wrap { flex: 1; display: flex; min-height: 0; }
+
+    /* ---- session sidebar ---- */
+    #side {
+      width: 292px; flex-shrink: 0; overflow-y: auto;
+      border-right: 1px solid var(--border); background: rgba(13, 17, 23, 0.45);
+    }
+    .sess {
+      padding: 10px 14px; border-bottom: 1px solid var(--border);
+      cursor: pointer; font-size: 12px;
+    }
+    .sess:hover { background: var(--panel-2); }
+    .sess.sel { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--accent); }
+    .sess .l1 { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .sess .sid { font-family: var(--mono); font-weight: 600; letter-spacing: 0.03em; }
+    .sess .stime { color: var(--faint); font-family: var(--mono); font-size: 11px; }
+    .sess .l2 { margin-top: 4px; color: var(--muted); font-size: 11px;
+                display: flex; gap: 8px; flex-wrap: wrap; }
+    .sess .l2 b { color: var(--text); font-weight: 600; }
+    .sess .l2 .zero { color: var(--faint); }
+
+    /* ---- main column ---- */
+    #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+    #shead {
+      padding: 10px 20px 8px; border-bottom: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
+    }
+    #shead .t { font-family: var(--mono); font-size: 12.5px; }
+    #shead .t .dur { color: var(--muted); }
+    #shead .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .schip {
+      font-size: 11px; font-family: var(--mono); color: var(--muted);
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 999px; padding: 2px 9px; white-space: nowrap;
+    }
+    .schip b { color: var(--text); font-weight: 600; }
+
+    #filters {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 8px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    .fchip {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11.5px; color: var(--text); cursor: pointer; user-select: none;
+      background: var(--panel-2); border: 1px solid var(--border-strong);
+      border-radius: 999px; padding: 3px 10px; white-space: nowrap;
+    }
+    .fchip .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .fchip .n { color: var(--faint); font-family: var(--mono); font-size: 10.5px; }
+    .fchip.off { opacity: 0.38; }
+    .fchip:hover { border-color: var(--accent-dim); }
+
+    #tlWrap { flex-shrink: 0; padding: 6px 0 0; overflow-x: auto; }
+    #tl { display: block; }
+    #tl .mk { cursor: pointer; }
+    #tl .mk:hover { filter: brightness(1.5); }
+
+    /* ---- audio waveform strips (aligned to the timeline X scale) ---- */
+    #waveWrap { padding: 6px 0 10px; }
+    .wrow { display: flex; align-items: center; margin-top: 8px; }
+    .wlabel {
+      width: 76px; flex-shrink: 0; padding-right: 8px;
+      display: flex; align-items: center; justify-content: flex-end; gap: 5px;
+      font-size: 10px; color: var(--muted); font-family: var(--mono);
+      white-space: nowrap;
+    }
+    .wlabel .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .wplot { position: relative; height: 46px; flex-shrink: 0;
+             cursor: pointer; }
+    .wplot canvas { position: absolute; top: 0; left: 0; }
+    .wplot:hover { background: rgba(255, 255, 255, 0.02); }
+    .whint { font-size: 11px; color: var(--faint); padding: 6px 0 0 76px; }
+    .whint .play { color: var(--muted); }
+    .whint label.dual {
+      margin-left: 14px; cursor: pointer; color: var(--muted); user-select: none;
+    }
+    .whint label.dual input { vertical-align: -1px; margin-right: 4px; cursor: pointer; }
+
+    #tblWrap { flex: 1; overflow-y: auto; min-height: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    thead th {
+      position: sticky; top: 0; background: var(--panel);
+      color: var(--faint); font-weight: 600; font-size: 11px; text-align: left;
+      padding: 6px 12px; border-bottom: 1px solid var(--border);
+      letter-spacing: 0.05em; z-index: 1;
+    }
+    tbody td { padding: 4px 12px; border-bottom: 1px solid rgba(35, 42, 55, 0.45);
+               vertical-align: top; }
+    tbody tr:hover { background: var(--panel-2); }
+    tbody tr.flash { background: rgba(34, 211, 238, 0.16); }
+    td.t { font-family: var(--mono); color: var(--muted); white-space: nowrap;
+           font-variant-numeric: tabular-nums; width: 76px; }
+    td.k { width: 118px; }
+    .kc {
+      display: inline-block; font-size: 10.5px; font-family: var(--mono);
+      border-radius: 4px; padding: 1px 7px; white-space: nowrap;
+      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border);
+    }
+    td.x { font-family: var(--mono); word-break: break-all; line-height: 1.5;
+           color: var(--text); }
+    td.x .sub { color: var(--faint); }
+    .empty { color: var(--faint); text-align: center; padding: 60px 20px; font-size: 13px; }
+
+    #keyPrompt {
+      position: fixed; inset: 0; background: rgba(8, 11, 16, 0.88);
+      display: flex; align-items: center; justify-content: center; z-index: 10;
+    }
+    #keyPrompt.hidden { display: none; }
+    .key-card {
+      background: var(--panel); border: 1px solid var(--border-strong);
+      border-radius: var(--radius); padding: 28px 32px; width: 380px; max-width: 92vw;
+    }
+    .key-card h2 { font-size: 15px; margin-bottom: 8px; }
+    .key-card p { font-size: 12.5px; color: var(--muted); line-height: 1.6; margin-bottom: 16px; }
+    .key-card .row { display: flex; gap: 10px; }
+    .key-card input { flex: 1; }
+    .key-card .err-msg { color: var(--red); font-size: 12px; margin-top: 10px; min-height: 16px; }
+
+    @media (max-width: 720px) {
+      .wrap { flex-direction: column; }
+      #side { width: 100%; max-height: 200px; border-right: none;
+              border-bottom: 1px solid var(--border); }
+    }
+  </style>
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">Sessions</span>
+      <span class="brand-sub">会话事件时间线</span>
+    </div>
+    <div class="toolbar">
+      <label class="ctl">过滤
+        <input type="text" id="textFilter" placeholder="文本，如 对对对 / T1 / ratio">
+      </label>
+      <label class="ctl">仅活跃会话
+        <span class="switch"><input type="checkbox" id="activeOnly" checked><span class="slider"></span></span>
+      </label>
+      <label class="ctl">live
+        <span class="switch"><input type="checkbox" id="liveToggle" checked><span class="slider"></span></span>
+      </label>
+      <button class="btn" id="refreshBtn">Refresh</button>
+      <a class="back" href="/logs.html">raw logs</a>
+      <a class="back" href="/">&larr; console</a>
+    </div>
+  </header>
+
+  <div class="meta">
+    <span id="metaInfo">loading…</span>
+    <span id="metaTruncated" class="warn hidden">仅解析 web.log 末尾 16 MiB</span>
+  </div>
+
+  <div class="wrap">
+    <aside id="side"></aside>
+    <section id="main">
+      <div id="shead"></div>
+      <div id="filters"></div>
+      <div id="tlWrap">
+        <svg id="tl" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div id="waveWrap"></div>
+      </div>
+      <div id="tblWrap">
+        <table>
+          <thead><tr><th>t+</th><th>事件</th><th>内容</th></tr></thead>
+          <tbody id="tbl"></tbody>
+        </table>
+        <div class="empty" id="tblEmpty">选择左侧一个会话查看时间线</div>
+      </div>
+    </section>
+  </div>
+
+  <div id="keyPrompt" class="hidden">
+    <div class="key-card">
+      <h2>Access key required</h2>
+      <p>会话时间线 API 与日志 API 共用访问密钥（服务器上的
+         <code>~/krisl/soulx/logs_key.txt</code>）。</p>
+      <div class="row">
+        <input type="password" id="keyInput" placeholder="logs access key">
+        <button class="btn" id="keyOkBtn">Unlock</button>
+      </div>
+      <div class="err-msg" id="keyErr"></div>
+    </div>
+  </div>
+
+  <script>
+    "use strict";
+    // Session event timeline (2026-11-04): /api/logs/sessions parses web.log
+    // server-side into per-session event streams; this page renders them as
+    // swimlane timelines + a filterable event table. Built for the blip
+    // forensics workflow: spot WHEN a '对对对。' turn committed relative to
+    // the mic defense events around it, without hand-grepping timestamps.
+    const $ = (id) => document.getElementById(id);
+    const LS_KEY = "soulx_logs_key";
+    const LS_SESS = "soulx_timeline_sess";
+    let key = localStorage.getItem(LS_KEY) || "";
+    let timer = null;
+    const REFRESH_MS = 5000;
+
+    // ---- event taxonomy ------------------------------------------------
+    // lane: 0 用户话轮, 1 麦克风·防御, 2 助手回复, 3 丢弃, 4 系统
+    const CATS = {
+      turn:          { label: "话轮提交",   lane: 0, g: "turn" },
+      partial:       { label: "partial",    lane: 0, g: "partial" },
+      suppressed:    { label: "压制毛刺",   lane: 1, g: "def" },
+      bargein:       { label: "barge-in",   lane: 1, g: "def" },
+      chunk:         { label: "回复段",     lane: 2, g: "reply" },
+      prev_ratio:    { label: "上轮截断",   lane: 2, g: "reply" },
+      interrupted:   { label: "被打断",     lane: 2, g: "reply" },
+      deliver:       { label: "后台交付",   lane: 2, g: "reply" },
+      delegate:      { label: "自动委派",   lane: 2, g: "reply" },
+      slowbrain:     { label: "慢脑",       lane: 2, g: "reply" },
+      drop_inflight: { label: "丢弃·在途毛刺", lane: 3, g: "drop" },
+      drop_playback: { label: "丢弃·播放毛刺", lane: 3, g: "drop" },
+      drop_selftalk: { label: "丢弃·自说自话", lane: 3, g: "drop" },
+      drop_premature:{ label: "丢弃·抢话",  lane: 3, g: "drop" },
+      stopped:       { label: "手动停止",   lane: 4, g: "sys" },
+      slow_warn:     { label: "慢处理",     lane: 4, g: "sys" },
+      error:         { label: "错误",       lane: 4, g: "sys" },
+    };
+    const GROUPS = [
+      { id: "turn",    label: "话轮",         kinds: ["turn"],           color: "#34d399", on: true },
+      { id: "partial", label: "Partial 转写", kinds: ["partial"],        color: "#2f9e77", on: false },
+      { id: "def",     label: "麦克风·防御",  kinds: ["suppressed", "bargein"], color: "#fbbf24", on: true },
+      { id: "reply",   label: "助手回复",     kinds: ["chunk", "prev_ratio", "interrupted", "deliver", "delegate", "slowbrain"], color: "#60a5fa", on: true },
+      { id: "drop",    label: "丢弃",         kinds: ["drop_inflight", "drop_playback", "drop_selftalk", "drop_premature"], color: "#c084fc", on: true },
+      { id: "sys",     label: "系统",         kinds: ["stopped", "slow_warn", "error"], color: "#8b94a7", on: true },
+    ];
+    const LANE_LABELS = ["用户话轮", "麦克风·防御", "助手回复", "丢弃", "系统"];
+    const RED = "#f87171", AMBER = "#fbbf24", GREEN = "#34d399",
+          BLUE = "#60a5fa", SKY = "#7dd3fc", PURPLE = "#c084fc",
+          VIOLET = "#a78bfa", GRAY = "#8b94a7";
+
+    // ---- state ----------------------------------------------------------
+    let sessList = [];
+    let selectedId = localStorage.getItem(LS_SESS) || null;
+    let cur = null;         // {id, start, end, settings, events}
+    let filters = {};       // groupId -> bool (from GROUPS defaults)
+    for (const g of GROUPS) filters[g.id] = g.on;
+
+    // ---- helpers ---------------------------------------------------------
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const fmtAbs = (t) => new Date(t * 1000).toLocaleTimeString();
+    const fmtDur = (s) => s < 90 ? s.toFixed(1) + "s" :
+                        s < 5400 ? Math.round(s / 60) + "m" :
+                        (s / 3600).toFixed(1) + "h";
+
+    async function api(path) {
+      const url = path + (path.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key);
+      const r = await fetch(url);
+      if (r.status === 401 || r.status === 503) {
+        showKeyPrompt(r.status === 503 ? "服务器未配置密钥" : "密钥错误");
+        throw new Error("unauthorized");
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }
+    function showKeyPrompt(msg) {
+      $("keyPrompt").classList.remove("hidden");
+      $("keyErr").textContent = msg || "";
+      $("keyInput").focus();
+    }
+
+    function groupOn(k) {
+      const g = CATS[k] && CATS[k].g;
+      return g ? filters[g] !== false : true;
+    }
+    function filteredEvents() {
+      if (!cur) return [];
+      const q = $("textFilter").value.trim().toLowerCase();
+      return cur.events.filter((e) =>
+        groupOn(e.k) &&
+        (!q || ((e.text || "") + " " + (e.task || "")).toLowerCase().includes(q))
+      );
+    }
+
+    function evTitle(e) {
+      const c = CATS[e.k] || { label: e.k };
+      let s = "+" + (e.t - cur.start).toFixed(1) + "s · " + c.label;
+      if (e.text) s += " · " + e.text.replace(/\n/g, " ⏎ ");
+      if (e.n !== undefined) s += " (" + e.n + " 块)";
+      if (e.ratio !== undefined) s += " (ratio " + e.ratio + ")";
+      return s;
+    }
+
+    // ---- sidebar ----------------------------------------------------------
+    function renderSidebar() {
+      const hideIdle = $("activeOnly").checked;
+      const list = sessList.filter((s) => !hideIdle || s.n_events > 0);
+      const side = $("side");
+      side.innerHTML = "";
+      if (!list.length) {
+        side.innerHTML = '<div class="empty">（无活跃会话）</div>';
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      for (const s of list) {
+        const d = document.createElement("div");
+        d.className = "sess" + (s.id === selectedId ? " sel" : "");
+        d.dataset.id = s.id;
+        const c = s.counts;
+        const badge = (label, n) =>
+          n ? `<span>${label} <b>${n}</b></span>` : "";
+        const zero = !s.n_events ? '<span class="zero">无事件</span>' : "";
+        d.innerHTML =
+          `<div class="l1"><span class="sid">${esc(s.id.slice(0, 8))}</span>` +
+          `<span class="stime">${fmtAbs(s.start)} · ${fmtDur(s.end - s.start)}</span></div>` +
+          `<div class="l2">${badge("话轮", (c.turn || 0))}` +
+          badge("压制", (c.suppressed || 0) + (c.bargein || 0)) +
+          badge("丢弃", (c.drop_inflight || 0) + (c.drop_playback || 0) +
+                       (c.drop_selftalk || 0) + (c.drop_premature || 0)) +
+          badge("错", (c.error || 0)) + `${zero}</div>`;
+        d.addEventListener("click", () => selectSession(s.id));
+        frag.appendChild(d);
+      }
+      side.appendChild(frag);
+    }
+
+    // ---- session header + filter chips -------------------------------------
+    function renderHeader() {
+      const h = $("shead");
+      if (!cur) { h.innerHTML = ""; return; }
+      const st = cur.settings || {};
+      const chip = (k, v) => (v === undefined || v === null || v === "")
+        ? "" : `<span class="schip">${k} <b>${esc(v)}</b></span>`;
+      h.innerHTML =
+        `<div class="t">${esc(cur.id)} ` +
+        `<span class="dur">${fmtAbs(cur.start)} – ${fmtAbs(cur.end)} · ${fmtDur(cur.end - cur.start)} · ${cur.events.length} 事件</span></div>` +
+        `<div class="chips">` +
+        chip("pvad", st.pvad_mode) + chip("turn", st.turn_engine) +
+        chip("guard", st.playback_guard) + chip("wait", st.turn_wait_ms) +
+        chip("grace", st.turn_grace_ms) + chip("asrfix", st.asr_correct) +
+        chip("tts", st.tts_engine) +
+        chip("agent", st.agent_enabled) + `</div>`;
+    }
+
+    function renderFilters() {
+      const counts = {};
+      if (cur) for (const e of cur.events) counts[CATS[e.k]?.g] =
+        (counts[CATS[e.k]?.g] || 0) + 1;
+      const f = $("filters");
+      let html = "";
+      for (const g of GROUPS) {
+        const n = counts[g.id] || 0;
+        html +=
+          `<span class="fchip${filters[g.id] ? "" : " off"}" data-g="${g.id}">` +
+          `<span class="dot" style="background:${g.color}"></span>` +
+          `${g.label}<span class="n">${n}</span></span>`;
+      }
+      f.innerHTML = html;
+      f.querySelectorAll(".fchip").forEach((el) => {
+        el.addEventListener("click", () => {
+          filters[el.dataset.g] = !filters[el.dataset.g];
+          renderFilters(); renderTimeline(); renderTable();
+        });
+      });
+    }
+
+    // ---- timeline -----------------------------------------------------------
+    const PAD_L = 76, PAD_R = 18, PAD_T = 10, LANE_H = 36, N_LANES = 5;
+    let tlW = 800;   // plot width shared by lanes and waveform strips
+
+    // session-time <-> x are one mapping everywhere (lanes, waves, playhead)
+    const tlSpan = () => Math.max(cur.end - cur.start, 1);
+    const xOfT = (t) => PAD_L + ((t - cur.start) / tlSpan()) * (tlW - PAD_L - PAD_R);
+    const tOfX = (x) => cur.start + ((x - PAD_L) / (tlW - PAD_L - PAD_R)) * tlSpan();
+
+    function renderTimeline() {
+      const svg = $("tl");
+      const evs = filteredEvents();
+      if (!cur) { svg.innerHTML = ""; svg.setAttribute("height", 0); return; }
+      const W = Math.max(($("tlWrap").clientWidth || 800) - 4, 640);
+      tlW = W;
+      const H = PAD_T + N_LANES * LANE_H + 24;
+      const t0 = cur.start, span = tlSpan();
+      const X = xOfT;
+
+      let s = "";
+      // lane backgrounds, separators, labels
+      for (let i = 0; i < N_LANES; i++) {
+        const y = PAD_T + i * LANE_H;
+        if (i % 2 === 0) s += `<rect x="${PAD_L}" y="${y}" width="${W - PAD_L - PAD_R}" height="${LANE_H}" fill="rgba(255,255,255,0.015)"/>`;
+        s += `<line x1="${PAD_L}" y1="${y}" x2="${W - PAD_R}" y2="${y}" stroke="#232a37" stroke-width="1"/>`;
+        s += `<text x="${PAD_L - 8}" y="${y + LANE_H / 2 + 3.5}" text-anchor="end"
+                     font-size="10" fill="#5b6373"
+                     font-family="${"SF Mono, Consolas, monospace"}">${LANE_LABELS[i]}</text>`;
+      }
+      // time axis
+      const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800];
+      const step = steps.find((v) => span / v <= 14) || 3600;
+      for (let t = 0; t <= span; t += step) {
+        const x = X(t0 + t);
+        s += `<line x1="${x}" y1="${PAD_T}" x2="${x}" y2="${PAD_T + N_LANES * LANE_H}"
+                     stroke="#232a37" stroke-width="1" stroke-dasharray="2 4"/>`;
+        s += `<text x="${x}" y="${H - 8}" text-anchor="middle" font-size="9.5"
+                     fill="#5b6373" font-family="SF Mono, Consolas, monospace">+${t >= 60 ? Math.round(t / 60) + "m" : t + "s"}</text>`;
+      }
+      // markers
+      evs.forEach((e, i) => { s += marker(e, X(e.t), i); });
+
+      svg.setAttribute("width", W);
+      svg.setAttribute("height", H);
+      svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+      svg.innerHTML = s;
+    }
+
+    function marker(e, x, i) {
+      const k = e.k;
+      const cat = CATS[k] || { label: k, lane: 4, g: "sys" };
+      const cy = PAD_T + cat.lane * LANE_H + LANE_H / 2;
+      const ttl = "<title>" + esc(evTitle(e)) + "</title>";
+      const a = ` class="mk" data-i="${i}"`;
+      if (k === "turn")
+        return `<circle cx="${x}" cy="${cy}" r="5.5" fill="${GREEN}"${a}>${ttl}</circle>`;
+      if (k === "partial")
+        return `<circle cx="${x}" cy="${cy + 8}" r="2.2" fill="${GREEN}" opacity="0.55"${a}>${ttl}</circle>`;
+      if (k === "suppressed") {
+        const h = 10 + Math.min(e.n || 1, 5) * 4;
+        return `<rect x="${x - 1.6}" y="${cy + 11 - h}" width="3.2" height="${h}" rx="1"
+                     fill="${AMBER}"${a}>${ttl}</rect>`;
+      }
+      if (k === "bargein")
+        return `<polygon points="${x},${cy - 8} ${x - 6.5},${cy + 5} ${x + 6.5},${cy + 5}"
+                     fill="${RED}"${a}>${ttl}</polygon>`;
+      if (k === "chunk")
+        return `<rect x="${x - 1.6}" y="${cy - 8}" width="3.2" height="16" rx="1"
+                     fill="${BLUE}"${a}>${ttl}</rect>`;
+      if (k === "prev_ratio")
+        return `<circle cx="${x}" cy="${cy}" r="4" fill="none" stroke="${SKY}"
+                     stroke-width="1.8"${a}>${ttl}</circle>`;
+      if (k === "interrupted")
+        return `<path d="M ${x - 5.5} ${cy - 5.5} L ${x + 5.5} ${cy + 5.5} M ${x + 5.5} ${cy - 5.5} L ${x - 5.5} ${cy + 5.5}"
+                     stroke="${RED}" stroke-width="2.4" fill="none"${a}>${ttl}</path>`;
+      if (k === "deliver" || k === "delegate" || k === "slowbrain")
+        return `<rect x="${x - 4.5}" y="${cy - 4.5}" width="9" height="9"
+                     transform="rotate(45 ${x} ${cy})" fill="${VIOLET}"${a}>${ttl}</rect>`;
+      if (k === "error")
+        return `<rect x="${x - 4.5}" y="${cy - 4.5}" width="9" height="9"
+                     transform="rotate(45 ${x} ${cy})" fill="${RED}"${a}>${ttl}</rect>`;
+      if (k === "slow_warn")
+        return `<circle cx="${x}" cy="${cy}" r="3.5" fill="${AMBER}"${a}>${ttl}</circle>`;
+      if (k === "stopped")
+        return `<rect x="${x - 1.6}" y="${cy - 7}" width="3.2" height="14" rx="1"
+                     fill="${GRAY}"${a}>${ttl}</rect>`;
+      // drop_* family
+      return `<path d="M ${x - 5.5} ${cy - 5.5} L ${x + 5.5} ${cy + 5.5} M ${x + 5.5} ${cy - 5.5} L ${x - 5.5} ${cy + 5.5}"
+                   stroke="${PURPLE}" stroke-width="2.4" fill="none"${a}>${ttl}</path>`;
+    }
+
+    // ---- session audio (waveform strips + click-to-listen) -------------------
+    // The server records mic (16k, what the turn server saw) and tts (24k,
+    // what the browser heard) per session; we fetch the WAVs once per
+    // selected session, decode locally and draw min/max peaks aligned to
+    // the timeline. Clicking a strip plays from that moment; a red playhead
+    // tracks playback across lanes and waves.
+    let audioState = { mic: null, tts: null };   // per selected session
+    let rafId = null;
+    // Dual-track "live replay" (2026-11-05): play mic AND tts from the same
+    // session timestamp so barge-ins sound exactly as they did live. Each
+    // stream maps to its own recording extent — outside it the stream is
+    // paused (silence), and it joins in when the clock reaches it.
+    const LS_DUAL = "soulx_timeline_dual";
+    let dualMode = localStorage.getItem(LS_DUAL) === "1";
+    let dual = null;   // {t0: session-time at replay start, wall0: perf.now()}
+
+    async function loadAudio() {
+      for (const k of ["mic", "tts"]) {
+        const st = audioState[k];
+        if (st) {
+          if (st.el) st.el.pause();
+          if (st.url) URL.revokeObjectURL(st.url);
+        }
+      }
+      dual = null;   // a live replay cannot survive a session switch
+      audioState = { mic: null, tts: null };
+      const info = cur && cur.audio;
+      if (!info) { renderWaveforms(); return; }
+      const jobs = ["mic", "tts"].filter((k) => info[k] && info[k].bytes)
+        .map(async (kind) => {
+          try {
+            const r = await fetch(
+              `/api/logs/sessions/${encodeURIComponent(cur.id)}/audio/${kind}` +
+              `?key=${encodeURIComponent(key)}`);
+            if (!r.ok) { console.warn("audio " + kind + ": HTTP " + r.status); return; }
+            const buf = await r.arrayBuffer();
+            // decodeAudioData DETACHES buf (Web Audio spec) — build the
+            // playback blob BEFORE decoding. Built after, the <audio>
+            // element received 0 bytes and every range request on it 416'd
+            // (ERR_REQUEST_RANGE_NOT_SATISFIABLE → MEDIA_ERR_SRC_NOT_SUPPORTED,
+            // swallowed by play().catch) — waveforms still rendered from the
+            // decoded buffer, so the breakage was invisible (2026-11-05).
+            const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+            const AC = window.AudioContext || window.webkitAudioContext;
+            const ctx = new AC();
+            let decoded;
+            try { decoded = await ctx.decodeAudioData(buf); }
+            finally { ctx.close(); }
+            // Piecewise run mapping (2026-11-05): the tts sidecar records
+            // at generation speed (RTF < 1), so contiguous byte ranges are
+            // "runs" anchored at their own epoch; audible gaps between runs
+            // are real silence that the linear st.start mapping compressed
+            // away. A run's optional third element is a barge-in cut:
+            // audio past it was emitted but never played. Legacy sidecars
+            // without runs fall back to one run from "start".
+            const rate = info[kind].rate;
+            const bps = rate * 2;   // bytes per second of audio
+            let runs = (info[kind].runs || [])
+              .filter((r) => Array.isArray(r) && r.length >= 2)
+              .map((r) => [Number(r[0]), Number(r[1]),
+                           r.length > 2 ? Number(r[2]) : null])
+              .filter((r) => isFinite(r[0]) && isFinite(r[1]) && r[0] >= 0)
+              .sort((a, b) => a[0] - b[0]);
+            if (!runs.length) runs = [[0, info[kind].start || cur.start, null]];
+            const st = {
+              buffer: decoded,
+              url,
+              el: null,
+              start: info[kind].start || cur.start,   // epoch of byte 0
+              runs: runs.map((r, i) => {
+                const o = Math.min(r[0] / bps, decoded.duration);
+                const next = runs[i + 1]
+                  ? Math.min(runs[i + 1][0] / bps, decoded.duration)
+                  : decoded.duration;
+                const lend = Math.max(o, next);       // local end incl. cut bytes
+                const aend = (r[2] != null && isFinite(r[2]))
+                  ? Math.min(lend, o + r[2])          // audible end
+                  : lend;
+                return { t: r[1], o, lend, aend };
+              }),
+              base: null, over: null,
+            };
+            audioState[kind] = st;
+          } catch (e) { console.warn("audio " + kind + ": " + e.message); }
+        });
+      await Promise.all(jobs);
+      renderWaveforms();
+    }
+
+    // session epoch -> audio-local seconds (null = no audible audio then)
+    function tToLocal(st, t) {
+      let best = null;
+      for (const r of st.runs) {
+        if (t < r.t) break;               // runs are epoch-sorted
+        if (t < r.t + (r.aend - r.o)) best = r.o + (t - r.t);
+      }
+      return best;
+    }
+
+    // audio-local seconds -> session epoch (null = past a barge-in cut)
+    function localToT(st, local) {
+      for (const r of st.runs) {
+        if (local >= r.o && local < r.aend) return r.t + (local - r.o);
+      }
+      return null;
+    }
+
+    // Peaks mapped through the session-time axis: pixel x covers session
+    // times [tOfX(x+PAD_L-0.5), tOfX(x+PAD_L+0.5)]; each run contributes the
+    // samples its audible window overlaps with that pixel. Audio that
+    // doesn't span the whole session (late mic start, audible gap between
+    // tts runs, reconnect gap on a reused session id, bytes past a barge-in
+    // cut) leaves blank regions instead of being stretched to fit — and a
+    // click at pixel x seeks exactly the moment drawn there (2026-11-05).
+    function drawPeaks(kind) {
+      const st = audioState[kind];
+      if (!st || !st.base || !cur) return;
+      const c = st.base, ctx = c.getContext("2d");
+      const w = c.width, h = c.height, mid = h / 2;
+      ctx.clearRect(0, 0, w, h);
+      const rate = st.buffer.sampleRate;
+      const ch = st.buffer.getChannelData(0);
+      ctx.strokeStyle = kind === "mic" ? "#34d399" : "#60a5fa";
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const tA = tOfX(x + PAD_L - 0.5), tB = tOfX(x + PAD_L + 0.5);
+        let mn = 0, mx = 0, has = false, anyS = false;
+        for (const r of st.runs) {
+          const s0 = Math.max(r.t, tA);                 // session-time overlap
+          const s1 = Math.min(r.t + (r.aend - r.o), tB);
+          if (s1 <= s0) continue;                       // run not at this pixel
+          has = true;
+          const i0 = Math.max(0, Math.floor((r.o + (s0 - r.t)) * rate));
+          const i1 = Math.min(Math.ceil((r.o + (s1 - r.t)) * rate), ch.length);
+          if (i1 <= i0) continue;                       // recorded silence
+          anyS = true;
+          const stride = Math.max(1, Math.floor((i1 - i0) / 64));
+          for (let i = i0; i < i1; i += stride) {
+            const v = ch[i];
+            if (!anyS || v < mn) mn = v;
+            if (!anyS || v > mx) mx = v;
+            anyS = true;
+          }
+        }
+        if (!has) continue;   // no audible recording at this pixel: blank
+        const y1 = mid - mx * (mid - 2), y2 = mid - mn * (mid - 2);
+        if (y2 - y1 < 1) { ctx.moveTo(x, mid - 0.5); ctx.lineTo(x, mid + 0.5); }
+        else { ctx.moveTo(x, y1); ctx.lineTo(x, y2); }
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    function renderWaveforms() {
+      const wrap = $("waveWrap");
+      if (!cur) { wrap.innerHTML = ""; return; }
+      const plotW = Math.max(tlW - PAD_L - PAD_R, 100);
+      wrap.innerHTML = "";
+      let any = false;
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        const color = kind === "mic" ? "#34d399" : "#60a5fa";
+        const row = document.createElement("div");
+        row.className = "wrow";
+        const label = document.createElement("div");
+        label.className = "wlabel";
+        label.innerHTML = `<span class="dot" style="background:${color}"></span>` +
+          (kind === "mic" ? "麦克风" : "助手播放");
+        row.appendChild(label);
+        if (st) {
+          any = true;
+          const plot = document.createElement("div");
+          plot.className = "wplot";
+          plot.style.width = plotW + "px";
+          const base = document.createElement("canvas");
+          const over = document.createElement("canvas");
+          for (const c of [base, over]) {
+            c.width = plotW; c.height = 46;
+            c.style.width = plotW + "px"; c.style.height = "46px";
+          }
+          plot.appendChild(base); plot.appendChild(over);
+          row.appendChild(plot);
+          const spacer = document.createElement("div");
+          spacer.style.width = PAD_R + "px";
+          spacer.style.flexShrink = "0";
+          row.appendChild(spacer);
+          st.base = base; st.over = over;
+          drawPeaks(kind);
+          plot.addEventListener("click", (e) => {
+            const rect = plot.getBoundingClientRect();
+            const t = tOfX(e.clientX - rect.left + PAD_L);
+            if (dualMode) playBoth(t); else playFrom(kind, t);
+          });
+        }
+        wrap.appendChild(row);
+      }
+      const hint = document.createElement("div");
+      hint.className = "whint";
+      hint.innerHTML = any
+        ? '<span class="play">点击波形从该处试听（再点同一处暂停）· 红线为播放头</span>' +
+          '<label class="dual"><input type="checkbox" id="dualChk"' +
+          (dualMode ? " checked" : "") +
+          '>双轨同步 · 还原现场（同时播放麦克风与助手播放流）</label>'
+        : "该会话无录音（会话录音 2026-11-04 上线，仅新会话有）";
+      wrap.appendChild(hint);
+      const chk = $("dualChk");
+      if (chk) chk.addEventListener("change", () => {
+        dualMode = chk.checked;
+        localStorage.setItem(LS_DUAL, dualMode ? "1" : "0");
+      });
+    }
+
+    // Session-time "now" while a dual replay runs. A playing, in-range
+    // element is the audio truth; the wall clock (advanced from the click)
+    // is the fallback when both streams sit in unrecorded gaps — it also
+    // carries the clock across gaps until a stream rejoins.
+    function sessionNow() {
+      if (!dual) return null;
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (st && st.el && !st.el.paused) {
+          const t = localToT(st, st.el.currentTime);
+          if (t != null) return t;
+        }
+      }
+      return dual.t0 + (performance.now() - dual.wall0) / 1000;
+    }
+
+    function stopAll() {
+      dual = null;
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (st && st.el) st.el.pause();
+      }
+    }
+
+    function playBoth(tSession) {
+      // clicking where the replay already is = stop, mirroring playFrom
+      if (dual && Math.abs(sessionNow() - tSession) < 0.3) { stopAll(); return; }
+      dual = { t0: tSession, wall0: performance.now() };
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (!st) continue;
+        if (!st.el) st.el = new Audio(st.url);
+        const local = tToLocal(st, tSession);
+        if (local == null) { st.el.pause(); continue; }   // gap or cut
+        try { st.el.currentTime = local; }
+        catch (e) { /* seek before metadata */ }
+        st.el.play().catch((e) => console.warn("playback " + kind + ": " + e.message));
+      }
+      if (!rafId) rafId = requestAnimationFrame(drawPlayheads);
+    }
+
+    function playFrom(kind, tSession) {
+      dual = null;   // single-track listening ends any live replay
+      const st = audioState[kind];
+      if (!st) return;
+      const tLocal = tToLocal(st, tSession);
+      if (tLocal == null) return;   // no audible audio at the click
+      if (!st.el) st.el = new Audio(st.url);
+      const el = st.el;
+      if (!el.paused && Math.abs(el.currentTime - tLocal) < 0.3) {
+        el.pause();
+        return;
+      }
+      const other = audioState[kind === "mic" ? "tts" : "mic"];
+      if (other && other.el) other.el.pause();
+      try { el.currentTime = tLocal; }
+      catch (e) { /* seek before metadata */ }
+      el.play().catch((e) => console.warn("playback: " + e.message));
+      if (!rafId) rafId = requestAnimationFrame(drawPlayheads);
+    }
+
+    function drawPlayheads() {
+      let playing = false;
+      if (dual) {
+        // live replay: one shared session clock drives both strips. Each
+        // stream joins when the clock enters its recording and pauses when
+        // it leaves; drift against the master element is re-seeked.
+        const t = sessionNow();
+        let maxRecEnd = -Infinity;
+        for (const kind of ["mic", "tts"]) {
+          const st = audioState[kind];
+          if (!st) continue;
+          for (const r of st.runs) {
+            maxRecEnd = Math.max(maxRecEnd, r.t + (r.aend - r.o));
+          }
+          if (!st.over) continue;
+          const c = st.over, ctx = c.getContext("2d");
+          ctx.clearRect(0, 0, c.width, c.height);
+          const local = tToLocal(st, t);
+          const inRange = local != null;
+          if (st.el && inRange) {
+            if (st.el.paused) {
+              try { st.el.currentTime = local; } catch (e) {}
+              st.el.play().catch(() => {});
+            } else if (Math.abs(st.el.currentTime - local) > 0.25) {
+              try { st.el.currentTime = local; } catch (e) {}
+            }
+            playing = true;
+          } else if (st.el && !st.el.paused) {
+            st.el.pause();
+          }
+          if (inRange) {
+            const x = xOfT(t) - PAD_L;
+            if (x >= 0 && x <= c.width) {
+              ctx.strokeStyle = "#f87171";
+              ctx.lineWidth = 1.5;
+              ctx.beginPath();
+              ctx.moveTo(x, 0); ctx.lineTo(x, c.height);
+              ctx.stroke();
+            }
+          }
+        }
+        // both recordings fully played out: the replay is over
+        if (t > maxRecEnd + 0.5) { stopAll(); }
+        // keep the loop alive while a replay runs even if no stream is
+        // currently in range — the wall clock must carry it to the next
+        rafId = dual ? requestAnimationFrame(drawPlayheads) : null;
+        return;
+      }
+      for (const kind of ["mic", "tts"]) {
+        const st = audioState[kind];
+        if (!st || !st.over) continue;
+        const c = st.over, ctx = c.getContext("2d");
+        ctx.clearRect(0, 0, c.width, c.height);
+        const el = st.el;
+        if (el && !el.paused) {
+          playing = true;
+          const t = localToT(st, el.currentTime);
+          if (t == null) continue;   // past a barge-in cut: nothing to draw
+          const x = xOfT(t) - PAD_L;
+          if (x >= 0 && x <= c.width) {
+            ctx.strokeStyle = "#f87171";
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(x, 0); ctx.lineTo(x, c.height);
+            ctx.stroke();
+          }
+        }
+      }
+      rafId = playing ? requestAnimationFrame(drawPlayheads) : null;
+    }
+
+    // ---- event table ---------------------------------------------------------
+    function renderTable() {
+      const tbody = $("tbl");
+      const empty = $("tblEmpty");
+      if (!cur) { tbody.innerHTML = ""; empty.style.display = ""; return; }
+      const evs = filteredEvents();
+      empty.style.display = evs.length ? "none" : "";
+      if (!evs.length) { tbody.innerHTML = ""; return; }
+      const gColor = {};
+      for (const g of GROUPS) gColor[g.id] = g.color;
+      let html = "";
+      evs.forEach((e, i) => {
+        const c = CATS[e.k] || { label: e.k, g: "sys" };
+        const sub = [];
+        if (e.n !== undefined) sub.push(e.n + " 块");
+        if (e.w !== undefined) sub.push("窗内 " + e.w);
+        if (e.ratio !== undefined) sub.push("ratio " + e.ratio);
+        if (e.dt !== undefined) sub.push(e.dt + "s");
+        if (e.task) sub.push(e.task);
+        const text = esc((e.text || "").replace(/\n/g, " ⏎ "));
+        html +=
+          `<tr data-i="${i}"><td class="t">+${(e.t - cur.start).toFixed(1)}s</td>` +
+          `<td class="k"><span class="kc" style="color:${gColor[c.g] || GRAY}">${c.label}</span></td>` +
+          `<td class="x">${text}` +
+          (sub.length ? ` <span class="sub">[${esc(sub.join(" · "))}]</span>` : "") +
+          `</td></tr>`;
+      });
+      tbody.innerHTML = html;
+    }
+
+    // ---- data flow -------------------------------------------------------------
+    async function selectSession(id) {
+      selectedId = id;
+      localStorage.setItem(LS_SESS, id);
+      renderSidebar();
+      try {
+        cur = await api("/api/logs/sessions/" + encodeURIComponent(id));
+      } catch (e) {
+        if (String(e.message) !== "unauthorized") {
+          $("metaInfo").textContent = "加载会话失败: " + e.message;
+        }
+        return;
+      }
+      renderHeader(); renderFilters(); renderTimeline(); renderTable();
+      loadAudio();   // async: waves appear once decoded
+    }
+
+    async function loadSessions() {
+      const data = await api("/api/logs/sessions");
+      sessList = data.sessions;
+      $("metaInfo").textContent =
+        `web.log · ${sessList.length} 个会话（最近优先）`;
+      $("metaTruncated").classList.toggle("hidden", !data.truncated);
+      renderSidebar();
+      // auto-(re)select: remembered id if still present, else newest active
+      if (!selectedId || !sessList.some((s) => s.id === selectedId)) {
+        const first = sessList.find((s) => s.n_events > 0) || sessList[0];
+        if (first) await selectSession(first.id);
+      }
+    }
+
+    async function cycle() {
+      try {
+        await loadSessions();
+        if (selectedId && sessList.some((s) => s.id === selectedId)) {
+          cur = await api("/api/logs/sessions/" + encodeURIComponent(selectedId));
+          renderHeader(); renderFilters(); renderTimeline(); renderTable();
+        }
+      } catch (e) {
+        if (String(e.message) !== "unauthorized") {
+          $("metaInfo").textContent = "刷新失败: " + e.message;
+        }
+      }
+    }
+
+    function restartTimer() {
+      if (timer) clearInterval(timer);
+      timer = null;
+      if ($("liveToggle").checked) timer = setInterval(cycle, REFRESH_MS);
+    }
+
+    // ---- wiring -----------------------------------------------------------------
+    $("tl").addEventListener("click", (e) => {
+      const t = e.target.closest(".mk");
+      if (!t) return;
+      const row = document.querySelector(`#tbl tr[data-i="${t.dataset.i}"]`);
+      if (row) {
+        row.scrollIntoView({ block: "center" });
+        row.classList.add("flash");
+        setTimeout(() => row.classList.remove("flash"), 1200);
+      }
+    });
+    let rsz = null;
+    window.addEventListener("resize", () => {
+      clearTimeout(rsz);
+      rsz = setTimeout(() => { renderTimeline(); renderWaveforms(); }, 150);
+    });
+    $("refreshBtn").addEventListener("click", cycle);
+    $("activeOnly").addEventListener("change", renderSidebar);
+    $("textFilter").addEventListener("input", () => {
+      renderTimeline(); renderTable();
+    });
+    $("liveToggle").addEventListener("change", restartTimer);
+    $("keyOkBtn").addEventListener("click", () => {
+      key = $("keyInput").value.trim();
+      localStorage.setItem(LS_KEY, key);
+      $("keyPrompt").classList.add("hidden");
+      cycle();
+    });
+    $("keyInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") $("keyOkBtn").click();
+    });
+
+    if (!key) showKeyPrompt("");
+    cycle();
+    restartTimer();
+  </script>
+</body>
+
+</html>

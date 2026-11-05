@@ -1,0 +1,91 @@
+model_config:
+  task: state_prediction
+
+  glm_tokenizer_path: pretrained_models/glm-4-voice-tokenizer
+  enable_lora: true
+  lora_r: 32
+  lora_alpha: 64
+
+  model_name: pretrained_models/Qwen3-0.6B-expand_vocab_v2
+  llm_dim: 1024
+  init_ckpt_path_lora: pretrained_models/SoulX-Duplug/SoulX-Duplug-0.6B-Bilingual.pth
+
+infer_config:
+  seed: 42
+  device: cuda
+  precision: bf16
+  # benchmark config from the README: max_wait_num 5, far_field_threshold 0.
+  # max_mistake_num stays 3: this is the mid-utterance text-lag arbitration
+  # (paraformer lags the audio 1-2 chunks; a no-text nonidle streak of 3
+  # forces the complete/incomplete arbitration that commits multi-sentence
+  # utterances at sentence boundaries). Raising it to 5 (tried 2026-11-04)
+  # starves that path — the model rides nonidle through inter-sentence
+  # pauses, the wait path never sees 5 consecutive idle, and sentences 2+
+  # never commit (full_utterance corpus regression).
+  # The blip distrust gate D got its OWN threshold instead (see below).
+  max_wait_num: 5
+  max_mistake_num: 3
+  far_field_threshold: 0
+  developer_mode: false
+
+  # phantom-turn gates (2026-11-04) — Stage 1, calibrated from the Stage 0
+  # baseline run (results/blip_gate_replay/, logs/blip_replay_baseline.log):
+  #   real-speech onsets: p_nonidle 0.974-0.999, rms 0.019-0.140 (n=8)
+  #   blip chunks:        p_nonidle 0.985,     rms 0.005     (n=1) + one
+  #   silent-audio nonidle misfire at rms 0.000
+  # -> prob gate 0.5 is a pure safety net (real speech never comes close);
+  #   the rms gate carries the separation: 0.010 sits ~2x below the weakest
+  #   real onset and ~2x above the blip/silence misfires.
+  nonidle_prob_gate: 0.5
+  nonidle_rms_gate: 0.01
+  # words (delta_text) may NOT bypass the prob/rms gates: paraformer
+  # hallucinates words on breath exactly in the pre-latch window (the
+  # "结说。" incident: latch chunk rms 0.004 + hallucinated word), and real
+  # onsets have never been observed below the rms gate (diag min 0.012)
+  nonidle_text_bypass: false
+  mistake_no_text_reset: true
+  # D's streak threshold: must clear the text lag of real short utterances
+  # (a 480ms sentence hits a 3-chunk no-text streak on its last chunk —
+  # threshold 3 would distrust it mid-onset; blip_turn_test regression,
+  # 2026-11-04). At 5 the downgrade also arms the wait path, so lagging
+  # text still commits; only a model stuck on nonidle (second distrust,
+  # still zero words) escalates to a reset.
+  mistake_no_text_num: 5
+  commit_no_text_reset: true
+  asr_seed_trim: true
+
+  # turn-boundary energy guards (2026-11-05, counting incident 75d43f7b) —
+  # the wait path committed on an "idle"-classified onset chunk (重, rms
+  # 0.0388) and a complete fired mid-word on the 数 onset (rms 0.086); both
+  # sliced words in half and wrecked the ASR text. Model classification
+  # alone cannot veto either; energy can.
+  #   wait_rms_veto: idle-classified chunks count toward the wait silence
+  #   confirmation only if rms < nonidle_rms_gate (0.01, reusing the latch
+  #   calibration — breaths 0.004 pass, onsets >= 0.012 never). Cost:
+  #   post-speech decay chunks no longer count, real-EOT wait commits land
+  #   ~160-320 ms later.
+  #   complete_defer: a complete on an energetic chunk (rms >= gate) is
+  #   held for complete_defer_max_chunks idle-classified chunks; a
+  #   nonidle/incomplete classification cancels it. Calibration: real-EOT
+  #   completes rms <= 0.045 (fluent) / <= 0.005 (live user) vs the mid-word
+  #   misfire 0.086. Quiet-chunk completes (normal EOT) untouched: zero cost.
+  wait_rms_veto: true
+  complete_defer: true
+  complete_defer_rms_gate: 0.06
+  complete_defer_max_chunks: 1
+  # experimental (default off): carry the previous turn's final seconds of
+  # real audio behind the fresh cascade seed at reset() so the next turn's
+  # recognition re-hears a still-mid-word boundary (duplicated head stripped
+  # via last_commit_text). C+D already eliminate the observed failures.
+  asr_seed_backoff_s: 0.0
+
+  input:
+    chunk_size: 2560
+    audio_back_size: 15360
+    audio_ahead_size: 640
+    sample_rate: 16000
+
+  asr:
+    model_name: paraformer
+    # model_name: sensevoice
+    # language: en

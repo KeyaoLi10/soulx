@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package cosyvoice;
+option go_package = "protos/";
+
+service CosyVoice {
+  rpc Inference(Request) returns (stream Response) {}
+  rpc StreamInference(stream Request) returns (stream Response) {}
+  rpc RegisterSpk(RegisterSpkRequest) returns (RegisterSpkResponse) {}
+}
+
+message Request {
+  string tts_text = 1;      // 要合成的文本内容
+  bool text_frontend = 2;   // 文本前端处理
+  bool stream = 3;          // 流式输出控制
+  float speed = 4;          // 速度控制
+  string format = 5;        // 输出音频格式
+
+  // 模式参数 (第一次请求时必需，后续流请求可省略)
+  oneof request_type {
+    sftRequest sft_request = 6;
+    zeroshotRequest zero_shot_request = 7;
+    crosslingualRequest cross_lingual_request = 8;
+    instruct2Request instruct2_request = 9;
+    zeroshotBySpkIdRequest zero_shot_by_spk_id_request = 10;
+    instruct2BySpkIdRequest instruct2_by_spk_id_request = 11;
+  }
+}
+
+message sftRequest {
+  string spk_id = 1;
+}
+
+message zeroshotRequest {
+  string prompt_text = 1;
+  bytes prompt_audio = 2;
+}
+
+message crosslingualRequest {
+  bytes prompt_audio = 1;
+}
+
+message instruct2Request {
+  string instruct_text = 1;
+  bytes prompt_audio = 2;
+}
+
+message zeroshotBySpkIdRequest {
+  string spk_id = 1;
+}
+
+message instruct2BySpkIdRequest {
+  string instruct_text = 1;
+  string spk_id = 2;
+}
+
+message Response {
+  bytes tts_audio = 1;
+  string format = 2;
+}
+
+message RegisterSpkRequest {
+  string spk_id = 1;
+  string prompt_text = 2;
+  bytes prompt_audio_bytes = 3;
+  int32 ori_sample_rate = 4;
+}
+
+message RegisterSpkResponse {
+  enum Status {
+    DEFAULT = 0;
+    OK = 1;
+    FAILED = 2;
+  }
+  Status status = 1;
+  string registered_spk_id = 2;
+}

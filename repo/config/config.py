@@ -1,0 +1,279 @@
+from dataclasses import dataclass, field
+from typing import Optional, List
+import torch
+
+
+@dataclass
+class ModelConfig:
+    task: str = "state_prediction"
+
+    # vocab config
+    text_vocab_size: int = 151643
+    original_vocab_size: int = 151669
+    lm_vocab_size: int = 151936
+    tokenizer_vocab_size: int = 203566
+    added_audio_token_size: int = 51866
+    added_special_token_size: int = 31
+    special_token_start: int = 151643
+    added_token_start: int = 151669
+    added_audio_token_start: int = 151700
+    total_vocab_size: int = field(init=False)
+
+    bos_token_id: int = 151643
+    eos_token_id: int = 151645
+    pad_token_id: int = 151643
+    audio_pad_token_id: int = 151673
+    asr_eos_token_id: int = 151674
+    asr_bos_token_id: int = 151675
+
+    user_complete_token_id: int = 151676
+    user_backchannel_token_id: int = 151677
+    user_incomplete_token_id: int = 151678
+    assistant_backchannel_token_id: int = 151679
+    user_idle_token_id: int = 151680
+    user_nonidle_token_id: int = 151681
+    assistant_interrupt_token_id: int = 151682
+
+    # model config
+    audio_embed_dim: int = 1280
+    llm_dim: int = 2048
+    glm_tokenizer_path: str = "pretrained_models/glm-4-voice-tokenizer"
+    model_name: str = "pretrained_models/Qwen3-1.7B-expand_vocab_v2"
+    init_ckpt_path: str = ""
+    init_ckpt_path_lora: str = ""
+
+    sampling_rate: int = 16000
+    chunk_size: int = 960
+    extract_token_batch: int = 256
+    enable_audio_mask: bool = False
+    asr_repetition_penalty: float = 1.0
+    num_beam: int = 3
+    punctuation: bool = False
+    max_chunk_token_length: int = 50
+    max_token_length: int = 1500
+    enable_cascade_asr: bool = True
+
+    # lora
+    enable_lora: bool = False
+    lora_task_type: str = "CAUSAL_LM"
+    lora_r: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+
+    # projector
+    enable_projector: bool = True
+    freeze_projector: bool = False
+    embed_only: bool = False
+
+    def __post_init__(self):
+        self.total_vocab_size = (
+            self.original_vocab_size
+            + self.added_audio_token_size
+            + self.added_special_token_size
+        )
+
+
+@dataclass
+class DataConfig:
+    # training set
+    batch_size: int = 64
+    num_workers: int = 12
+    split_size: float = 0.05
+    max_token_length: int = 1500
+    avg_token_length: int = 150
+    train_data_path: str = ""
+
+    # dynamic batch size
+    enable_dynamic_batch: bool = False
+    max_batch_size: int = 512
+    max_token_per_batch: int = 8192
+    stream_dataset_buffer_size: int = 5000
+
+    # test set
+    test_data_name: str = ""
+    test_lang: str = ""
+    test_result_dir: str = ""
+    test_result_file: str = ""
+    test_data_path: str = ""
+    input_wav_path: str = ""
+
+
+@dataclass
+class TrainConfig:
+    # optimizer
+    linear_lr: bool = False
+    learning_rate: float = 1e-4
+    min_lr: float = 1e-6
+    warmup_steps: int = 5000
+    anneal_steps: int = 400000
+    anneal_rate: float = 0.5
+    weight_decay: float = 1e-2
+    betas: List[float] = field(init=False)
+    eps: float = 1e-8
+
+    enable_switch_loss_rate: bool = False
+    switch_loss_rate_label: str = ""
+
+    text_loss_rate: float = 1.0
+    eos_loss_rate: float = 1.0
+    idle_loss_rate: float = 1.0
+    nonidle_loss_rate: float = 1.0
+    user_complete_loss_rate: float = 1.0
+    user_incomplete_loss_rate: float = 1.0
+    user_backchannel_loss_rate: float = 1.0
+
+    text_loss_rate_switched: float = 1.0
+    eos_loss_rate_switched: float = 1.0
+    idle_loss_rate_switched: float = 1.0
+    nonidle_loss_rate_switched: float = 1.0
+    user_complete_loss_rate_switched: float = 1.0
+    user_incomplete_loss_rate_switched: float = 1.0
+    user_backchannel_loss_rate_switched: float = 1.0
+
+    # tricks
+    # EMA
+    enable_ema: bool = False
+    ema_dacay: float = 0.9
+    ema_every_n_steps: int = 1
+    ema_start_step: int = 0
+
+    # train adapter first
+    adapter_first: bool = False
+    unfreeze_step: int = 10000
+
+    # trainer
+    seed: int = 42
+    stage: str = "train"
+    total_steps: int = 1000000
+    total_epochs: int = 0
+    val_check_interval: int = 10000
+    log_every_n_steps: int = 100
+    accumulate_grad_batches: int = 1
+    num_gpu_per_node: int = 8
+    num_node: int = 1
+    accelerator: str = "gpu"
+    strategy: str = "ddp"
+    precision: str = "16-mixed"
+    sync_batchnorm: bool = True
+    ckpt_path: str = ""
+    default_root_dir: str = ""
+    debug_log_dir: str = "debug_logs/"
+    wandb_run_name: str = ""
+    wandb_save_dir: str = ""
+
+    def __post_init__(self):
+        self.betas = [0.9, 0.999]
+
+
+@dataclass
+class InferConfig:
+    device: str = field(
+        default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    seed: int = 42
+    precision: str = "bf16"
+    sample_rate: int = 16000
+    max_wait_num: int = 10
+    max_mistake_num: int = 5
+    far_field_threshold: float = 0.02
+    developer_mode: bool = False
+
+    # --- pre-latch blip gates (phantom-turn prevention, 2026-11-04) ---
+    # speech_detected used to latch on the FIRST nonidle chunk with no
+    # confidence / energy / text evidence, so a post-utterance breath chunk
+    # that barely won the argmax could start a phantom turn (the "对对对。"
+    # incident). A pre-latch nonidle chunk now has to clear the prob AND rms
+    # gates below (see nonidle_text_bypass for why words no longer exempt).
+    # Rejected alternative, do NOT reintroduce: a min-consecutive-nonidle
+    # latch count. Real WebRTC speech alternates nonidle/idle at ~50% duty
+    # and never sustains 3 consecutive nonidle chunks, while the incident
+    # blip was exactly 3 consecutive — consecutive counts invert the
+    # discriminator (real speech first, blips second).
+    nonidle_prob_gate: float = 0.5  # pre-latch p(nonidle) below this -> idle; 0 disables
+    nonidle_rms_gate: float = 0.0  # pre-latch chunk RMS below this -> idle; 0 disables
+    # let delta_text bypass the prob/rms gates at latch time. OFF: the cascade
+    # ASR hallucinates words on breath chunks exactly pre-latch (the
+    # "结说。" incident latched on rms 0.004 via a hallucinated word), and real
+    # onsets have never been observed below the rms gate (min 0.012 vs gate
+    # 0.01). Turn back on only if a genuinely sub-gate-energy speech regime
+    # shows up in the diag logs.
+    nonidle_text_bypass: bool = False
+    # mistake path (nonidle streak, cascade ASR saw no word) -> downgrade the
+    # chunk to idle and ARM the wait path: a real utterance with lagging text
+    # still commits at the wait commit (the ASR runs every chunk), a blip
+    # dies there via the empty-text guard, and a model stuck on nonidle
+    # escalates to a reset on the second distrust. Independent threshold:
+    # must exceed the text lag of real short utterances (a 480ms sentence
+    # hits a 3-chunk streak on its last chunk, before paraformer emits the
+    # words), while the shared max_mistake_num stays at the value that
+    # arbitrates mid-utterance text lag — conflating the two starves
+    # multi-sentence utterances of commits (full_utterance corpus
+    # regression, 2026-11-04)
+    mistake_no_text_reset: bool = True
+    mistake_no_text_num: int = 5
+    # commit with empty recognition -> reset instead of emitting "speak"
+    commit_no_text_reset: bool = True
+    # exclude the synthetic-noise seeds (1.6s buffer_for_asr / 3.2s
+    # cascade_buffer, see reset()) from every recognize() input — pure noise
+    # is paraformer's favourite hallucination substrate
+    asr_seed_trim: bool = True
+
+    # --- turn-boundary energy guards (mid-word slicing, 2026-11-05) ---
+    # the counting incident (75d43f7b): the wait path committed on the 5th
+    # "idle" chunk that was actually the onset of 「重」 (rms 0.0388), and a
+    # <|user_complete|> fired mid-word on the 「数」 onset (rms 0.086) —
+    # both sliced the utterance inside words, which then wrecked the ASR
+    # text (十+数 -> 二十, orphaned 数慢一点 -> 煮慢一点). Model
+    # classification alone cannot veto either; energy can.
+    # wait-path: an idle-CLASSIFIED chunk counts toward the silence
+    # confirmation only if its RMS is also below nonidle_rms_gate (reuses
+    # the existing latch calibration: breaths ~0.004 pass, real onsets
+    # >= 0.012 never do). Cost: post-speech decay chunks no longer count,
+    # real-EOT wait commits land ~160-320 ms later.
+    wait_rms_veto: bool = True
+    # complete-path: a <|user_complete|> on an energetic chunk (rms >=
+    # complete_defer_rms_gate) is held for up to complete_defer_max_chunks
+    # idle-classified chunks before committing; a nonidle/incomplete
+    # classification cancels it (the turn continues). Calibration
+    # (results/blip_gate_replay, 2026-11-05): real-EOT completes at
+    # rms <= 0.045 (fluent speaker) / <= 0.005 (live user), the mid-word
+    # misfire at 0.086 — the gate sits between. Quiet-chunk completes
+    # (the normal EOT shape) are untouched: zero latency cost.
+    complete_defer: bool = True
+    complete_defer_rms_gate: float = 0.06
+    complete_defer_max_chunks: int = 1
+    # experimental cross-turn left context: seconds of the previous turn's
+    # real audio carried behind the fresh cascade seed at reset() so the
+    # next turn's recognition re-hears a boundary that still cut mid-word
+    # (duplicated head stripped via last_commit_text — char-level, see
+    # _strip_commit_overlap). 0 = off; C+D already eliminate the observed
+    # boundary failures, keep this off unless a residual case shows up.
+    asr_seed_backoff_s: float = 0.0
+
+    single_round: bool = False
+    config_path: str = "config/config.yaml"
+
+    input: dict = field(
+        default_factory=lambda: {
+            "chunk_size": 2560,
+            "audio_back_size": 15360,
+            "audio_ahead_size": 640,
+            "sample_rate": 16000,
+            "chunk_token_len_small": 2,
+        }
+    )
+    asr: dict = field(
+        default_factory=lambda: {
+            "model_name": "paraformer",
+            "language": "auto",
+            "max_chunk_token_length": 256,
+        }
+    )
+
+
+@dataclass
+class RunConfig:
+    model_config: ModelConfig = field(default_factory=ModelConfig)
+    dataset_config: DataConfig = field(default_factory=DataConfig)
+    train_config: TrainConfig = field(default_factory=TrainConfig)
+    infer_config: InferConfig = field(default_factory=InferConfig)

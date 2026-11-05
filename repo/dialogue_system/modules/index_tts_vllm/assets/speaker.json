@@ -1,0 +1,14 @@
+{
+    "jay_klee": [
+        "assets/jay_promptvn.wav"
+    ],
+    "elva": [
+        "assets/elva-female.wav"
+    ],
+    "ada": [
+        "assets/ada-female.wav"
+    ],
+    "john": [
+        "assets/john-male.wav"
+    ]
+}

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Voice Studio</title>
+  <link rel="stylesheet" href="style.css?v=20261103a">
+</head>
+
+<body>
+  <div id="connBanner" class="conn-banner hidden">
+    <span>Connection lost — reconnecting…</span>
+    <button id="reconnectNowBtn" type="button">Reconnect now</button>
+  </div>
+
+  <div id="loadingOverlay" class="loading-overlay">
+    <div class="loading-card">
+      <div class="spinner-wrapper">
+        <span class="loading-spinner"></span>
+        <span class="loading-success hidden">✓</span>
+      </div>
+      <p id="loadingMessage">Connecting to server...</p>
+      <button id="loadingConfirmBtn" class="btn btn-primary loading-btn hidden">Start Experience</button>
+    </div>
+  </div>
+
+  <!-- ===== Top bar ===== -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot" id="brandDot"></span>
+      <span class="brand-name">Voice Studio</span>
+      <span class="brand-sub">full-duplex console</span>
+    </div>
+    <div class="topbar-right">
+      <div class="vad-chip">
+        <span class="vad-label">VAD</span>
+        <span id="vadStatus" data-state="idle">Waiting for user speech</span>
+      </div>
+      <div id="connPill" class="conn-pill" data-state="connecting">Connecting…</div>
+      <button id="reconnectBtn" class="conn-reconnect" type="button"
+              title="Force a fresh connection to the server">Reconnect</button>
+      <a class="conn-reconnect" href="/logs.html" target="_blank" rel="noopener"
+         title="Remote log viewer (key-gated)">Logs</a>
+    </div>
+  </header>
+
+  <!-- ===== Console: full-width stage + right rail ===== -->
+  <main class="console">
+
+    <!-- Stage (left, takes all remaining width) -->
+    <section class="stage">
+
+      <div class="orb-zone">
+        <div id="orbWrap" class="orb-wrap">
+          <div id="voiceCircle" class="voice-circle">
+            <span id="circleStatus" class="circle-status">READY</span>
+          </div>
+        </div>
+        <div class="stage-meta">
+          <span class="meta-label">SESSION</span>
+          <span id="sessionTimer" class="session-timer">00:00</span>
+        </div>
+      </div>
+
+      <div class="wave-panel">
+        <div class="panel-head">
+          <span class="panel-title">Input Monitor</span>
+          <span class="panel-hint">16 kHz · mono</span>
+        </div>
+        <canvas id="waveformCanvas"></canvas>
+      </div>
+
+      <div class="transport">
+        <button id="startBtn" class="btn btn-primary">● Start</button>
+        <button id="stopBtn" class="btn btn-danger" disabled>■ Stop</button>
+      </div>
+
+    </section>
+
+    <!-- Right rail -->
+    <aside class="rail">
+
+      <!-- Transcript -->
+      <section class="rail-block transcript-block">
+        <div class="block-head">
+          <h2>Transcript</h2>
+          <span class="live-indicator"><span class="live-dot"></span>live</span>
+        </div>
+        <div id="chatLog" class="chat-log">
+          <div class="log-empty">Conversation will appear here — start the session and speak.</div>
+        </div>
+      </section>
+
+      <!-- Persona -->
+      <section class="rail-block">
+        <div class="block-head">
+          <h2>Persona / Script</h2>
+          <span id="personaSaved" class="saved-flag hidden">Saved ✓</span>
+        </div>
+        <select id="personaPreset" class="input">
+          <option value="">— Presets —</option>
+          <option value="default">Default · Elva (gentle assistant)</option>
+          <option value="concise">Concise · short answers</option>
+          <option value="storyteller">Storyteller · narrator</option>
+          <option value="tutor">Patient tutor · explains simply</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <textarea id="personaPrompt" class="input textarea" rows="6" spellcheck="false"></textarea>
+        <p class="block-hint">System prompt sent to the LLM. Define a character, a role-play script, or speaking rules.</p>
+        <div class="btn-row">
+          <button id="applyPersonaBtn" class="btn btn-primary btn-sm">Apply</button>
+          <button id="resetPersonaBtn" class="btn btn-ghost btn-sm">Reset</button>
+        </div>
+      </section>
+
+      <!-- Voice Engine -->
+      <section class="rail-block">
+        <div class="block-head">
+          <h2>Voice Engine</h2>
+        </div>
+        <div class="field">
+          <label for="turnEngine">Turn engine</label>
+          <select id="turnEngine" class="input">
+            <option value="soulx">SoulX-Duplug</option>
+            <option value="frc">FireRedChat (dual EOT)</option>
+          </select>
+          <span class="block-hint">Turn-taking architecture: SoulX semantic turn server, or the FireRedChat pipeline (pVAD endpointing + ultraVAD/Qwen dual end-of-turn). LLM and voice are the same either way.</span>
+        </div>
+        <div class="field">
+          <label for="turnWaitMs">Incomplete→wait silence <span id="turnWaitMsVal" class="val">800 ms</span></label>
+          <input id="turnWaitMs" type="range" min="160" max="3200" step="160" value="800">
+          <span class="block-hint">After the model judges &lt;|user_incomplete|&gt; (unfinished sentence), how long you must stay quiet before the reply fires anyway — a mid-sentence thinking pause shorter than this is safe. SoulX engine only.</span>
+        </div>
+        <div class="field">
+          <label for="turnGraceMs">Complete grace window <span id="turnGraceMsVal" class="val">900 ms</span></label>
+          <input id="turnGraceMs" type="range" min="0" max="3000" step="100" value="900">
+          <span class="block-hint">A &lt;|user_complete|&gt; turn holds the reply this long before speaking — resume speaking inside the window to cancel it. 0 disables (not recommended). SoulX engine only.</span>
+        </div>
+        <div class="field">
+          <label for="playbackGuard" class="toggle-row">
+            <input id="playbackGuard" type="checkbox" checked>
+            <span>Playback echo guard</span>
+          </label>
+          <span class="block-hint">While the assistant is generating or speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo/blip phantom turns are dropped — speaker echo, AEC residue or breath noise then cannot chop the reply or hijack your sentence. Off = raw zero-hysteresis behavior (any single sound interrupts). SoulX engine only.</span>
+        </div>
+        <div class="field">
+          <label for="asrCorrect" class="toggle-row">
+            <input id="asrCorrect" type="checkbox" checked>
+            <span>Whole-turn ASR correction</span>
+          </label>
+          <span class="block-hint">At each turn commit the server re-recognizes the whole utterance offline and corrects the live text (bubble + what the LLM hears) — the live rolling-window text is the main source of ASR errors. Costs up to the wait below of extra latency; on timeout or failed correction the live text is kept. SoulX engine only.</span>
+        </div>
+        <div class="field">
+          <label for="asrCorrectWaitMs">ASR correction wait <span id="asrCorrectWaitMsVal" class="val">500 ms</span></label>
+          <input id="asrCorrectWaitMs" type="range" min="0" max="2000" step="100" value="500">
+          <span class="block-hint">How long the reply holds for the corrected text before falling back to the live one. Typical correction lands in 100-300 ms; 0 = never wait (correction still updates nothing then). SoulX engine only.</span>
+        </div>
+        <div class="field">
+          <label for="ttsEngine">Engine</label>
+          <select id="ttsEngine" class="input">
+            <option value="voxcpm">VoxCPM2</option>
+            <option value="firered">FireRedTTS</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="ttsCfg">Expressiveness (cfg) <span id="ttsCfgVal" class="val">2.0</span></label>
+          <input id="ttsCfg" type="range" min="0.5" max="5" step="0.1" value="2.0">
+        </div>
+        <div class="field">
+          <label for="ttsSteps">Quality steps <span id="ttsStepsVal" class="val">10</span></label>
+          <input id="ttsSteps" type="range" min="4" max="40" step="1" value="10">
+          <span class="block-hint">More steps = higher quality, slower synthesis. (VoxCPM2 only)</span>
+        </div>
+      </section>
+
+      <!-- Speaker Gate (pvad sidecar) -->
+      <section class="rail-block">
+        <div class="block-head">
+          <h2>Speaker Gate</h2>
+          <span id="pvadEnrolled" class="gate-badge" data-state="off">not enrolled</span>
+        </div>
+        <div class="field">
+          <label for="pvadMode">Mode</label>
+          <select id="pvadMode" class="input">
+            <option value="off">Off · direct (default)</option>
+            <option value="shadow">Shadow · observe only</option>
+            <option value="enforce">Enforce · block others</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="pvadThreshold">Similarity threshold <span id="pvadThresholdVal" class="val">0.50</span></label>
+          <input id="pvadThreshold" type="range" min="0.3" max="0.9" step="0.05" value="0.5">
+          <span class="block-hint">Speaker similarity (ECAPA cosine vs the enrolled voice) must exceed this to take a turn or barge in.</span>
+        </div>
+        <div class="gate-row">
+          <button id="pvadEnrollBtn" class="btn btn-ghost btn-sm">Re-enroll speaker</button>
+          <span class="gate-prob">P<span id="pvadProb">–</span></span>
+        </div>
+        <p id="pvadNote" class="gate-note hidden"></p>
+        <p class="block-hint">First gate-passed turn auto-enrolls the main speaker. Unknown signal never blocks the conversation (fail-open).</p>
+      </section>
+
+      <!-- Background Tasks (fast/slow brain agent) -->
+      <section class="rail-block">
+        <div class="block-head">
+          <h2>Background Tasks</h2>
+          <span id="taskCount" class="gate-badge" data-state="off">0</span>
+        </div>
+        <div class="field">
+          <label for="agentEnabled" class="toggle-row">
+            <input id="agentEnabled" type="checkbox" checked>
+            <span>Agent mode (slow brain)</span>
+          </label>
+          <span class="block-hint">Complex requests are delegated to a background reasoning agent; results are spoken at the next natural pause.</span>
+        </div>
+        <div id="taskList" class="task-list"></div>
+        <p id="taskEmpty" class="task-empty">No background tasks.</p>
+      </section>
+
+      <!-- Conversation -->
+      <section class="rail-block">
+        <div class="block-head">
+          <h2>Conversation</h2>
+        </div>
+        <div class="field">
+          <label for="maxHistory">Memory turns <span id="maxHistoryVal" class="val">5</span></label>
+          <input id="maxHistory" type="range" min="1" max="20" step="1" value="5">
+        </div>
+        <div class="field">
+          <label for="minSegLen">First-audio segment length <span id="minSegLenVal" class="val">10</span></label>
+          <input id="minSegLen" type="range" min="4" max="40" step="1" value="10">
+          <span class="block-hint">Shorter = audio starts sooner but choppier sentences.</span>
+        </div>
+      </section>
+
+    </aside>
+  </main>
+
+  <script src="script.js?v=20261105a"></script>
+</body>
+
+</html>
