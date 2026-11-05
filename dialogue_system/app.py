@@ -242,6 +242,15 @@ class ChatSession:
         # buffered client-side ahead of real time). Used to suppress the
         # LISTENING circle flip while the assistant is still talking.
         self.playback_end = 0.0
+        # Playback-run bookkeeping for the self-talk echo window
+        # (2026-11-05 吞句修复): serial / first-audio-emit wall-clock /
+        # total emitted seconds of the CURRENT continuous playback run.
+        # assistant_chunks entries carry (run, cum) so the echo check can
+        # estimate the playback head pos = min(now - first, total) and
+        # only match chunks whose audio is plausibly at the mic now.
+        self.playback_run_serial = 0
+        self.playback_run_first_ts = None
+        self.playback_run_total = 0.0
         # Fast/slow brain: True while a speech generation (user turn OR
         # background-result delivery) is running in this session. The
         # delivery arbiter polls it to pick a speaking slot.
@@ -272,8 +281,12 @@ class ChatSession:
         # endpoint alongside the agent runtime.
         self.frc = None
         # Recent assistant text segments (the LLM chunks that get spoken),
-        # newest last, capped. The self-talk check compares a turn's ASR
-        # text against these: echo turns transcribe OUR OWN words.
+        # newest last, capped. Each entry is {"text", "run", "cum", "ts"}:
+        # run = playback_run_serial the chunk's audio belongs to, cum =
+        # cumulative seconds of that run's audio when the chunk finished
+        # emitting, ts = wall-clock at append. The self-talk check uses
+        # these to match a turn's ASR text only against chunks that are
+        # plausibly audible NOW (echo physics), never stale ones.
         self.assistant_chunks = []
 
     @property
@@ -359,7 +372,6 @@ session_manager = SessionManager()
 # wire the modules that must not import app back (see the import note above)
 emitter.set_session_lookup(session_manager.get_session)
 llm = QwenLLM_stream()
-pvad_gate.get_history = llm.get_session
 # Both TTS engines instantiated — the active one is chosen per session from
 # the web UI settings panel (defaults in settings.DEFAULT_SETTINGS; the
 # TTS_ENGINE env only picks that default).
@@ -609,8 +621,16 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
         logger.info(f"[{client_id}] LLM Chunk: {chunk}")
         emit_to_room(client_id, "text_response", {"text": chunk})
         message_to_add += chunk
-        # Remember spoken segments for the self-talk (echo) check
-        session.assistant_chunks.append(chunk)
+        # Remember spoken segments for the self-talk (echo) check, with
+        # run/cum/ts bookkeeping so the check can bound its sources to
+        # physically plausible playback (2026-11-05 吞句修复). cum is
+        # updated as this chunk's audio streams; the serial is patched
+        # onto the entry when the run's first audio actually emits.
+        entry = {
+            "text": chunk, "run": session.playback_run_serial,
+            "cum": 0.0, "ts": time.time(),
+        }
+        session.assistant_chunks.append(entry)
         if len(session.assistant_chunks) > 12:
             del session.assistant_chunks[0]
         for wav_chunk in tts_client.synthesize(
@@ -620,14 +640,26 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
                 return True
             if first_emit_time is None:
                 first_emit_time = time.time()
+                # a new continuous playback run starts here (previous run
+                # was interrupted or finished): re-seed its bookkeeping
+                session.playback_run_serial += 1
+                entry["run"] = session.playback_run_serial
+                session.playback_run_first_ts = first_emit_time
+                session.playback_run_total = 0.0
                 # assistant audio is now audible (or about to be, within
                 # client buffer latency): any user turn committed AFTER
                 # this point is a new conversational turn, not a
                 # continuation of the previous user utterance
                 session.assistant_audible_ts = time.time()
+                # forensic recording: a new pipeline means playback was
+                # discontinuous (user turn or barge-in in between) — the
+                # tts sidecar must not glue this reply onto the last run
+                session.audio_tts.run_break()
             # Calculate audio duration: bytes / (sample_rate * channels * bytes_per_sample)
             # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
             total_audio_duration += len(wav_chunk) / 48000.0
+            session.playback_run_total = total_audio_duration
+            entry["cum"] = total_audio_duration
             emit_to_room(client_id, "audio_chunk", wav_chunk)
             session.audio_tts.write(bytes(wav_chunk))
             # Estimated remaining buffered playback: chunks are emitted
@@ -744,6 +776,11 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
             logger.info(
                 f"[{client_id}] Interrupted mid-stream. Ratio: {ratio:.2f}. Truncated message: {message_to_add}"
             )
+            # forensic recording: emission ran ahead of playback (TTS
+            # RTF < 1), so the sidecar's last run holds bytes the browser
+            # never played — mark where audible playback actually stopped
+            session.audio_tts.mark_cut(
+                session.interruption_time or time.time(), first_emit_time)
         else:
             message_to_add = ""
 
@@ -896,6 +933,11 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         # (pvad_turn_gate below). The receive loop's episode-count drop
         # (path a) catches the sub-4-character hallucination fragments
         # this text check cannot see.
+        # 2026-11-05 吞句修复: _pvad_selftalk_text now also bounds its
+        # match sources to physically plausible playback (chunks at the
+        # playback head ± echo tail — the mic cannot hear 40-second-old
+        # text), so quoting what we said a minute ago is free; only
+        # near-verbatim quotes of what is AT the mic now still drop.
         recent_interrupt = (
             session.interruption_time is not None
             and time.time() - session.interruption_time
@@ -1651,32 +1693,98 @@ AUDIO_DIR = os.environ.get("SOULX_AUDIO_DIR", str(Path(LOGS_DIR) / "audio"))
 _AUDIO_RECORD = os.environ.get("SOULX_AUDIO_RECORD", "1") != "0"
 _AUDIO_MAX_SESSION_BYTES = 96 * 1024 * 1024   # per session per kind
 _AUDIO_RETENTION_DAYS = 3
+# A new recording run starts when a write lands this far beyond the point
+# where the audio written so far would have FINISHED PLAYING. TTS chunks
+# are written at generation speed (RTF ~0.36 measured 2026-11-05), not at
+# playback speed, so "when it sounded" is the run epoch + audio duration
+# — the same playback clock _run_speech_pipeline uses for playback_end.
+# Mic is written in real time, so for it this reduces to a plain
+# inter-write gap check (reconnects/drain stalls start new runs too).
+_AUDIO_RUN_GAP_S = 0.5
 
 
 class _SessionAudio:
     """Best-effort raw PCM recorder for one session/kind.
 
     Writes never block or raise into the caller: recording is forensics,
-    not a feature the conversation depends on. The first write stamps a
-    sidecar .json (start epoch + rate) so the timeline can align the
-    waveform with log-event timestamps across restarts.
+    not a feature the conversation depends on.
+
+    Sidecar .json (rewritten on every run boundary):
+      {"start": <epoch of byte 0>, "rate": <Hz>,
+       "runs": [[byte_offset, epoch, cut_audio_s?], ...]}
+    Runs partition the file: bytes [off_i, off_{i+1}) were written
+    contiguously and map to session time epoch_i + (off - off_i)/(2*rate).
+    A new run starts at an audible gap (see _AUDIO_RUN_GAP_S), at every
+    reply pipeline's first emit (run_break), and — with a third element
+    "cut" — when a barge-in truncated playback: bytes past the cut were
+    emitted but never played, so the timeline must not present them as
+    having sounded. Legacy sidecars without "runs" map the whole file as
+    one run from "start" (time-compressed for old tts recordings).
     """
 
     def __init__(self, sid, kind, rate):
         self.rate = rate
         self.path = Path(AUDIO_DIR) / f"{sid}.{kind}.pcm"
         self.start = None
-        self.n = 0
+        self.runs = []
+        self.n = 0                 # bytes written by this instance
+        self._base = 0             # bytes already in the file at open
         self._f = None
         self._lock = threading.Lock()
         self._capped = False
+        self._adopted_runs = False
+        self._force_break = False
         if not _AUDIO_RECORD:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._f = open(self.path, "ab")
+            self._base = self._f.tell()
         except OSError as e:
             logger.warning(f"audio record {kind} unavailable: {e}")
+            return
+        # Adopt an existing sidecar (sid reused across reconnects / app
+        # restarts): keep its start/runs so the timeline stays one file
+        # instead of silently re-dating old bytes.
+        try:
+            meta = json.loads(self.path.with_suffix(".json").read_text())
+            if int(meta.get("rate", rate)) == rate and meta.get("start"):
+                self.start = float(meta["start"])
+                runs = meta.get("runs")
+                if isinstance(runs, list):
+                    for r in runs:
+                        if (isinstance(r, (list, tuple)) and len(r) in (2, 3)
+                                and isinstance(r[0], int)
+                                and isinstance(r[1], (int, float))):
+                            self.runs.append(
+                                [r[0], float(r[1])] +
+                                ([float(r[2])] if len(r) == 3 else []))
+                    self._adopted_runs = bool(self.runs)
+                if not self._adopted_runs:
+                    # legacy sidecar (pre-2026-11-05): old bytes are one
+                    # opaque run from "start"; fresh audio must not glue
+                    # onto it (old tts files are time-compressed, so the
+                    # gap check alone would not fire)
+                    self.runs = [[0, self.start]]
+                    self._force_break = True
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save(self):
+        try:
+            self.path.with_suffix(".json").write_text(json.dumps(
+                {"start": self.start, "rate": self.rate, "runs": self.runs}))
+        except OSError:
+            pass
+
+    def _start_run(self, pos, now):
+        if self.runs and pos == self.runs[-1][0]:
+            # previous run never got any bytes: re-date it instead of
+            # stacking two runs at the same offset
+            self.runs[-1][1] = now
+        else:
+            self.runs.append([pos, now])
+        self._save()
 
     def write(self, pcm):
         if self._f is None:
@@ -1685,13 +1793,25 @@ class _SessionAudio:
             if self._capped:
                 return
             try:
+                now = time.time()
+                pos = self._base + self.n
                 if self.start is None:
-                    self.start = time.time()
-                    self.path.with_suffix(".json").write_text(json.dumps(
-                        {"start": self.start, "rate": self.rate}))
+                    self.start = now
+                    self.runs = [[0, now]]
+                    self._save()
+                gap = self._force_break
+                if not gap and self.runs:
+                    off, ep = self.runs[-1][0], self.runs[-1][1]
+                    # audio seconds written into the current run so far
+                    # = how far playback has progressed since it began
+                    played = (pos - off) / (2.0 * self.rate)
+                    gap = now > ep + played + _AUDIO_RUN_GAP_S
+                if gap:
+                    self._force_break = False
+                    self._start_run(pos, now)
                 self._f.write(pcm)
                 self.n += len(pcm)
-                if self.n >= _AUDIO_MAX_SESSION_BYTES:
+                if self._base + self.n >= _AUDIO_MAX_SESSION_BYTES:
                     self._capped = True
                     logger.warning(
                         f"audio record {self.path.name} capped at "
@@ -1703,6 +1823,32 @@ class _SessionAudio:
                 except OSError:
                     pass
                 self._f = None
+
+    def run_break(self):
+        """Force the next write to start a new run. Called at each reply
+        pipeline's first emit: a new pipeline means a user turn happened
+        in between (gap or barge-in), so playback was discontinuous."""
+        with self._lock:
+            self._force_break = True
+
+    def mark_cut(self, t, since=None):
+        """Barge-in at session epoch t: audio in the last run beyond t was
+        emitted but never played. `since` (the pipeline's first-emit time)
+        guards the race where a newer pipeline already started its own
+        run — only cut a run this pipeline wrote into."""
+        with self._lock:
+            if not self.runs:
+                return
+            off, ep = self.runs[-1][0], self.runs[-1][1]
+            if since is not None and ep > since:
+                return
+            pos = self._base + self.n
+            played = (pos - off) / (2.0 * self.rate)
+            local = t - ep
+            if local <= 0 or local >= played:
+                return   # nothing audible was lost
+            self.runs[-1] = [off, ep, float(local)]
+            self._save()
 
     def close(self):
         with self._lock:
@@ -1981,14 +2127,16 @@ def _audio_info(sid) -> dict:
             n = p.stat().st_size
         except OSError:
             continue
-        rate, start = default_rate, None
+        rate, start, runs = default_rate, None, None
         try:
             meta = json.loads(p.with_suffix(".json").read_text())
             rate = int(meta.get("rate", default_rate))
             start = meta.get("start")
+            if isinstance(meta.get("runs"), list):
+                runs = meta["runs"]
         except (OSError, ValueError, TypeError):
             pass
-        out[kind] = {"rate": rate, "start": start, "bytes": n}
+        out[kind] = {"rate": rate, "start": start, "bytes": n, "runs": runs}
     return out
 
 

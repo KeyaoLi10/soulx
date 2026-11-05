@@ -15,8 +15,7 @@ Public entry points (called from app.py's pipeline_worker / receive loop):
 Everything else is internal to this module.
 
 Two hooks are wired by app.py after its singletons exist (importing app
-from here would be circular): get_history (LLM session history, used by
-the self-talk echo check) and emit_to_room (from emitter.py).
+from here would be circular): emit_to_room (from emitter.py).
 """
 import difflib
 import json
@@ -32,9 +31,6 @@ from emitter import emit_to_room
 from settings import Config, DEFAULT_SETTINGS
 
 logger = logging.getLogger(__name__)
-
-# LLM history accessor (llm.get_session), wired by app.py at import time.
-get_history = None
 
 
 def pvad_enabled(session) -> bool:
@@ -79,6 +75,11 @@ _PVAD_FORENSICS_CONTEXT_S = 6.0
 # _BARGEIN_MIN_CHUNKS, _CHUNK_MS, _TURN_GRACE_S, _TASK_MENTION_RE,
 # _SUSTAINED_VOICE_WINDOW_S, _BLIPTURN_FILTER — stayed in app.py)
 _PVAD_PLAYBACK_GRACE_S = 1.5  # turn-gate playback leniency extends this
+# Self-talk echo window (2026-11-05 吞句修复): a chunk's audio can only be
+# at the mic around the moment it PLAYS (playback-head estimate ± this
+# tail), so older chunks of a long run are not echo sources — matching
+# them ate short user corrections quoting minutes-old assistant words.
+_SELF_TALK_ECHO_TAIL_S = 4.0
                           # far past playback_end: the turn decision lags
                           # the speech by ~0.8 s, so a turn completing just
                           # after playback ended was still spoken INTO the
@@ -287,16 +288,47 @@ def _pvad_selftalk_text(session, asr_text: str) -> bool:
     our own output — while a real user's words are not. This is the one
     discriminator that separates assistant echo from an AEC-mangled main
     speaker during playback (their ECAPA cosines overlap: echo turns
-    0.18-0.39 vs mangled user 0.26-0.46, live-measured 2026-10-29)."""
+    0.18-0.39 vs mangled user 0.26-0.46, live-measured 2026-10-29).
+
+    Physics window (2026-11-05 吞句修复): the microphone can only pick up
+    audio that is playing NOW or ended moments ago — never text from 40
+    seconds ago. Before this fix the sources spanned 12 chunks + pending +
+    the last 6 history messages (minutes), and short corrections quoting
+    the assistant's topic words died on scattered 3-of-5-char 0.6 recalls
+    (session 9e727c1f: five consecutive user corrections eaten while the
+    matched source was 40-60 s old). Sources are now only chunks whose
+    audio is plausibly at the mic: current-run chunks near the playback
+    head (pos = min(now - first_emit, total_emitted), the real-time
+    playback model the circle-status gate already uses), or older-run
+    chunks within the just-interrupted tail. History/pending are never
+    echo sources — everything ever spoken passed _speak_chunk."""
     q = _pvad_norm_text(asr_text)
     if len(q) < 4:
         return False  # too short to attribute to anyone
-    sources = list(session.assistant_chunks)
-    if session.pending_message:
-        sources.append(session.pending_message)
-    for m in (get_history(session.client_id) if get_history else [])[-6:]:
-        if m.get("role") == "assistant" and m.get("content"):
-            sources.append(m["content"])
+    now = time.time()
+    playing = now < session.playback_end + _PVAD_PLAYBACK_GRACE_S
+    recent_interrupt = (
+        session.interruption_time is not None
+        and now - session.interruption_time < _PVAD_PLAYBACK_GRACE_S
+    )
+    if not (playing or recent_interrupt):
+        return False  # nothing audible: an echo is physically impossible
+    run = getattr(session, "playback_run_serial", 0)
+    first = getattr(session, "playback_run_first_ts", None)
+    total = getattr(session, "playback_run_total", 0.0)
+    # playback-head estimate; min() freezes it through inter-chunk gen gaps
+    pos = None if first is None else min(now - first, total)
+    sources = []
+    for e in session.assistant_chunks:
+        if e.get("run") == run and pos is not None:
+            # current run: only chunks at/after the playback head minus the
+            # echo tail. Early chunks of a long run are long gone.
+            if e["cum"] < pos - _SELF_TALK_ECHO_TAIL_S:
+                continue
+        elif now - e.get("ts", 0.0) > _PVAD_PLAYBACK_GRACE_S + _SELF_TALK_ECHO_TAIL_S:
+            # older run: plausible only just after its playback was cut
+            continue
+        sources.append(e["text"])
     for src in sources:
         s = _pvad_norm_text(src)
         if len(s) < 4:
@@ -310,9 +342,29 @@ def _pvad_selftalk_text(session, asr_text: str) -> bool:
         # RECALL of q in s — what fraction of the turn's text appears in
         # order in our recent output.
         sm = difflib.SequenceMatcher(None, q, s)
-        matched = sum(b.size for b in sm.get_matching_blocks())
-        if matched / len(q) >= 0.6:
-            return True
+        blocks = sm.get_matching_blocks()
+        matched = sum(b.size for b in blocks)
+        if matched / len(q) < 0.6:
+            continue
+        # Span efficiency: an echo is a transcription of ONE consecutive
+        # stretch of the playing audio, so its matched blocks hug each
+        # other in the source too (only garbled chars fall in the gaps).
+        # A correction interleaves the user's own words with quoted topic
+        # words ("查今天的北京天气" vs "…查一下北京最新的天气情况":
+        # 5 matched chars across a 10-char source span = 0.5) — that
+        # scattered-in-source shape is a user, not an echo.
+        real = [b for b in blocks if b.size]  # drop the (0,0)-size sentinel
+        span = real[-1].b + real[-1].size - real[0].b
+        if matched / span < 0.6:
+            continue
+        # Short-turn contiguity: echo transcribes a CONSECUTIVE stretch of
+        # the playing audio, so its largest match block is nearly all of q.
+        # A short correction quoting topic words scatters singles for the
+        # same 0.6 recall ("就查今天的" <- 查/天/的 of "让我查一下星期天
+        # 的天气", 3 blocks of size 1) — that shape is a user, not an echo.
+        if len(q) < 8 and max(b.size for b in blocks) < len(q) - 2:
+            continue
+        return True
     return False
 
 
