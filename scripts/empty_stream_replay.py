@@ -97,8 +97,9 @@ class MockTTS:
 
 
 class StopMidSynthTTS:
-    """Sets the stop during the FIRST segment's synthesis — the classic
-    mid-audio barge-in, already handled by _speak_chunk's wav-loop check."""
+    """Sets the stop during the FIRST segment's synthesis, after one wav
+    chunk was already emitted — audible interruption (classic mid-audio
+    barge-in), handled by _speak_chunk's wav-loop check."""
 
     def __init__(self, stop):
         self.stop = stop
@@ -108,6 +109,18 @@ class StopMidSynthTTS:
             if i == 1:
                 self.stop.set()
             yield b"\x00" * 24000
+
+
+class StopBeforeFirstWavTTS:
+    """Sets the stop before yielding ANY wav chunk — interrupted during
+    the first synthesis, nothing audible yet (silent kill)."""
+
+    def __init__(self, stop):
+        self.stop = stop
+
+    def synthesize(self, chunk, streaming=False, options=None):
+        self.stop.set()
+        yield b"\x00" * 24000
 
 
 # --- generator shapes -------------------------------------------------
@@ -168,9 +181,9 @@ def run(gen_factory, tts=None, grace_until=None):
     return ret, s
 
 
-# 1. THE BUG: stop inside the generator, zero segments -> must be False
+# 1. THE BUG: stop inside the generator, zero segments -> silent kill (None)
 ret, s = run(gen_zero_yield_on_stop)
-check("零产出+stop -> interrupted(False)", False, ret,
+check("零产出+stop -> 静默掐死(None)", None, ret,
       not messages, s.pending_message is None, not s.assistant_chunks)
 
 # 2. normal two-segment reply, no stop -> True, full text pending
@@ -187,25 +200,52 @@ check("播完之后才 stop -> 仍 True(不重投)", True, ret,
       s.pending_message == "北京今天天气晴朗，气温在五到十七度之间。")
 
 # 4. KNOWN BOUNDARY: stop between yields truncates at the last completed
-#    segment and is (still) reported as fully spoken — unchanged behavior
+#    (audible) segment and is (still) reported as fully spoken — the
+#    between-yields window is far smaller than the first-segment window
 ret, s = run(gen_stop_between_segments)
 check("[边界]段间 stop 截断 -> 仍 True(既定边界)", True, ret,
       s.pending_message == "北京今天天气晴朗，")
 
-# 5. stop during wav synthesis (classic mid-audio barge-in) -> False
+# 5. stop during wav synthesis, one chunk already audible -> False
+#    (audible rejection: consumes a delivery attempt)
 s = mk_session()
 stop = threading.Event()
 messages.clear()
 ret = pipeline(s, 1, gen_two_segments(stop), stop,
                StopMidSynthTTS(stop), {})
-check("音频合成中 stop -> False(原有路径)", False, ret,
+check("音频已出后合成中 stop -> False(算拒绝)", False, ret,
       not messages, s.pending_message is None, len(s.audio_tts.cuts) == 1)
 
-# 6. grace path: zero-yield stop during the hold -> False
-ret, s = run(gen_zero_yield_on_stop, grace_until=time.time() + 30)
-check("宽限窗内零产出+stop -> False", False, ret, not messages)
+# 6. stop before the FIRST wav chunk of the first segment -> None
+#    (nothing audible: silent kill, must not consume the budget)
+s = mk_session()
+stop = threading.Event()
+messages.clear()
+ret = pipeline(s, 1, gen_two_segments(stop), stop,
+               StopBeforeFirstWavTTS(stop), {})
+check("首包合成前 stop -> None(静默掐死)", None, ret, not messages)
 
-# 7. grace path: short reply finishes inside the window, no resumed
+# 7. grace path: zero-yield stop during the hold -> None
+ret, s = run(gen_zero_yield_on_stop, grace_until=time.time() + 30)
+check("宽限窗内零产出+stop -> None", None, ret, not messages)
+
+# 8. grace path: user resumes during the hold (premature drop) -> None
+s = mk_session()
+stop = threading.Event()
+messages.clear()
+
+
+def gen_resume_during_hold(stop, sess):
+    sess.last_voice_ts = 5.0  # sustained voice after hold start (ref 0.0)
+    yield "这句不该被说出来。"
+
+
+ret = pipeline(s, 1, gen_resume_during_hold(stop, s), stop,
+               MockTTS(), {}, grace_until=time.time() + 30)
+check("宽限窗内复语放弃(premature) -> None", None, ret,
+      not messages, not s.assistant_chunks)
+
+# 9. grace path: short reply finishes inside the window, no resumed
 #    speech -> flushed and fully spoken -> True
 ret, s = run(gen_two_segments, grace_until=time.time() + 0.25)
 check("宽限窗内完成并冲刷 -> True", True, ret,
