@@ -70,11 +70,20 @@ TOKENIZER = None
 MODEL = None
 GEN_LOCK = threading.Lock()  # serialize generate(); concurrent generate() on
                              # one model time-slices the GPU anyway
+# token ids banned in /agent_chat generations (set in load_model once the
+# tokenizer is up — see _stream_agent for why <|im_start|> must never be
+# sampled mid-turn)
+_BANNED_AGENT_TOKEN_IDS = []
 
 
 def load_model():
-    global TOKENIZER, MODEL
+    global TOKENIZER, MODEL, _BANNED_AGENT_TOKEN_IDS
     TOKENIZER = AutoTokenizer.from_pretrained(MODEL_PATH)
+    _im_start = TOKENIZER.convert_tokens_to_ids("<|im_start|>")
+    if isinstance(_im_start, int):
+        _BANNED_AGENT_TOKEN_IDS = [_im_start]
+    else:  # unknown token -> nothing to ban; log loudly
+        print("[llm] WARNING: <|im_start|> not in vocab, agent-turn ban inactive", flush=True)
     for attn in ("sdpa", "eager"):
         try:
             MODEL = AutoModelForCausalLM.from_pretrained(
@@ -511,6 +520,25 @@ async def _stream_agent(request: Request, conversation, body, tools, thinking):
         "max_new_tokens": int(body.get("max_tokens") or (4096 if thinking else MAX_NEW_TOKENS)),
         "do_sample": True,
     }
+    # Ban <|im_start|> during agent generation. Degeneration found 2026-11-05:
+    # instead of sampling EOS after a </tool_call>, the model sometimes keeps
+    # writing the WHOLE multi-turn transcript inline — it fabricates
+    # <|im_start|>user turns (fake tool results), then assistant turns with
+    # another tool call, and rolls until max_tokens (2048 tokens ≈ 83s,
+    # 30+ hallucinated tool calls per round, answers based on fabricated
+    # results). A legitimate assistant turn never contains <|im_start|>, so
+    # banning it closes the transcript-continuation path and forces the model
+    # to end its turn properly. (LogitsProcessor list is passed straight to
+    # MODEL.generate via **gen_kwargs.)
+    from transformers import LogitsProcessor
+
+    class _BanTokens(LogitsProcessor):
+        def __call__(self, input_ids, scores):
+            scores[:, _BANNED_AGENT_TOKEN_IDS] = -float("inf")
+            return scores
+
+    if _BANNED_AGENT_TOKEN_IDS:
+        gen_kwargs["logits_processor"] = [_BanTokens()]
     prompt = _build_prompt(conversation, tools=tools, thinking=thinking)
 
     def produce():
