@@ -567,8 +567,15 @@
             const r = await fetch(
               `/api/logs/sessions/${encodeURIComponent(cur.id)}/audio/${kind}` +
               `?key=${encodeURIComponent(key)}`);
-            if (!r.ok) return;
+            if (!r.ok) { console.warn("audio " + kind + ": HTTP " + r.status); return; }
             const buf = await r.arrayBuffer();
+            // decodeAudioData DETACHES buf (Web Audio spec) — build the
+            // playback blob BEFORE decoding. Built after, the <audio>
+            // element received 0 bytes and every range request on it 416'd
+            // (ERR_REQUEST_RANGE_NOT_SATISFIABLE → MEDIA_ERR_SRC_NOT_SUPPORTED,
+            // swallowed by play().catch) — waveforms still rendered from the
+            // decoded buffer, so the breakage was invisible (2026-11-05).
+            const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
             const AC = window.AudioContext || window.webkitAudioContext;
             const ctx = new AC();
             let decoded;
@@ -576,8 +583,7 @@
             finally { ctx.close(); }
             audioState[kind] = {
               buffer: decoded,
-              peaks: null,
-              url: URL.createObjectURL(new Blob([buf], { type: "audio/wav" })),
+              url,
               el: null,
               start: info[kind].start || cur.start,   // epoch of first frame
               base: null, over: null,
@@ -588,18 +594,35 @@
       renderWaveforms();
     }
 
-    function computePeaks(buffer, buckets) {
-      const ch = buffer.getChannelData(0);
-      const n = ch.length;
-      const out = new Float32Array(buckets * 2);   // min/max per bucket
-      const per = n / buckets;
-      for (let b = 0; b < buckets; b++) {
-        const s = Math.floor(b * per);
-        const e = Math.min(Math.floor((b + 1) * per), n);
+    // Peaks mapped through the session-time axis: pixel x covers session
+    // times [tOfX(x+PAD_L-0.5), tOfX(x+PAD_L+0.5)], converted to
+    // audio-local seconds via st.start and clamped to the buffer. Audio
+    // that doesn't span the whole session (late mic start, reconnect gap
+    // on a reused session id) leaves blank regions instead of being
+    // stretched to fit — and a click at pixel x seeks exactly the moment
+    // drawn there (2026-11-05).
+    function drawPeaks(kind) {
+      const st = audioState[kind];
+      if (!st || !st.base || !cur) return;
+      const c = st.base, ctx = c.getContext("2d");
+      const w = c.width, h = c.height, mid = h / 2;
+      ctx.clearRect(0, 0, w, h);
+      const rate = st.buffer.sampleRate;
+      const ch = st.buffer.getChannelData(0);
+      const dur = st.buffer.duration;
+      ctx.strokeStyle = kind === "mic" ? "#34d399" : "#60a5fa";
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const ta = Math.max(0, tOfX(x + PAD_L - 0.5) - st.start);
+        const tb = Math.min(dur, tOfX(x + PAD_L + 0.5) - st.start);
+        if (tb <= ta) continue;   // no recording at this pixel: leave blank
+        const s = Math.floor(ta * rate);
+        const e = Math.min(Math.floor(tb * rate), ch.length);
         let mn = 0, mx = 0;
-        if (s < e) {
+        if (e > s) {
           mn = 1; mx = -1;
-          // stride keeps this O(buckets * 64) even for long sessions
+          // stride keeps this O(w * 64) even for long sessions
           const stride = Math.max(1, Math.floor((e - s) / 64));
           for (let i = s; i < e; i += stride) {
             const v = ch[i];
@@ -607,22 +630,6 @@
             if (v > mx) mx = v;
           }
         }
-        out[b * 2] = mn; out[b * 2 + 1] = mx;
-      }
-      return out;
-    }
-
-    function drawPeaks(kind) {
-      const st = audioState[kind];
-      if (!st || !st.base || !st.peaks) return;
-      const c = st.base, ctx = c.getContext("2d");
-      const w = c.width, h = c.height, mid = h / 2;
-      ctx.clearRect(0, 0, w, h);
-      ctx.strokeStyle = kind === "mic" ? "#34d399" : "#60a5fa";
-      ctx.globalAlpha = 0.85;
-      ctx.beginPath();
-      for (let x = 0; x < w; x++) {
-        const mn = st.peaks[x * 2], mx = st.peaks[x * 2 + 1];
         const y1 = mid - mx * (mid - 2), y2 = mid - mn * (mid - 2);
         if (y2 - y1 < 1) { ctx.moveTo(x, mid - 0.5); ctx.lineTo(x, mid + 0.5); }
         else { ctx.moveTo(x, y1); ctx.lineTo(x, y2); }
@@ -664,7 +671,6 @@
           spacer.style.width = PAD_R + "px";
           spacer.style.flexShrink = "0";
           row.appendChild(spacer);
-          st.peaks = computePeaks(st.buffer, plotW);
           st.base = base; st.over = over;
           drawPeaks(kind);
           plot.addEventListener("click", (e) => {
@@ -698,7 +704,7 @@
         el.currentTime = Math.max(
           0, Math.min(tLocal, st.buffer.duration - 0.05));
       } catch (e) { /* seek before metadata */ }
-      el.play().catch(() => {});
+      el.play().catch((e) => console.warn("playback: " + e.message));
       if (!rafId) rafId = requestAnimationFrame(drawPlayheads);
     }
 
