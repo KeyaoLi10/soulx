@@ -53,7 +53,7 @@ Usage:
   CUDA_VISIBLE_DEVICES=7 venv-voxcpm/bin/python services/voxcpm_tts_server.py \
       [--port 8085]
 Env: VOXCPM_MODEL_PATH (default /mnt/disk3/krisl/soulx/VoxCPM2),
-     VOXCPM_LORA_PATH (default the self-trained step_0000400 checkpoint),
+     VOXCPM_LORA_PATH (default the self-trained step_0000500 checkpoint),
      VOXCPM_REF_WAV / VOXCPM_ANCHOR_WAV (anchor resolution, see above),
      VOXCPM_VOICE_DESC (only used by the zero-shot fallback).
 Startup note: optimize=True (torch.compile) makes the first launch take
@@ -78,7 +78,7 @@ from pydantic import BaseModel
 SOULX = "/home/research/krisl/soulx"
 MODEL_PATH = os.environ.get("VOXCPM_MODEL_PATH", "/mnt/disk3/krisl/soulx/VoxCPM2")
 LORA_PATH = os.environ.get(
-    "VOXCPM_LORA_PATH", "/vepfs-cnbjc4e12c6d7e1f/krisl/step_0000400"
+    "VOXCPM_LORA_PATH", "/vepfs-cnbjc4e12c6d7e1f/krisl/step_0000500"
 ).strip()
 REF_WAV = os.environ.get("VOXCPM_REF_WAV", "").strip()
 ANCHOR_WAV = os.environ.get("VOXCPM_ANCHOR_WAV", f"{SOULX}/data/voxcpm_anchor.wav")
