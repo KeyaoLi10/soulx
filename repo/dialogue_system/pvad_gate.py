@@ -543,6 +543,12 @@ def _pvad_do_bargein(session) -> None:
         f"[{session.client_id}] barge-in confirmed: stopping playback/generation"
     )
     session.interrupt()
+    # forensic recording: the browser drops its buffer at this stop, but
+    # the tts sidecar may hold an emitted-but-unplayed tail (TTS emits
+    # faster than real time) — cut where audible playback actually ended.
+    # No-op unless a fully-emitted reply is pending; an in-flight
+    # pipeline cuts its own run in its interrupted branch.
+    session.cut_pending_audio()
 
 
 def pvad_streak_append(session, now, wav) -> None:

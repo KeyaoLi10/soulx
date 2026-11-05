@@ -80,13 +80,13 @@ class _AudioTTS:
         self.breaks = 0
         self.cuts = []
 
-    def run_break(self):
+    def run_break(self, since=None):
         self.breaks += 1
 
     def write(self, b):
         self.written += len(b)
 
-    def mark_cut(self, t, first):
+    def mark_cut(self, t, since=None):
         self.cuts.append(t)
 
 
@@ -105,6 +105,19 @@ def mk_session():
     s.playback_run_first_ts = None
     s.playback_run_total = 0.0
     s.audio_tts = _AudioTTS()
+    # app.py 的 ChatSession.cut_pending_audio：forensic cut 的会话侧入口
+    # （pending 状态还在时把未播尾巴切在打断点）。桩里直接转发给
+    # audio_tts.mark_cut，行为与真实现一致（pending 为空时 no-op）。
+    def _cut_pending_audio(t=None):
+        with s.lock:
+            since = s.pending_start_time
+            if s.pending_message is None or not since:
+                return
+            if t is None:
+                t = s.interruption_time or time.time()
+        s.audio_tts.mark_cut(t, since)
+
+    s.cut_pending_audio = _cut_pending_audio
     return s
 
 
