@@ -444,6 +444,9 @@ class _TagSplitter:
     def __init__(self, start_mode="text"):
         self.buf = ""
         self.mode = start_mode  # text | think | tool
+        # set by flush() when the stream ended inside an unclosed block —
+        # callers use it to mark the generation truncated (v2 finish_reason)
+        self.truncated = False
         # with enable_thinking=True the chat template ends the generation
         # prompt with "<think>\n", so the stream begins already inside
         # thinking (the opening tag never appears in the decoded output)
@@ -499,27 +502,55 @@ class _TagSplitter:
                 out.append(("tool", block))
 
     def flush(self):
-        """End of stream: release whatever never got closed."""
+        """End of stream. G6 fix (2026-11-06, agent-runtime manual §12):
+        an unclosed <tool_call> is a TRUNCATED stream — it must never be
+        parsed and executed, and its raw text must not leak into the text
+        channel either, so it is dropped and `truncated` is set. Unclosed
+        <think> content is a reasoning draft and is likewise dropped; only
+        finalized text is released."""
         out = []
         if self.buf:
-            out.append((self.mode, self.buf))
+            if self.mode == "text":
+                out.append(("text", self.buf))
+            elif self.mode == "tool":
+                self.truncated = True
+            # mode == "think": dropped
             self.buf = ""
         self.mode = "text"
         return out
 
 
-async def _stream_agent(request: Request, conversation, body, tools, thinking):
-    """Yield ('S'|'R'|'T', bytes) chunks for one agent generation."""
+def _agent_gen_kwargs(body, thinking, v2=False):
+    """组装 _stream_agent 的生成参数。v2（手册 §12）默认 temperature=0
+    贪心：注意 legacy 的 `body.get("temperature") or TEMP` 会把显式 0
+    当默认值——v2 必须区分"没传"与"传 0"。legacy 采样行为保持不变。"""
+    if v2:
+        t = body.get("temperature")
+        temperature = float(t) if t is not None else 0.0
+        do_sample = temperature > 0
+    else:
+        temperature = float(body.get("temperature") or TEMP)
+        do_sample = True
+    return {
+        "temperature": temperature,
+        "top_p": float(body.get("top_p") or TOP_P),
+        "max_new_tokens": int(body.get("max_tokens") or (4096 if thinking else MAX_NEW_TOKENS)),
+        "do_sample": do_sample,
+    }
+
+
+async def _stream_agent(request: Request, conversation, body, tools, thinking,
+                        v2=False, state=None):
+    """Yield ('S'|'R'|'T', bytes) chunks for one agent generation.
+    v2=True: greedy-by-default sampling for the control plane (see §12).
+    state: optional dict; sets state["truncated"] when the stream ended
+    inside an unclosed <tool_call> (G6) so /agent_chat_v2 can mark
+    finish_reason="length" and the client can refuse to commit."""
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     done = object()
     cancel = threading.Event()
-    gen_kwargs = {
-        "temperature": float(body.get("temperature") or TEMP),
-        "top_p": float(body.get("top_p") or TOP_P),
-        "max_new_tokens": int(body.get("max_tokens") or (4096 if thinking else MAX_NEW_TOKENS)),
-        "do_sample": True,
-    }
+    gen_kwargs = _agent_gen_kwargs(body, thinking, v2=v2)
     # Ban <|im_start|> during agent generation. Degeneration found 2026-11-05:
     # instead of sampling EOS after a </tool_call>, the model sometimes keeps
     # writing the WHOLE multi-turn transcript inline — it fabricates
@@ -553,12 +584,14 @@ async def _stream_agent(request: Request, conversation, body, tools, thinking):
     threading.Thread(target=produce, daemon=True).start()
 
     splitter = _TagSplitter(start_mode="think" if thinking else "text")
+    disconnected = False
     try:
         while True:
             item = await queue.get()
             if item is done:
                 break
             if await request.is_disconnected():
+                disconnected = True
                 cancel.set()
                 break
             pieces = splitter.feed(item)
@@ -580,6 +613,78 @@ async def _stream_agent(request: Request, conversation, body, tools, thinking):
             call = _parse_tool_call(text)
             if call:
                 yield ("T", json.dumps(call, ensure_ascii=False).encode("utf-8"))
+    if state is not None:
+        state["truncated"] = splitter.truncated
+        state["disconnected"] = disconnected
+
+
+@app.post("/agent_chat_v2")
+async def agent_chat_v2(request: Request):
+    """NDJSON framing for the control-plane generation path (manual §12).
+
+    One JSON object per line (newlines inside JSON are escaped by dumps):
+      {"v":2,"seq":1,"type":"text_delta","text":"..."}
+      {"v":2,"seq":2,"type":"reasoning_delta","text":"..."}
+      {"v":2,"seq":3,"type":"tool_call","call_id":"C1","name":"...","arguments":{...}}
+      {"v":2,"seq":4,"type":"error","error":"..."}
+      {"v":2,"seq":5,"type":"done","finish_reason":"stop|length|cancelled|error"}
+
+    Contract: the client MUST NOT commit a control batch unless it received
+    a final done frame with finish_reason=="stop". finish_reason=="length"
+    means the stream was truncated (e.g. an unclosed <tool_call> was dropped
+    server-side — G6) and the batch is invalid. v2 defaults to greedy
+    (temperature=0); sampling is only on with an explicit temperature>0.
+    """
+    data = await request.json()
+    messages = data.get("messages", [])
+    tools = data.get("tools") or None
+    thinking = bool(data.get("thinking"))
+
+    async def ndjson_stream():
+        seq = 0
+
+        def frame(obj):
+            nonlocal seq
+            seq += 1
+            obj["v"] = 2
+            obj["seq"] = seq
+            return json.dumps(obj, ensure_ascii=False) + "\n"
+
+        if not messages:
+            yield frame({"type": "error", "error": "no messages"})
+            yield frame({"type": "done", "finish_reason": "error"})
+            return
+        state = {}
+        try:
+            async for tag, payload in _stream_agent(
+                request, messages, data, tools, thinking, v2=True, state=state
+            ):
+                if tag == "S" and payload:
+                    yield frame({"type": "text_delta",
+                                 "text": payload.decode("utf-8", "replace")})
+                elif tag == "R" and payload:
+                    yield frame({"type": "reasoning_delta",
+                                 "text": payload.decode("utf-8", "replace")})
+                elif tag == "T":
+                    call = json.loads(payload.decode("utf-8"))
+                    yield frame({"type": "tool_call",
+                                 "call_id": f"C{seq + 1}",
+                                 "name": call.get("name"),
+                                 "arguments": call.get("arguments", {})})
+        except Exception as e:  # noqa: BLE001
+            yield frame({"type": "error", "error": str(e)})
+            yield frame({"type": "done", "finish_reason": "error"})
+            return
+        if state.get("truncated"):
+            finish = "length"
+        elif state.get("disconnected"):
+            finish = "cancelled"
+        else:
+            finish = "stop"
+        yield frame({"type": "done", "finish_reason": finish})
+
+    return StreamingResponse(ndjson_stream(),
+                             media_type="application/x-ndjson")
 
 
 @app.post("/agent_chat")
