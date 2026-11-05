@@ -101,9 +101,15 @@ from pvad_gate import (
     pvad_handle_bargein,
     pvad_maybe_auto_enroll,
     pvad_ring_append,
+    pvad_streak_append,
     pvad_try_enroll,
     pvad_turn_gate,
 )
+# Pre-ASR stream gate (2026-11-05): silences non-main-speaker audio
+# before it reaches the turn server. Same sidecar discipline as the rest
+# of the pvad path — the receive loop only reads a flag; the scorer
+# thread does the blocking ECAPA work.
+from pvad_stream import PvadStreamGate, stream_gate_active, stream_gate_filter
 from settings import Config, DEFAULT_SETTINGS, TTS_ENGINE, sanitize_updates
 
 logging.basicConfig(
@@ -186,6 +192,14 @@ class ChatSession:
         # Set by pvad_turn_gate, read by the bank/enroll calls of the
         # same pipeline_worker run.
         self.pvad_turn_verified = False
+        # The cos behind that verdict (None on fail-open). Once enrolled,
+        # only high-margin passes (>= threshold + _PVAD_REENROLL_MARGIN)
+        # may re-enroll or bank — marginal passes are the user+background
+        # MIXED windows that poisoned the reference on 2026-11-05.
+        self.pvad_turn_cos = None
+        # Pre-ASR stream gate (pvad_stream.PvadStreamGate), created lazily
+        # by the receive loop only while pvad is enabled. None = inert.
+        self.pvad_stream_gate = None
         # Gate-decision audio dumps written for this session (forensics
         # cap; see pvad_gate._pvad_dump_forensics)
         self.pvad_forensics_n = 0
@@ -194,10 +208,19 @@ class ChatSession:
         # must not stop playback — only sustained nonidle (real speech)
         # may interrupt. Any idle/speak result resets the streak.
         self.bargein_streak = 0
-        # The nonidle audio itself (rolling ~2.5 s). The barge-in identity
-        # check scores THIS, not the mic ring: the ring's recent-speech
-        # window can still hold the user's just-finished turn, which made
-        # the first echo/noise onset score as the main speaker.
+        # The nonidle audio itself as (ts, wav) pairs, rolling ~2.5 s of
+        # audio / _PVAD_BARGEIN_RETAIN_S of wall time. The barge-in
+        # identity check scores THIS, not the mic ring: the ring's
+        # recent-speech window can still hold the user's just-finished
+        # turn, which made the first echo/noise onset score as the main
+        # speaker. GAP-TOLERANT since 2026-11-05: an idle chunk no longer
+        # clears it (only a turn commit or age does) — with a background
+        # video playing, the turn server's rms gate rewrites the quiet
+        # video chunks to idle, and the old instant clear kept resetting
+        # the user's interrupt evidence to zero mid-shout ("停停停" got
+        # 10 consecutive unscoreable rejections in 1.7 s; report docs/
+        # PVAD背景视频失效调查报告-20261105.md §4). Retention is bounded
+        # so stale evidence cannot confirm a later barge-in either.
         self.bargein_audio = []
         # Timestamps of recent nonidle chunks (rolling _PLAYBACK_BARGEIN_
         # WINDOW_S) — duty-cycle evidence for the playback barge-in guard
@@ -415,6 +438,8 @@ _BARGEIN_MIN_CHUNKS = 0   # consecutive nonidle chunks before a barge-in
 # and the zero-latency first-chunk path is unchanged.
 _PLAYBACK_BARGEIN_WINDOW_S = 1.6   # evidence window (~10 chunks)
 _PLAYBACK_BARGEIN_NONIDLE = 3      # nonidle chunks needed inside it
+# (bargein_audio's gap-tolerant retention lives in pvad_gate.py:
+#  _PVAD_BARGEIN_RETAIN_S — see the 2026-11-05 background-video report)
 
 
 def _playback_guard_active(session):
@@ -1452,6 +1477,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 if pvad_enabled(session):
                     session.pvad.feed(audio_chunk)
                     pvad_ring_append(session, audio_chunk)
+                    if session.pvad_stream_gate is None and stream_gate_active(session):
+                        session.pvad_stream_gate = PvadStreamGate(session)
+                    # Pre-ASR stream gate: silence the chunk AFTER the ring /
+                    # sidecar / feeder have seen the ORIGINAL audio (the
+                    # scorer must keep scoring the real mic or the gate
+                    # could never release), so background-voice audio never
+                    # reaches ASR / live text / turn commits. Inert unless
+                    # enrolled+enforce+actively-suppressing (pvad_stream.py).
+                    audio_chunk = stream_gate_filter(session, audio_chunk)
                     pvad_emit_status(session)
 
                 t_proc = time.time()
@@ -1484,7 +1518,13 @@ async def websocket_endpoint(websocket: WebSocket):
                              "window": len(session.bargein_times)},
                         )
                     session.bargein_streak = 0
-                    session.bargein_audio = []
+                    # bargein_audio is NOT cleared here (gap-tolerant
+                    # since 2026-11-05): idle chunks — including the
+                    # quiet background-video ones the turn server's rms
+                    # gate rewrites to idle — must not zero the user's
+                    # interrupt evidence. It is bounded by age
+                    # (_BARGEIN_AUDIO_RETAIN_S, evicted on append) and
+                    # cleared on turn commit below.
                     session.voice_run = 0
                 elif isinstance(segment, list) and segment[0] is None:
                     # Barge-in signal — hysteresis first: the turn server
@@ -1501,13 +1541,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     # still push it.
                     session.bargein_streak += 1
                     session.voice_run += 1
-                    session.bargein_audio.append(audio_chunk)
-                    if len(session.bargein_audio) > 16:  # ~2.5 s rolling
-                        del session.bargein_audio[0]
+                    now = time.time()
+                    # (ts, wav) gap-tolerant accumulation — helper in
+                    # pvad_gate.py (age-evicted, never cleared by idle)
+                    pvad_streak_append(session, now, audio_chunk)
                     # duty-cycle evidence for the playback guard (the
                     # deque is pruned to the window; idle chunks do NOT
                     # clear it — see the Session field note)
-                    now = time.time()
                     # LAZY burst reset (2026-11-03): a voice burst is a
                     # run of nonidle chunks with <= window-sized gaps.
                     # Resetting here (on new nonidle after a long gap)
@@ -1753,6 +1793,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if session.frc:
                 session.frc.stop()
             session.pvad.stop()
+            if session.pvad_stream_gate is not None:
+                session.pvad_stream_gate.stop()
             session.audio_mic.close()
             session.audio_tts.close()
             vad_pool.release(session.vad)

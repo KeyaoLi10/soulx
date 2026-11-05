@@ -64,9 +64,39 @@ _PVAD_TURN_MIN_S = 1.2    # turn gate: shorter tail => fail-open
 _PVAD_BARGEIN_MIN_S = 0.9 # barge-in gate: streak audio below this is
                           # unscoreable (1s is where ECAPA separates;
                           # 0.5s does not separate at all)
+_PVAD_BARGEIN_RETAIN_S = 3.0
+                          # Wall-clock retention of bargein_audio (gap-
+                          # tolerant accumulation, 2026-11-05): nonidle
+                          # chunks survive idle gaps up to this long. The
+                          # turn server's pre-latch rms gate (config
+                          # nonidle_rms_gate=0.01) rewrites quiet
+                          # background-video chunks to idle, so real
+                          # interleaved speech+video bursts read as
+                          # alternating nonidle/idle — with the old clear-
+                          # on-any-idle, interrupt evidence never reached
+                          # the 0.9 s ECAPA floor while a video played
+                          # (report docs/PVAD背景视频失效调查报告
+                          # -20261105.md §4). 3 s spans a 停停停-style
+                          # burst (measured bursts: 1.9-3.7 s of nonidle
+                          # audio over ~3 s wall) without letting one
+                          # burst vouch for the next.
 _PVAD_ENROLL_TAIL_S = 6.0 # speech-bounded ring tail banked per turn
 _PVAD_ENROLL_MIN_S = 2.5  # less banked audio than this => defer enroll
 _PVAD_BANK_MAX_S = 12.0   # enrollment bank retention
+_PVAD_REENROLL_MARGIN = 0.15
+                          # Once enrolled, a turn must score threshold+this
+                          # to re-enroll or bank. Verified-but-marginal
+                          # passes (0.50-0.65) are exactly the user+video
+                          # MIXED windows of the 2026-11-05 background-
+                          # video session: they passed the gate at 0.52-0.69
+                          # and re-enrolled the reference from their last-5s
+                          # (video-contaminated) tail, after which the real
+                          # user decayed 0.235 -> 0.098 and a video-dominant
+                          # window scored 0.50-0.55 AGAINST the polluted
+                          # reference (report docs/PVAD背景视频失效调查报告
+                          # -20261105.md §6). High-margin only keeps the
+                          # reference clean; a thin enrollment loses rolling
+                          # adaptation, which is the cheaper failure.
 _PVAD_FORENSICS_MAX = 200 # gate-decision audio dumps per session (disk
                           # guard; ~50KB/s of wav each)
 _PVAD_FORENSICS_CONTEXT_S = 6.0
@@ -156,13 +186,30 @@ def pvad_bank_turn_audio(session) -> None:
     Once enrolled, only identity-VERIFIED turns bank (scored cos >=
     threshold): a fail-open pass is by definition unverified, and banking
     it is how echo-class audio displaces the enrolled speaker (measured
-    2026-10-30 — see the pvad_turn_verified field note)."""
-    if session.pvad.enrolled and not session.pvad_turn_verified:
-        logger.info(
-            f"[{session.client_id}] pvad bank skipped: gate pass was not "
-            f"identity-verified (fail-open) — reference stays put"
-        )
-        return
+    2026-10-30 — see the pvad_turn_verified field note).
+
+    Once enrolled, only HIGH-MARGIN verified turns bank (cos >= threshold
+    + _PVAD_REENROLL_MARGIN): the bank feeds re-enrollment, and marginal
+    passes are the mixed windows that poisoned the reference on
+    2026-11-05 (see _PVAD_REENROLL_MARGIN)."""
+    threshold = session.settings.get(
+        "pvad_threshold", DEFAULT_SETTINGS["pvad_threshold"]
+    )
+    if session.pvad.enrolled:
+        if not session.pvad_turn_verified:
+            logger.info(
+                f"[{session.client_id}] pvad bank skipped: gate pass was not "
+                f"identity-verified (fail-open) — reference stays put"
+            )
+            return
+        cos = getattr(session, "pvad_turn_cos", None)
+        if cos is not None and cos < threshold + _PVAD_REENROLL_MARGIN:
+            logger.info(
+                f"[{session.client_id}] pvad bank skipped: verified pass was "
+                f"marginal (cos={cos:.3f} < {threshold + _PVAD_REENROLL_MARGIN:.2f}) "
+                f"— mixed-audio turns must not feed the reference"
+            )
+            return
     wav = _pvad_ring_tail(session, _PVAD_ENROLL_TAIL_S)
     if wav is None or wav.shape[0] < int(1.0 * Config.SAMPLE_RATE):
         return
@@ -403,8 +450,11 @@ def pvad_turn_gate(session, asr_text: str) -> bool:
     cos, threshold = _pvad_score(session)
     # stash for the bank/re-enroll calls later in this pipeline run: only
     # a SCORED pass may move the enrollment reference (fail-open passes
-    # must not bank — that is the pollution vector of 2026-10-30)
+    # must not bank — that is the pollution vector of 2026-10-30), and
+    # once enrolled only a HIGH-MARGIN pass may (_PVAD_REENROLL_MARGIN,
+    # the mixed-window pollution vector of 2026-11-05)
     session.pvad_turn_verified = cos is not None and cos >= threshold
+    session.pvad_turn_cos = cos
     if cos is not None and cos >= threshold:
         return True  # strict pass — clean capture of the enrolled speaker
     playing = time.time() < session.playback_end + _PVAD_PLAYBACK_GRACE_S
@@ -451,6 +501,16 @@ def pvad_turn_gate(session, asr_text: str) -> bool:
             # (enrollment bootstraps from playback-period turns)
             _pvad_dump_forensics(session, asr_text, cos,
                                  "pass-unenrolled-playing")
+        elif session.pvad.enrolled:
+            # enrolled + unscoreable + NOT playing: the fail-open short-
+            # window channel. On 2026-11-05 this is how a pure video
+            # phrase (「嗯，刚洗完，你这怎么天天晚？」, <1.2 s window)
+            # reached the LLM. Fail-open stays (a falsely rejected user
+            # is still the worst failure, and short confirmations like
+            # 「好的」 are exactly this signature) — but it must be
+            # VISIBLE in forensics so leaks can be tuned, not silent.
+            _pvad_dump_forensics(session, asr_text, cos,
+                                 "pass-unscoreable-short")
         return True  # fail-open (unenrolled / unscoreable / no service)
     _pvad_dump_forensics(session, asr_text, cos, "below-threshold")
     emit_to_room(
@@ -483,6 +543,24 @@ def _pvad_do_bargein(session) -> None:
         f"[{session.client_id}] barge-in confirmed: stopping playback/generation"
     )
     session.interrupt()
+
+
+def pvad_streak_append(session, now, wav) -> None:
+    """Receive-loop hook: accumulate a nonidle chunk into bargein_audio.
+    GAP-TOLERANT (2026-11-05): entries are (ts, wav) and survive idle
+    chunks — evicted only by age (_PVAD_BARGEIN_RETAIN_S above) or the
+    16-chunk audio cap, and cleared on turn commit. With a background
+    video playing, the turn server's pre-latch rms gate rewrites the
+    quiet video chunks to idle, and the old clear-on-any-idle kept
+    zeroing the user's interrupt evidence mid-shout (10 consecutive
+    "unscoreable" rejections in 1.7 s on 2026-11-05; report docs/
+    PVAD背景视频失效调查报告-20261105.md §4)."""
+    session.bargein_audio.append((now, wav))
+    while (session.bargein_audio
+           and now - session.bargein_audio[0][0] > _PVAD_BARGEIN_RETAIN_S):
+        del session.bargein_audio[0]
+    if len(session.bargein_audio) > 16:  # ~2.5 s of chunks: score window
+        del session.bargein_audio[0]
 
 
 def pvad_handle_bargein(session) -> None:
@@ -537,9 +615,14 @@ def pvad_handle_bargein(session) -> None:
         return
     session.pvad_checking = True
 
-    # snapshot the streak audio under the same loop that appends it
+    # snapshot the streak audio under the same loop that appends it.
+    # (ts, wav) pairs since 2026-11-05 — gap-tolerant accumulation: the
+    # chunks can span idle gaps up to _PVAD_BARGEIN_RETAIN_S, so the
+    # snapshot may hold nonidle audio from both sides of a quiet
+    # background-video patch. That is the point: the user's interrupt
+    # evidence must survive the video's interleaved quiet chunks.
     streak_wav = (
-        np.concatenate(session.bargein_audio)
+        np.concatenate([c for _, c in session.bargein_audio])
         if session.bargein_audio
         else None
     )
@@ -642,9 +725,22 @@ def pvad_maybe_auto_enroll(session) -> None:
     fail-open passes: an unscoreable phantom turn passed the gate, and
     its echo-class ring tail re-enrolled the reference — after which the
     real user scored ~0 and was rejected on every later turn while
-    phantoms kept passing (2026-10-30, session b63c185f)."""
-    if session.pvad.enrolled and not session.pvad_turn_verified:
-        return  # unverified (fail-open) pass: never move the reference
+    phantoms kept passing (2026-10-30, session b63c185f).
+
+    2026-11-05: verified is no longer enough — the pass must also be
+    HIGH-MARGIN (cos >= threshold + _PVAD_REENROLL_MARGIN). The
+    background-video session showed verified-but-marginal turns (0.52-
+    0.69) were user+video MIXED windows whose last-5s enroll tail
+    dragged the reference toward the video voice."""
+    if session.pvad.enrolled:
+        if not session.pvad_turn_verified:
+            return  # unverified (fail-open) pass: never move the reference
+        cos = getattr(session, "pvad_turn_cos", None)
+        threshold = session.settings.get(
+            "pvad_threshold", DEFAULT_SETTINGS["pvad_threshold"]
+        )
+        if cos is not None and cos < threshold + _PVAD_REENROLL_MARGIN:
+            return  # marginal pass: not clean enough to move the reference
     pvad_try_enroll(session, "auto")
 
 
@@ -663,6 +759,13 @@ def pvad_emit_status(session) -> None:
             "mode": session.settings.get("pvad_mode", DEFAULT_SETTINGS["pvad_mode"]),
             "threshold": session.settings.get(
                 "pvad_threshold", DEFAULT_SETTINGS["pvad_threshold"]
+            ),
+            # pre-ASR stream gate (pvad_stream.py): True while mic->ASR is
+            # being silenced as non-main-speaker audio (UI badge + the
+            # regression tests read this)
+            "gated": bool(
+                session.pvad_stream_gate is not None
+                and session.pvad_stream_gate.suppressing()
             ),
         },
     )

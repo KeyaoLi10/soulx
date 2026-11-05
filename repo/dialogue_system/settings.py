@@ -54,6 +54,15 @@ DEFAULT_SETTINGS = {
     "pvad_threshold": 0.50,    # ECAPA cosine vs enrolled speaker must be
                                # above this (measured: same 0.59-0.80,
                                # different 0.06-0.44)
+    # Pre-ASR stream gate (2026-11-05): in enforce mode, once enrolled,
+    # audio that sustainably scores well below the enrolled speaker is
+    # silenced BEFORE the turn server — background voices never enter
+    # ASR / live text / turn commits. Hysteresis: suppress after 2
+    # consecutive scores < threshold-0.20, release on any score >=
+    # threshold; shadow mode reports only; unenrolled/service-down/
+    # unscoreable always pass (fail-open). Only active with pvad_mode
+    # != off, so the default-off pvad path is untouched.
+    "pvad_stream_gate": True,
     # Fast/slow brain agent (delegate_task → background slow brain on
     # :6008, results delivered at the next quiet gap)
     "agent_enabled": True,
@@ -154,4 +163,6 @@ def sanitize_updates(data) -> dict:
         clean["playback_guard"] = bool(data["playback_guard"])
     if "asr_correct" in data:
         clean["asr_correct"] = bool(data["asr_correct"])
+    if "pvad_stream_gate" in data:
+        clean["pvad_stream_gate"] = bool(data["pvad_stream_gate"])
     return clean

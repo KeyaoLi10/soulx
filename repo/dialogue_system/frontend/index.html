@@ -194,6 +194,13 @@
           <input id="pvadThreshold" type="range" min="0.3" max="0.9" step="0.05" value="0.5">
           <span class="block-hint">Speaker similarity (ECAPA cosine vs the enrolled voice) must exceed this to take a turn or barge in.</span>
         </div>
+        <div class="field">
+          <label for="pvadStreamGate" class="toggle-row">
+            <input id="pvadStreamGate" type="checkbox" checked>
+            <span>Pre-ASR audio gate</span>
+          </label>
+          <span class="block-hint">With the gate in enforce mode and the speaker enrolled, mic audio that sustainably scores well below the enrolled voice is silenced before ASR — a background video/voice never reaches the transcript, the UI, or turn commits. Hysteresis: ~0.8 s of clearly-different audio to mute, one above-threshold score to unmute; unknown/unenrolled always passes. Only active with Speaker Gate on.</span>
+        </div>
         <div class="gate-row">
           <button id="pvadEnrollBtn" class="btn btn-ghost btn-sm">Re-enroll speaker</button>
           <span class="gate-prob">P<span id="pvadProb">–</span></span>
@@ -238,7 +245,7 @@
     </aside>
   </main>
 
-  <script src="script.js?v=20261105a"></script>
+  <script src="script.js?v=20261105b"></script>
 </body>
 
 </html>

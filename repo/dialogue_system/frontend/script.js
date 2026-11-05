@@ -831,6 +831,7 @@ const settingsEls = {
   pvadMode: document.getElementById('pvadMode'),
   pvadThreshold: document.getElementById('pvadThreshold'),
   pvadThresholdVal: document.getElementById('pvadThresholdVal'),
+  pvadStreamGate: document.getElementById('pvadStreamGate'),
   pvadEnrollBtn: document.getElementById('pvadEnrollBtn'),
   pvadEnrolled: document.getElementById('pvadEnrolled'),
   pvadProb: document.getElementById('pvadProb'),
@@ -855,6 +856,7 @@ function currentSettings() {
     tts_timesteps: parseInt(settingsEls.ttsSteps.value, 10) || 10,
     pvad_mode: settingsEls.pvadMode.value,
     pvad_threshold: parseFloat(settingsEls.pvadThreshold.value) || 0.5,
+    pvad_stream_gate: settingsEls.pvadStreamGate.checked,
     agent_enabled: settingsEls.agentEnabled.checked,
     playback_guard: settingsEls.playbackGuard.checked,
     asr_correct: settingsEls.asrCorrect.checked,
@@ -913,6 +915,7 @@ function debouncedSend() {
       min_seg_len: s.min_seg_len,
       pvad_mode: s.pvad_mode,
       pvad_threshold: s.pvad_threshold,
+      pvad_stream_gate: s.pvad_stream_gate,
       agent_enabled: s.agent_enabled,
       playback_guard: s.playback_guard,
       asr_correct: s.asr_correct,
@@ -971,6 +974,7 @@ settingsEls.minSegLen.addEventListener('input', () => {
 
 // ==================== Speaker Gate (pvad sidecar) ====================
 settingsEls.pvadMode.addEventListener('change', debouncedSend);
+settingsEls.pvadStreamGate.addEventListener('change', debouncedSend);
 settingsEls.pvadThreshold.addEventListener('input', () => {
   settingsEls.pvadThresholdVal.textContent =
     parseFloat(settingsEls.pvadThreshold.value).toFixed(2);
@@ -995,10 +999,12 @@ function flashGateNote(text, sticky = false) {
   }
 }
 
-function handlePvadStatus({ enrolled, prob, mode, threshold }) {
+function handlePvadStatus({ enrolled, prob, mode, threshold, gated }) {
   if (settingsEls.pvadEnrolled) {
     settingsEls.pvadEnrolled.dataset.state = enrolled ? 'enrolled' : 'off';
-    settingsEls.pvadEnrolled.textContent = enrolled ? 'enrolled' : 'not enrolled';
+    settingsEls.pvadEnrolled.textContent = enrolled
+      ? (gated ? 'enrolled · muting others' : 'enrolled')
+      : 'not enrolled';
   }
   if (settingsEls.pvadProb) {
     settingsEls.pvadProb.textContent = prob == null ? '–' : prob.toFixed(2);
