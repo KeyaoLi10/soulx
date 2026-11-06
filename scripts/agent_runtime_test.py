@@ -181,6 +181,10 @@ check("result invalid on stale revision",
       not env.valid_for({"T1": {"revision": 3,
                                 "execution_status": C.EXEC_COMPLETED}}))
 check("result invalid on unknown task", not env.valid_for({}))
+check("result invalid on retracted (cancel_intent)",
+      not env.valid_for({"T1": {"revision": 2,
+                                "execution_status": C.EXEC_COMPLETED,
+                                "cancel_intent": 1}}))
 q_env = C.SpeechEnvelope(speech_id="s2", session_id="sess", connection_epoch=1,
                          kind="question", task_id="T1", revision=2)
 check("question valid only waiting_input",

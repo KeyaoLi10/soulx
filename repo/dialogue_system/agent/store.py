@@ -724,7 +724,16 @@ class AgentStore:
                 continue
             st = t["execution_status"]
             if st in (C.EXEC_COMPLETED, C.EXEC_FAILED):
-                # §9.2 第三层：执行是事实，只抑制播报
+                # §9.2 第三层：执行是事实，只抑制播报。cancel_intent=1
+                # 让交付泵的信封校验也拒掉这条结果——2026-11-06 湖人纠错
+                # 事故：抑制只扫了 deliveries 表，而交付行要到 can_deliver
+                # 通过后才创建（delivery.py:158），结果还躺在 outbox 里，
+                # 照播不误。amend/rerun（_new_revision）与 get_task 重播
+                # （_redeliver_unheard）都会把标记清回来。
+                self._conn.execute(
+                    "UPDATE tasks SET cancel_intent=1, updated_at=? WHERE "
+                    "session_id=? AND task_id=?",
+                    (self._now(), session_id, tgt["task_id"]))
                 self._suppress_deliveries(session_id, tgt["task_id"],
                                           t["current_revision"])
                 self._append_event(session_id, "delivery_suppressed",
@@ -952,6 +961,13 @@ class AgentStore:
             return False   # 无可重播的结果记录（如测试直改任务状态）
         if dlv is not None:
             self._reopen_delivery(dlv["delivery_id"])
+        # 用户显式追问 = 重新要这个结果：清掉改口标记，否则交付泵的
+        # 信封校验会把重排的 deliver 又拒掉（2026-11-06 湖人纠错事故的
+        # 对称面——"结果先不重复说，你需要的话我再讲"要能兑现）
+        self._conn.execute(
+            "UPDATE tasks SET cancel_intent=0, updated_at=? WHERE "
+            "session_id=? AND task_id=?",
+            (self._now(), session_id, task_id))
         self._enqueue(session_id, "deliver", src)
         return True
 

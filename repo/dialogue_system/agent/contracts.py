@@ -508,6 +508,8 @@ class SpeechEnvelope:
             return False     # 已被新版本取代
         st = cur.get("execution_status")
         if self.kind == "result":
+            if cur.get("cancel_intent"):
+                return False  # 改口后旧结果不再播（§13.2；2026-11-06 事故）
             return st in (EXEC_COMPLETED, EXEC_FAILED, EXEC_WAITING_INPUT)
         if self.kind == "receipt":
             # 受理/修改回执在任务被改口后应抑制（§13.2）

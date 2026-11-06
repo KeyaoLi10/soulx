@@ -531,6 +531,44 @@ disc = rt.store._conn.execute(
 check("18c no spurious discard row for committed turn", disc == 0, str(disc))
 speak_gate.set()
 
+# ==== 场景 19：改口抑制穿越 outbox——cancel 落在"已完成但结果未播"上，
+# 结果不得再播；get_task 显式追问后重播（2026-11-06 湖人纠错事故：
+# 抑制只扫 deliveries 表，交付行要到 can_deliver 通过后才创建，结果
+# 躺在 outbox 里照播不误）===============================================
+CANCEL_PLAN = plan_json([{"op": "cancel_tasks", "targets": [
+    {"task_id": "T1", "expected_revision": 1}]}], reply_mode="receipts")
+GET_PLAN = plan_json([{"op": "get_task", "target_task_id": "T1"}],
+                     reply_mode="receipts")
+
+rt, ad, st = make_env(tmp, [CREATE_PLAN, CANCEL_PLAN, GET_PLAN])
+rt_ref[0] = rt
+st["can_deliver"] = False            # 结果压在 outbox：交付行尚未创建
+ad.handle_utterance("查一下骑士队的比赛")
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None
+          and rt.store.task_row("s1", "T1")["execution_status"]
+          == C.EXEC_COMPLETED)
+check("19 task completed, result held in outbox", ok)
+ad.handle_utterance("不对，我要查的是湖人队")
+ok = wait(lambda: rt.store.task_row("s1", "T1")["cancel_intent"] == 1)
+check("19b cancel on completed marks retraction", ok)
+ok = wait(lambda: any("刚好已经完成了" in str(x) for x in st["speak_calls"]))
+check("19c cancel receipt speaks already-completed template", ok,
+      str(st["speak_calls"]))
+st["can_deliver"] = True             # 话权放开：被改口的结果必须保持沉默
+time.sleep(0.4)
+for _ in range(6):
+    rt.delivery.pump()
+    time.sleep(0.05)
+check("19d retracted result never delivered",
+      not any("北京晴" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+ad.handle_utterance("骑士队结果怎么样")
+ok = wait(lambda: any("北京晴" in str(x) for x in st["speak_calls"]))
+check("19e explicit get_task re-delivers after retraction", ok,
+      str(st["speak_calls"]))
+check("19f retraction flag cleared by re-delivery",
+      rt.store.task_row("s1", "T1")["cancel_intent"] == 0)
+
 # ==== 场景 9：close 释放 ====================================================
 rt, ad, st = make_env(tmp, [])
 rt.store.ensure_session("s1")
