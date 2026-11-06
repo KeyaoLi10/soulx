@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import requests
 from itertools import groupby
@@ -380,9 +381,12 @@ class AgentControlClient:
 
     MAX_FRAME_BYTES = 1 << 20                # 单帧 1MB 上限
 
-    def __init__(self, endpoint="http://localhost:6007/agent_chat_v2",
-                 timeout_s=30.0):
-        self.endpoint = endpoint
+    # 路由专用实例走 AGENT_CONTROL_ENDPOINT（默认回退主 :6007）
+    DEFAULT_ENDPOINT = os.environ.get(
+        "AGENT_CONTROL_ENDPOINT", "http://localhost:6007/agent_chat_v2")
+
+    def __init__(self, endpoint=None, timeout_s=30.0):
+        self.endpoint = endpoint or self.DEFAULT_ENDPOINT
         self.timeout_s = timeout_s
 
     def _iter_frames(self, response, stop_event=None):

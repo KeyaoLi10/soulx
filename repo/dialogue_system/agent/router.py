@@ -59,8 +59,11 @@ plan_json 必须是一个 JSON 字符串，结构为：
 {"schema_version": 1, "operations": [...], "reply_mode": "direct"|"receipts"|"clarify"|"mixed", "direct_question": null, "clarification": null}
 operations 的每个 op 是 create_task / amend_task / cancel_tasks / rerun_task / get_task / answer_task_question / followup_task / runtime_query / stop_speech 之一；纯闲聊用 reply_mode=direct 且 operations 为空列表。"""
 
-# ---- few-shot（§7.4：12-20 个短例，多任务/否定/引用/同句改口/重跑/
-#      问题回答/已完成未播/澄清）-------------------------------------------
+# ---- few-shot（§7.4 原定 12-20 例；2026-11-06 路由提速砍到 8 对。
+#      被砍例的语义全部由系统提示硬规则覆盖：runtime 状态直读 /
+#      "全部取消"须明确作用域 / mixed 直接问 / 在场确认=direct /
+#      rerun-answer-followup 由"明确重跑必须保留"等规则兜底。
+#      末例（停+建，原 #16）是 2026-11-06 吞句事故例，必须保留）----------
 
 
 def _fs(user: str, plan: dict):
@@ -106,79 +109,23 @@ def _few_shots() -> List[dict]:
     out += _fs("你好呀。",
                {"schema_version": 1, "operations": [],
                 "reply_mode": "direct"})
-    # 5 当前时间 runtime_query
-    out += _fs("现在几点了？",
-               {"schema_version": 1, "operations": [
-                   {"op": "runtime_query", "query": "datetime",
-                    "evidence": {"quote": "现在几点了"}}],
-                "reply_mode": "receipts"})
-    # 6 任务状态追问 get_task
+    # 5 任务状态追问 get_task
     out += _fs("刚才那个查天气的查得怎么样了？",
                {"schema_version": 1, "operations": [
                    {"op": "get_task", "target_task_id": "T1",
                     "evidence": {"quote": "那个查天气的"}}],
                 "reply_mode": "receipts"})
-    # 7 明确重跑
-    out += _fs("不对，重新查一遍，刚才的结果我不信。",
-               {"schema_version": 1, "operations": [
-                   {"op": "rerun_task", "target_task_id": "T1",
-                    "expected_revision": 1,
-                    "refresh_reason": "用户要求重新执行",
-                    "evidence": {"quote": "重新查一遍"}}],
-                "reply_mode": "receipts"})
-    # 8 回答待答问题
-    out += _fs("搜七天的。",
-               {"schema_version": 1, "operations": [
-                   {"op": "answer_task_question", "target_task_id": "T1",
-                    "expected_revision": 1, "question_id": "Q1",
-                    "answer": "七天",
-                    "evidence": {"quote": "搜七天的"}}],
-                "reply_mode": "receipts"})
-    # 9 歧义澄清
+    # 6 歧义澄清
     out += _fs("把那个改一下。",
                {"schema_version": 1, "operations": [],
                 "reply_mode": "clarify",
                 "clarification": "你想改哪一个任务？可以说一下任务的名字。"})
-    # 10 只停发言
+    # 7 只停发言
     out += _fs("停一下停一下。",
                {"schema_version": 1, "operations": [
                    {"op": "stop_speech", "evidence": {"quote": "停一下"}}],
                 "reply_mode": "receipts"})
-    # 11 followup（基于已有结果追加独立分析）
-    out += _fs("在刚才查到的天气基础上，帮我总结一周的穿衣建议。",
-               {"schema_version": 1, "operations": [
-                   {"op": "followup_task", "parent_task_id": "T1",
-                    "parent_revision": 1, "result_ref": "T1:r1",
-                    "local_ref": "L1", "label": "穿衣建议",
-                    "goal": "基于 T1 天气结果总结一周穿衣建议",
-                    "evidence": {"quote": "在刚才查到的天气基础上"}}],
-                "reply_mode": "receipts"})
-    # 12 否定：不要新建（用户撤回意图）
-    out += _fs("算了算了，什么都不用查了，全部取消。",
-               {"schema_version": 1, "operations": [
-                   {"op": "cancel_tasks", "scope": "all_active",
-                    "evidence": {"quote": "全部取消"}}],
-                "reply_mode": "receipts"})
-    # 13 mixed：控制操作 + 直接问题
-    out += _fs("取消那个检索，顺便问一下圆周率是多少？",
-               {"schema_version": 1, "operations": [
-                   {"op": "cancel_tasks", "targets": [
-                       {"task_id": "T1", "expected_revision": 1}],
-                    "evidence": {"quote": "取消那个检索"}}],
-                "reply_mode": "mixed",
-                "direct_question": "圆周率是多少？"})
-    # 14 已完成未播任务追问
-    out += _fs("刚才算的那个结果再说一遍。",
-               {"schema_version": 1, "operations": [
-                   {"op": "get_task", "target_task_id": "T3",
-                    "evidence": {"quote": "刚才算的那个"}}],
-                "reply_mode": "receipts"})
-    # 15 在场确认/催促 ≠ 任务追问（2026-11-06 enforce 实测：连续多轮把
-    # 历史句当证据引到 get_task 上——哪怕快照里有终态任务也不追）
-    out += _fs("喂，你听得到吗？",
-               {"schema_version": 1, "operations": [],
-                "reply_mode": "direct"})
-    # 16 同句"停一下"+新要求：两个都要处理（2026-11-06 enforce 实测：
+    # 8 同句"停一下"+新要求：两个都要处理（2026-11-06 enforce 实测：
     # "等一下等一下……我想看看湖人最近一场比赛"被路由成只出 stop_speech，
     # 同句查询被整个吞掉 → 长无声）
     out += _fs("等一下等一下，我想看看湖人最近一场比赛的情况怎么样。",
@@ -282,10 +229,11 @@ class RouteResult:
 
 class PlanRouter:
     """控制轮路由器。transport 注入点供离线测试；生产默认
-    AgentControlClient(/agent_chat_v2)。"""
+    AgentControlClient(/agent_chat_v2)。endpoint=None 时由客户端按
+    AGENT_CONTROL_ENDPOINT 环境变量解析（默认主 :6007）。"""
 
     def __init__(self, transport: Optional[Callable] = None,
-                 endpoint: str = "http://localhost:6007/agent_chat_v2",
+                 endpoint: Optional[str] = None,
                  timeout_s: float = 30.0,
                  max_history_turns: int = 6,
                  repair_attempts: int = 1):

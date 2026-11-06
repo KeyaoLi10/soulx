@@ -239,7 +239,7 @@ check("B2 system prompt first", msg[0]["role"] == "system"
 fs_user = [m for m in msg if m["role"] == "user"
            and "查一下北京明天的天气" in m["content"]]
 check("B3 few-shots present (multi-task example)",
-      bool(fs_user) and len(FEW_SHOTS) >= 24)
+      bool(fs_user) and len(FEW_SHOTS) == 16)  # 8 对（2026-11-06 提速砍半）
 last = msg[-1]
 check("B4 snapshot + user text in final message",
       last["role"] == "user" and '"task"' not in last["content"][:1]
