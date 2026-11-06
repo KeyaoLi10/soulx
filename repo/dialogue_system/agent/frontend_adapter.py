@@ -15,6 +15,9 @@
   generate_fn(stop_event) -> segment 生成器
                                 表达轮（direct/mixed 的 direct_question）
   history_fn()        -> [{role, content}]   最近对话（喂路由快照）
+  release_gen_fn(gen_sn) -> None  释放收音循环 commit 时置位的
+                                gen_in_progress（enforce 无声轮兜底，
+                                gen_serial 已变时为 no-op）
 
 三种模式（§19 发布开关）：
   legacy  —— adapter 完全不参与（app 侧根本不创建）
@@ -39,6 +42,9 @@ logger = logging.getLogger(__name__)
 GRACE_POLL_S = 0.05
 # 路由失败时的固定澄清话术（§6.2：超时/失败必须有终态并释放队列）
 ROUTER_FAIL_TEXT = "这个我一时没理清要做什么，你能再说一遍吗？"
+# 无声兜底（2026-11-06 listening 卡死事故家族）：receipts 模式提交了计划
+# 却一个字都没上口（模板空洞，如列表查询）——控制轮绝不能无声结束。
+SILENT_TURN_ACK_TEXT = "好的。"
 
 
 class AgentFrontendAdapter:
@@ -53,10 +59,17 @@ class AgentFrontendAdapter:
                  mode: str = "shadow",
                  grace_poll_s: float = GRACE_POLL_S,
                  shadow_idle_wait_s: float = 30.0,
-                 on_event: Optional[Callable] = None):
+                 on_event: Optional[Callable] = None,
+                 release_gen_fn: Optional[Callable[[int], None]] = None):
         """runtime: AgentRuntimeV2；router: PlanRouter；snapshot_builder:
         (user_text, request_id, history) -> snapshot dict（agent.context）。
-        on_event(event, data)：前端任务面板等 UI 通知（可选）。"""
+        on_event(event, data)：前端任务面板等 UI 通知（可选）。
+        release_gen_fn(gen_sn)：释放收音循环在 turn commit 时置位的
+        gen_in_progress（app._end_generation，gen_serial 不匹配时为 no-op）。
+        enforce 轮的生命周期跨越路由(~5s)到上口结束，期间标志由本 worker
+        持有；worker 结束（含无声轮）必须释放，否则 gen_in_progress 永久
+        True，后台交付被 _agent_can_deliver 永久拒绝（2026-11-06 事故）。
+        """
         self.session_id = session_id
         self.runtime = runtime
         self.router = router
@@ -71,6 +84,7 @@ class AgentFrontendAdapter:
         self.grace_poll_s = grace_poll_s
         self.shadow_idle_wait_s = shadow_idle_wait_s
         self.on_event = on_event
+        self.release_gen_fn = release_gen_fn
         self._utterance_lock = threading.Lock()   # 串行化 utterance 处理
         self._stop = threading.Event()
         # 当前挂起的控制轮线程（一次只有一个；新话轮到来时旧线程自行退出）
@@ -138,9 +152,15 @@ class AgentFrontendAdapter:
     # ------------------------------------------------------------------ enforce
 
     def handle_utterance(self, text: str, turn_trigger: str = "",
-                         source_commit_id: Optional[str] = None):
+                         source_commit_id: Optional[str] = None,
+                         gen_sn: Optional[int] = None):
         """enforce 模式：V2 控制器接管本轮控制决策。app 在 ASR 文本确定、
         自回声过滤与话轮门之后调用；不阻塞收音线程（路由在后台跑）。
+
+        gen_sn：收音循环在 commit 时 _begin_generation 返回的序号——
+        本 worker 全权负责它的释放（上口会 bump 序号自行清理，无声轮
+        在 finally 里释放；被更新的话轮取代时 gen_serial 已变，释放
+        自然成为 no-op）。
 
         流程（§6/§7）：
           1. 上一话轮的计划还没过 grace 门 → 作废（续说场景，§6.2）
@@ -159,17 +179,34 @@ class AgentFrontendAdapter:
         th = threading.Thread(
             target=self._turn_worker, daemon=True,
             name=f"agent-v2-turn-{self.session_id[:8]}",
-            args=(text, turn_trigger, source_commit_id))
+            args=(text, turn_trigger, source_commit_id, gen_sn))
         self._active_turn = {"thread": th, "abandoned": False}
         th.start()
 
-    def _turn_worker(self, text, turn_trigger, source_commit_id):
+    def _release_gen(self, gen_sn):
+        """释放 commit 时置位的 gen_in_progress（无声轮/被取代轮）。
+        绝不抛出——释放失败也不能拖垮 worker 收尾。"""
+        if gen_sn is None or self.release_gen_fn is None:
+            return
+        try:
+            self.release_gen_fn(gen_sn)
+        except Exception:  # noqa: BLE001
+            logger.exception("[%s][v2] gen flag release failed",
+                             self.session_id[:8])
+
+    def _turn_worker(self, text, turn_trigger, source_commit_id, gen_sn):
         try:
             self._turn_worker_inner(text, turn_trigger, source_commit_id)
         except Exception:  # noqa: BLE001 — 控制轮失败必须落到固定澄清话术
             logger.exception("[%s][v2] turn worker crashed",
                              self.session_id[:8])
             self._speak_safe(ROUTER_FAIL_TEXT)
+        finally:
+            # commit 时收音循环置位的 gen_in_progress 由本 worker 释放：
+            # 上口轮的 _speak 已 bump gen_serial 自行清理（此处 no-op），
+            # 无声轮若不释放则标志永久 True → 后台交付被永久拒绝
+            # （2026-11-06 listening 卡死事故的致命一环）。
+            self._release_gen(gen_sn)
 
     def _turn_worker_inner(self, text, turn_trigger, source_commit_id):
         res = self.runtime.submit_request(
@@ -204,9 +241,15 @@ class AgentFrontendAdapter:
         for receipt_text in out.get("texts") or []:
             if not self._speak_safe(receipt_text):
                 return   # 打断即终态，本轮后续回执不再上口
+        plan = out.get("plan")
+        # 澄清话术（clarify 模式）：路由没听懂时要问的问题也是控制轮的
+        # 终态，必须上口——漏掉就是无声轮（2026-11-06 事故家族）
+        if (plan is not None and plan.reply_mode == "clarify"
+                and plan.clarification):
+            self._speak_safe(plan.clarification)
+            return
         # 表达轮：direct/mixed 的 direct_question 走正常生成（§7.3：不能
         # 因为本轮有一个控制操作就吞掉另一个问题）
-        plan = out.get("plan")
         if (self.generate_fn is not None and plan is not None
                 and plan.reply_mode in ("direct", "mixed")
                 and (plan.direct_question or plan.reply_mode == "direct")):
@@ -219,6 +262,14 @@ class AgentFrontendAdapter:
             except Exception:  # noqa: BLE001
                 logger.exception("[%s][v2] expression round failed",
                                  self.session_id[:8])
+            return
+        # 无声兜底：计划已提交却一个字都没上口（模板空洞，如列表查询）。
+        # stop_speech 除外——它的回执就是安静本身，再说一个字就自相矛盾。
+        if not (out.get("texts") or []):
+            ops = [getattr(o, "op", "") for o in
+                   (plan.operations if plan is not None else [])]
+            if "stop_speech" not in ops:
+                self._speak_safe(SILENT_TURN_ACK_TEXT)
 
     def _speak_safe(self, text) -> bool:
         """单条固定话术上口。返回是否完整播出（False/None 都不算）。"""

@@ -388,6 +388,30 @@ def receipt_text(receipt: Receipt, label: str = "") -> str:
     """受控回执话术。label 必须来自经过校验的任务名（runtime 传入），
     模板外的内容不进 TTS。"""
     name = label or receipt.task_id or "这个任务"
+    if receipt.outcome == RC_INFO:
+        # 只读查询（get_task）也必须有可播报终态——2026-11-06 listening
+        # 卡死事故：路由把"你还没说完呢"判成 get_task+receipts，RC_INFO
+        # 无模板 → 空回执 + receipts 模式不走表达轮 → 整轮无声，且收音
+        # 循环 commit 时置位的 gen_in_progress 无人清除（见 app.py
+        # _end_generation），系统看起来彻底"卡死"。stop_speech 的回执就
+        # 是安静本身；列表查询（无 target）没有单任务态，交给 adapter 的
+        # 无声兜底。
+        if receipt.op != "get_task" or not receipt.current_state:
+            return ""
+        state = receipt.current_state
+        if state in (EXEC_QUEUED, EXEC_RUNNING):
+            return f"{name}还在进行中，结果出来我就告诉你。"
+        if state == EXEC_CANCEL_REQUESTED:
+            return f"{name}正在停止。"
+        if state == EXEC_WAITING_INPUT:
+            return f"{name}还差一点信息，稍后我会来问你。"
+        if state == EXEC_COMPLETED:
+            return f"{name}已经完成了。"
+        if state == EXEC_FAILED:
+            return f"{name}没有完成，需要的话我换个方式再试。"
+        if state == EXEC_CANCELED:
+            return f"{name}已经取消了。"
+        return f"{name}的状态我确认过了。"
     if receipt.outcome == RC_ACCEPTED:
         return f"{name}已经安排好了，稍后告诉你结果。"
     if receipt.outcome == RC_UPDATED:

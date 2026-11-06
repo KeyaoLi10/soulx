@@ -505,6 +505,23 @@ def _begin_generation(session) -> int:
         return session.gen_serial
 
 
+def _end_generation(session, gen_sn):
+    """Release a commit-time gen flag. No-op when a newer generation began
+    (gen_serial moved on — an interrupted older turn must not clear the
+    flag out from under its replacement). Every turn that will NOT run a
+    generation must release its commit-time flag: the enforce-mode V2
+    turn worker holds it across routing (~5 s) and releases it in its
+    finally (2026-11-06 listening 卡死事故: a receipts-mode turn that
+    spoke nothing left gen_in_progress latched True forever, so
+    _agent_can_deliver rejected every background delivery — T2's result
+    retried 458 times — and the UI sat in LISTENING with no reply)."""
+    if gen_sn is None:
+        return
+    with session.lock:
+        if session.gen_serial == gen_sn:
+            session.gen_in_progress = False
+
+
 def _reply_in_flight(session):
     """Is a reply pending or playing? BOTH phases, not just playback:
     generation (turn committed, LLM/TTS streaming, gen_in_progress —
@@ -1112,6 +1129,7 @@ def _make_agent_v2(session, client_id, mode=None):
         last_voice_ts_fn=lambda: session.last_voice_ts,
         speak_fn=_speak,
         can_deliver_fn=lambda: _agent_can_deliver(session),
+        release_gen_fn=lambda sn: _end_generation(session, sn),
         generate_fn=lambda stop_event: llm.generate_with_history(
             client_id,
             stop_event=stop_event,
@@ -1219,6 +1237,8 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
             asr_text = asr.recognize(audio_segment, sample_rate)
 
         if not asr_text.strip():
+            # nothing will run for this turn — release the commit-time flag
+            _end_generation(session, gen_sn)
             return
 
         # Playback self-talk drop (2026-11-02 幻影话轮修复): with the pvad
@@ -1263,6 +1283,10 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
                 f"[{client_id}] self-talk turn dropped during playback "
                 f"(pvad off): {asr_text[:40]!r}"
             )
+            # dropped turn: no generation will run — release the
+            # commit-time flag (it would otherwise latch until the next
+            # real turn, blocking background delivery the whole time)
+            _end_generation(session, gen_sn)
             return
 
         # Main-speaker gate, AFTER ASR: the self-talk check needs the
@@ -1270,6 +1294,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         # for free. A rejected turn must not interrupt the ongoing
         # playback, touch LLM history, or cost any LLM/TTS work.
         if not pvad_turn_gate(session, asr_text):
+            _end_generation(session, gen_sn)
             return
         if pvad_enabled(session):
             pvad_maybe_auto_enroll(session)
@@ -1294,6 +1319,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         current_stop_event = session.stop_event
 
         if current_stop_event.is_set():
+            _end_generation(session, gen_sn)
             return
 
         logger.info(
@@ -1361,7 +1387,10 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         if (v2_mode == "enforce" and settings.get("agent_enabled")):
             # V2 控制器接管本轮控制决策：路由（grace 门后提交）、模板回执
             # 上口、表达轮，全部由 adapter 后台驱动；本 worker 不再启动
-            # legacy 生成。gen_in_progress 尚未置位，无需清理。
+            # legacy 生成。commit 时置位的 gen_in_progress 移交给 V2 turn
+            # worker（gen_sn）：上口轮由 _speak 的 begin/finally 自行清理，
+            # 无声轮在其 finally 释放——绝不能留在本函数里不管（2026-11-06
+            # listening 卡死事故：标志永久 True → 后台交付被永久拒绝）。
             adapter = _ensure_agent_v2(session, client_id, "enforce")
             if adapter is not None and _legacy_runtime_idle(session):
                 # 懒建于 shadow 的 V2 后台线程未启动——接管前补启动
@@ -1369,7 +1398,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
                 adapter.runtime.start_background()
                 adapter.handle_utterance(
                     asr_text, turn_trigger=turn_trigger or "",
-                    source_commit_id=commit_id)
+                    source_commit_id=commit_id, gen_sn=gen_sn)
                 return
             if adapter is not None:
                 # legacy 还有在跑/待交付的后台任务：本轮仍走 legacy 生成
@@ -1492,6 +1521,12 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
                     session.gen_in_progress = False
 
     except Exception as e:
+        # the turn died before any generation ran — release the
+        # commit-time flag (no-op if a newer generation already began)
+        try:
+            _end_generation(session, gen_sn)
+        except Exception:  # noqa: BLE001
+            pass
         logger.error(f"Error in pipeline for {client_id}: {e}", exc_info=True)
 
 

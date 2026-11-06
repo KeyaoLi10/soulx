@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "repo" / "dialogue_system"))
 from agent import contracts as C  # noqa: E402
 from agent import slow_brain as SB  # noqa: E402
 from agent.frontend_adapter import (ROUTER_FAIL_TEXT,  # noqa: E402
+                                    SILENT_TURN_ACK_TEXT,
                                     AgentFrontendAdapter)
 from agent.router import PlanRouter  # noqa: E402
 from agent.runtime import AgentRuntimeV2  # noqa: E402
@@ -63,7 +64,7 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
     state = {
         "speak_calls": [], "gen_calls": [], "router_calls": 0,
         "grace_open": grace_open, "can_deliver": can_deliver,
-        "grace_s": 0.0, "last_voice_ts": 0.0,
+        "grace_s": 0.0, "last_voice_ts": 0.0, "gen_releases": [],
     }
     plans = list(router_plans)
     lock = threading.Lock()
@@ -122,6 +123,7 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
         can_deliver_fn=lambda: state["can_deliver"],
         generate_fn=lambda stop_event: iter(["你好呀，我是表达轮。"]),
         history_fn=lambda: [{"role": "user", "content": "hi"}],
+        release_gen_fn=lambda sn: state["gen_releases"].append(sn),
         mode="enforce")
     rt_ref[0] = rt
     return rt, adapter, state
@@ -252,6 +254,89 @@ check("8 mixed mode speaks control receipt", ok, str(st["speak_calls"]))
 ok = wait(lambda: any("表达轮" in str(x) for x in st["speak_calls"]))
 check("8b mixed mode does not swallow the question (expression round)",
       ok, str(st["speak_calls"]))
+
+# ==== 场景 10：get_task 状态回执上口（RC_INFO 模板，2026-11-06 事故）=====
+rt, ad, st = make_env(tmp, [
+    plan_json([{"op": "get_task", "target_task_id": "T1"}],
+              reply_mode="receipts")])
+rt_ref[0] = rt
+# 先造一个 T1（commit 后处于 queued）
+pre = C.parse_plan(CREATE_PLAN)
+rt.store.ensure_session("s1")
+rt.store.commit_plan("s1", "R0", pre, plan_version=1)
+ad.handle_utterance("那个天气查得怎么样了", gen_sn=100)
+ok = wait(lambda: any("还在进行中" in str(x) or "已经完成了" in str(x)
+                      for x in st["speak_calls"]))
+check("10 get_task status receipt spoken (RC_INFO template)",
+      ok, str(st["speak_calls"]))
+check("10b gen flag released after status turn",
+      100 in st["gen_releases"], str(st["gen_releases"]))
+
+# 10c：任务跑完后 get_task → "已经完成了"
+ok = wait(lambda: rt.store.task_row("s1", "T1")["execution_status"]
+          == C.EXEC_COMPLETED)
+check("10c T1 completed after scheduler", ok)
+rt, ad, st = make_env(tmp, [
+    plan_json([{"op": "get_task", "target_task_id": "T1"}],
+              reply_mode="receipts")])
+rt_ref[0] = rt
+rt.store.ensure_session("s1")
+pre = C.parse_plan(CREATE_PLAN)
+rt.store.commit_plan("s1", "R0", pre, plan_version=1)
+# 手动把 T1 推到 completed（不经 runner）
+rt.store._conn.execute(
+    "UPDATE tasks SET execution_status='completed' "
+    "WHERE session_id='s1' AND task_id='T1'")
+rt.store._conn.commit()
+ad.handle_utterance("好了吗")
+ok = wait(lambda: any("已经完成了" in str(x) for x in st["speak_calls"]))
+check("10d get_task on completed speaks done template",
+      ok, str(st["speak_calls"]))
+
+# ==== 场景 11：clarify 模式——澄清问题必须上口 ==============================
+rt, ad, st = make_env(tmp, [
+    plan_json([], reply_mode="clarify", clarification="你想查哪个城市？")])
+rt_ref[0] = rt
+ad.handle_utterance("帮我查天气")
+ok = wait(lambda: any("你想查哪个城市" in str(x) for x in st["speak_calls"]))
+check("11 clarify mode speaks the clarification",
+      ok, str(st["speak_calls"]))
+
+# ==== 场景 12：无声兜底与 stop_speech 豁免 ==================================
+# runtime_query（RC_INFO 无模板）+ receipts → 兜底话术，绝不能无声
+rt, ad, st = make_env(tmp, [
+    plan_json([{"op": "runtime_query", "query": "datetime"}],
+              reply_mode="receipts")])
+rt_ref[0] = rt
+ad.handle_utterance("现在几点了", gen_sn=200)
+ok = wait(lambda: st["speak_calls"] != [])
+check("12 template-hole receipts turn speaks fallback ack",
+      ok and st["speak_calls"][0] == SILENT_TURN_ACK_TEXT,
+      str(st["speak_calls"]))
+check("12b gen flag released on silent-fallback turn",
+      200 in st["gen_releases"], str(st["gen_releases"]))
+
+# stop_speech-only：回执就是安静本身，兜底不得打破
+rt, ad, st = make_env(tmp, [
+    plan_json([{"op": "stop_speech"}], reply_mode="receipts")])
+rt_ref[0] = rt
+ad.handle_utterance("别说了", gen_sn=300)
+ok = wait(lambda: 300 in st["gen_releases"])
+check("12c stop_speech-only turn releases gen flag", ok,
+      str(st["gen_releases"]))
+check("12d stop_speech-only turn stays silent (no fallback)",
+      st["speak_calls"] == [], str(st["speak_calls"]))
+
+# ==== 场景 13：上口轮也释放 gen_sn（_speak 已 bump 序号，释放为 no-op 语义
+# 由 app 侧 gen_serial 保证；adapter 侧只验证 finally 一定回调） ============
+rt, ad, st = make_env(tmp, [DIRECT_PLAN])
+rt_ref[0] = rt
+ad.handle_utterance("你好呀", gen_sn=400)
+ok = wait(lambda: any("表达轮" in str(x) for x in st["speak_calls"]))
+check("13 speaking turn runs expression round", ok, str(st["speak_calls"]))
+ok = wait(lambda: 400 in st["gen_releases"])
+check("13b speaking turn releases gen flag in finally", ok,
+      str(st["gen_releases"]))
 
 for r in [r for r in [rt] if r]:
     pass
