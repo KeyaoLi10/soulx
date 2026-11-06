@@ -38,11 +38,22 @@ grace 提交门（§6.1）：计划在 grace 窗口内只挂起；窗口内续�
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# 纯应答/附和：整句只由应答词构成（"嗯""好的好的""对"……）。这类话永远
+# 不承载控制意图，但只在上一话轮还活着（路由在飞/计划挂起）时吸收——
+# 不作废挂起计划、不再起一路路由、不另起闲聊路。2026-11-06 实测事故：
+# 天气请求路由 6.3s 期间用户一句"嗯，好的好的"把成果作废重来，连环
+# 重路由四次，任务 25s 后才创建、UI 面板迟迟不出现。注意"停"绝不能
+# 入表——"你停停停"是控制意图，必须照常走路由。
+_ACK_RE = re.compile(
+    r"^[嗯呃啊哦噢诶哎唉呀哟呦哈嘿好的对是行呢吧的了嘛呗"
+    r"\s，。？！、,.?!…]+$")
 
 # 提交门轮询间隔（秒）。只读时间戳，无锁竞争。
 GRACE_POLL_S = 0.05
@@ -235,6 +246,16 @@ class AgentFrontendAdapter:
             turn_seq = self._turn_seq
             prev_turn = self._active_turn
             prev = prev_turn.get("thread")
+            prev_alive = prev is not None and prev.is_alive()
+            # 纯应答吸收（_ACK_RE 注释）：上一轮还活着时一句"嗯/好的"
+            # 既不作废其挂起计划也不重路由。上一轮已结束（空闲）时照常
+            # 走完整路径——孤零零一句应答也该有人接话。
+            if (text.strip() and _ACK_RE.match(text.strip())
+                    and (prev_alive
+                         or self.runtime.pending_exists(self.session_id))):
+                logger.info("[%s][v2] pure ack absorbed (prev turn alive): "
+                            "%s", self.session_id[:8], text)
+                return
             if (prev is not None and prev.is_alive()
                     and not prev_turn.get("committed")):
                 # 上一计划未提交：续说作废（§6.2 旧计划作废，重新路由）。
@@ -271,6 +292,34 @@ class AgentFrontendAdapter:
         turn["thread"] = th
         self._active_turn = turn
         th.start()
+
+    def user_stop(self):
+        """用户手动停止（duplex_stop）：掐当前闲聊路、作废旧轮、作废挂起
+        计划、停后台交付泵。不动 store——会话还活着，用户下一句话照常
+        接管（handle_utterance 每 turn 都会 start_background 幂等补启动）。
+        2026-11-06 实测事故：手动停止后闲聊路仍把生成完的整段播完、交付
+        泵还在等下一个空隙补播结果——用户听感是"停不下来"。"""
+        with self._utterance_lock:
+            turn = self._active_turn
+            turn["abandoned"] = True
+            stop = turn.get("chitchat_stop")
+            if stop is not None:
+                stop.set()
+        try:
+            self.runtime.discard_pending(self.session_id, reason="user_stop")
+        except Exception:  # noqa: BLE001
+            logger.exception("[%s][v2] user_stop discard failed",
+                             self.session_id[:8])
+        try:
+            # 只停泵不关 store（stop_background 会 store.close，会话还
+            # 要继续用）；下一话轮 start_background 幂等重启
+            self.runtime.scheduler.stop()
+            self.runtime.delivery.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("[%s][v2] user_stop pump stop failed",
+                             self.session_id[:8])
+        logger.info("[%s][v2] user stop: chitchat cut, pending discarded, "
+                    "delivery pump stopped", self.session_id[:8])
 
     def _release_gen(self, gen_sn):
         """释放 commit 时置位的 gen_in_progress（无声轮/被取代轮）。

@@ -752,6 +752,64 @@ check("25b abandoned turn's chitchat never speaks (only new turn's)",
 check("25c abandoned turn's plan never commits",
       _committed_count(rt) == 1, str(_committed_count(rt)))
 
+# 26 纯应答吸收：路由在飞时一句"嗯，好的好的"不作废挂起计划、不触发
+# 重路由、不另起闲聊路（2026-11-06 实测：天气计划被应答作废，连环重
+# 路由四次，任务 25s 才创建）；空闲时的应答照常走完整路径
+chitchat_starts = {"n": 0}
+
+
+def _counting_chitchat(stop_event):
+    chitchat_starts["n"] += 1
+    return iter(["好，我去查一下。"])
+
+
+def _slow_create26():
+    time.sleep(0.3)
+    return CREATE_PLAN
+
+
+rt, ad, st = make_env(tmp, [_slow_create26], chitchat_impl=_counting_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")
+time.sleep(0.05)
+ad.handle_utterance("嗯，好的好的。")     # 路由在飞期间的纯应答 → 吸收
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
+check("26 ack does not discard pending plan (task still created)", ok)
+check("26b ack triggers no re-route",
+      st["router_calls"] == 1, str(st["router_calls"]))
+check("26c ack starts no second chitchat lane",
+      chitchat_starts["n"] == 1, str(chitchat_starts["n"]))
+time.sleep(0.4)                          # 上一轮结束后空闲
+ad.handle_utterance("好的。")             # 空闲应答 → 正常路径
+ok = wait(lambda: st["router_calls"] == 2)
+check("26d idle ack routes normally", ok, str(st["router_calls"]))
+
+# 27 手动停止（duplex_stop）：掐闲聊路、作废挂起计划、停交付泵——
+# 停止后一个字都不再出（2026-11-06 实测：停止后闲聊路仍播完整段）
+def _slow_create27():
+    time.sleep(0.3)
+    return CREATE_PLAN
+
+
+gate27 = threading.Event()
+rt, ad, st = make_env(tmp, [_slow_create27],
+                      chitchat_impl=_make_gated_chitchat(gate27))
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")
+time.sleep(0.05)
+ad.user_stop()
+gate27.set()                             # 停止后放行：生成器应已被掐
+time.sleep(0.3)
+check("27 user stop cuts chitchat lane",
+      not any("诶怎么了" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+check("27b plan never commits after user stop",
+      _committed_count(rt) == 0, str(_committed_count(rt)))
+check("27c scheduler pump stopped",
+      rt.scheduler._thread is None or not rt.scheduler._thread.is_alive())
+check("27d delivery pump stopped",
+      rt.delivery._thread is None or not rt.delivery._thread.is_alive())
+
 # ==== 场景 9：close 释放 ====================================================
 rt, ad, st = make_env(tmp, [])
 rt.store.ensure_session("s1")

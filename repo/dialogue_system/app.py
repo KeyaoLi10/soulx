@@ -2069,6 +2069,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         session.cut_pending_audio()
                         session.stop_event.set()
                         session.reset_interrupt()
+                        # V2 接入层同步收口：掐闲聊路、作废挂起计划、停
+                        # 交付泵——否则手动停止后闲聊路仍播完整段、交付
+                        # 泵还在等空隙补播（2026-11-06 实测"停不下来"）
+                        adapter_v2 = getattr(session, "agent_v2", None)
+                        if (adapter_v2 is not None
+                                and adapter_v2.mode == "enforce"):
+                            adapter_v2.user_stop()
                         logger.info(f"Session manually stopped by client: {client_id}")
 
                     elif event == "pvad_enroll":
