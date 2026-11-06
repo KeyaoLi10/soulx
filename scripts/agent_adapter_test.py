@@ -338,6 +338,65 @@ ok = wait(lambda: 400 in st["gen_releases"])
 check("13b speaking turn releases gen flag in finally", ok,
       str(st["gen_releases"]))
 
+# ==== 场景 14：get_task 重播——交付被打断的结果再说一遍（2026-11-06
+# 待办：outbox 重入语义）====================================================
+GET_TASK = plan_json([{"op": "get_task", "target_task_id": "T1"}],
+                     reply_mode="receipts")
+rt, ad, st = make_env(tmp, [GET_TASK, GET_TASK, GET_TASK])
+rt_ref[0] = rt
+rt.store.ensure_session("s1")
+rt.store.commit_plan("s1", "R0", C.parse_plan(CREATE_PLAN), plan_version=1)
+ok = wait(lambda: rt.store.task_row("s1", "T1")["execution_status"]
+          == C.EXEC_COMPLETED
+          and any("北京晴" == x for x in st["speak_calls"]))
+check("14 T1 completed and first delivery played", ok,
+      str(st["speak_calls"]))
+# 模拟"播出后被用户打断"：交付终态改 interrupted_partial（outbox 已 done）
+dlv_row = rt.store._conn.execute(
+    "SELECT delivery_id FROM deliveries WHERE session_id='s1' AND "
+    "kind='result' AND task_id='T1'").fetchone()
+rt.store._conn.execute(
+    "UPDATE deliveries SET state='interrupted_partial' WHERE delivery_id=?",
+    (dlv_row["delivery_id"],))
+rt.store._conn.commit()
+ad.handle_utterance("你还没说完呢")
+ok = wait(lambda: any("我再说一遍结果" in str(x) for x in st["speak_calls"]))
+check("14b interrupted delivery → get_task says redelivering receipt",
+      ok, str(st["speak_calls"]))
+ok = wait(lambda: st["speak_calls"].count("北京晴") >= 2)
+check("14c result re-spoken via re-enqueued outbox", ok,
+      str(st["speak_calls"]))
+ok = wait(lambda: (rt.store.delivery_row(dlv_row["delivery_id"])
+                   or {"state": ""})["state"] == C.DLV_PLAYED_CONFIRMED)
+check("14d reopened delivery reaches played_confirmed again", ok)
+
+# 14e：已完整听到（played_confirmed）→ 只报状态，不重播
+ad.handle_utterance("那个天气的结果是什么来着")
+ok = wait(lambda: sum("已经完成了" in str(x) for x in st["speak_calls"]) >= 1)
+check("14e heard-before task → plain done receipt", ok,
+      str(st["speak_calls"]))
+time.sleep(0.4)
+check("14f no re-delivery after plain receipt",
+      st["speak_calls"].count("北京晴") == 2, str(st["speak_calls"]))
+
+# 14g：交付在途（outbox pending）→ 不重复重排
+rt.store._conn.execute(
+    "UPDATE deliveries SET state='interrupted_partial' WHERE delivery_id=?",
+    (dlv_row["delivery_id"],))
+rt.store._conn.commit()
+rt.store.enqueue_outbox("s1", "deliver", {
+    "kind": "result", "task_id": "T1", "revision": 1, "run_id": "run-x",
+    "outcome": C.EXEC_COMPLETED, "summary": "北京晴",
+    "payload": {"summary": "北京晴"}})
+n_before = rt.store._conn.execute(
+    "SELECT COUNT(*) c FROM outbox WHERE kind='deliver'").fetchone()["c"]
+ad.handle_utterance("好了吗")
+ok = wait(lambda: any("已经完成了" in str(x) for x in st["speak_calls"]))
+n_after = rt.store._conn.execute(
+    "SELECT COUNT(*) c FROM outbox WHERE kind='deliver'").fetchone()["c"]
+check("14g in-flight delivery not double-enqueued",
+      ok and n_before == n_after, f"{n_before} -> {n_after}")
+
 for r in [r for r in [rt] if r]:
     pass
 

@@ -321,6 +321,40 @@ check("B14 history trimmed to 6",
       any("u9" in c for c in sent_users)
       and not any("u0" in c and len(c) == 2 for c in sent_users))
 
+# B15 证据引用接地（2026-11-06 enforce 实测：连续多轮引用同一句历史话）
+STALE_PLAN = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "get_task", "target_task_id": "T1",
+         "evidence": {"quote": "你刚刚北京天气的播报，你还没说完呢"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+GROUNDED_GET = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "get_task", "target_task_id": "T1",
+         "evidence": {"quote": "天气怎么样了"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+tr, calls = _mk_transport([_tool_call_result(STALE_PLAN),
+                           _tool_call_result(GROUNDED_GET)])
+rr = PlanRouter(transport=tr).route(SNAP, "那个天气怎么样了？")
+check("B15 stale-quote plan repaired to grounded",
+      rr.ok and rr.attempts == 2, rr.to_log())
+note = calls[1]["messages"][-1]
+check("B15b grounding note carries current utterance and stale quote",
+      note["role"] == "user" and "那个天气怎么样了？" in note["content"]
+      and "还没说完呢" in note["content"], note["content"][:80])
+
+# B16 持续不接地 → 终态拒绝（把闲聊轮错路由成任务轮比拒绝更糟）
+tr, calls = _mk_transport([_tool_call_result(STALE_PLAN),
+                           _tool_call_result(STALE_PLAN)])
+rr = PlanRouter(transport=tr).route(SNAP, "喂，你听得到吗？")
+check("B16 persistent ungrounded quote terminal",
+      not rr.ok and "not grounded" in rr.error and rr.attempts == 2,
+      rr.to_log())
+
+# B17 标点差异不影响接地（归一化后子串匹配）
+tr, calls = _mk_transport([_tool_call_result(GROUNDED_GET)])
+rr = PlanRouter(transport=tr).route(SNAP, "那个，天气怎么样了？！")
+check("B17 punctuation-tolerant grounding", rr.ok, rr.to_log())
+
 # ==== C. context.build_router_snapshot ======================================
 
 tmp = tempfile.mkdtemp(prefix="agent_router_ctx_")

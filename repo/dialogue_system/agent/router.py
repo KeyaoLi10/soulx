@@ -8,6 +8,7 @@ length 截断 / 协议错误一律不提交，最多一次格式修复后给出�
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
@@ -45,6 +46,9 @@ ROUTER_SYSTEM_PROMPT = """你是对话系统的控制路由器。本轮只调用
 "停一下"优先表示停止当前发言，除非上下文明确是在取消一个后台任务。
 "全部取消"必须有明确作用域；"那个取消"存在多个合理候选时澄清。
 不得根据"最近完成"自行改变用户话题焦点。
+evidence.quote 必须是本轮用户原文的连续片段，绝不能引用历史对话、任务名或你自己的话。
+"你在吗/你听得到吗/喂"这类确认在场或催促的话是闲聊：reply_mode=direct 且 operations 为空列表，不要当成任务追问。
+get_task 只在本轮原文确实在问任务的状态或结果时使用。
 runtime 能直接读取的状态和时间不用委派。
 需要外部事实、工具或长工作时创建/继续任务；不可编造执行结果。
 没有真实工具结果，不得把"我已经查到"当作事实。
@@ -167,6 +171,11 @@ def _few_shots() -> List[dict]:
                    {"op": "get_task", "target_task_id": "T3",
                     "evidence": {"quote": "刚才算的那个"}}],
                 "reply_mode": "receipts"})
+    # 15 在场确认/催促 ≠ 任务追问（2026-11-06 enforce 实测：连续多轮把
+    # 历史句当证据引到 get_task 上——哪怕快照里有终态任务也不追）
+    out += _fs("喂，你听得到吗？",
+               {"schema_version": 1, "operations": [],
+                "reply_mode": "direct"})
     return out
 
 
@@ -178,6 +187,34 @@ _REPAIR_NOTE = (
     "上一轮没有产出可提交的完整计划（{err}）。重新调用 route_turn，"
     "plan_json 必须是符合 schema_version 1 的 JSON 字符串；不要输出"
     "解释文字。")
+
+# 接地修复提示：证据引用锚到了历史句（2026-11-06 enforce 实测事故：
+# 连续多轮 route 都引用同一句旧话，温度 0 下锚定死锁）
+_GROUNDING_NOTE = (
+    "上一轮计划的证据引用 {quote} 不在本轮用户原文里——"
+    "evidence.quote 只能摘自本轮用户原文的连续片段，绝不能引用历史"
+    "对话、任务名或你自己的话。本轮用户原文是：{text}\n重新调用 "
+    "route_turn；如果本轮没有提到任何任务或操作，用 reply_mode="
+    "direct 且 operations 为空列表。")
+
+# 引用接地归一化：忽略空白与常见中英文标点（ASR 断句差异）
+_NORM_RE = re.compile(r"[\s，。？！,.?!、·\"'“”‘’…（）()【】\[\]]")
+
+
+def _norm_text(s: str) -> str:
+    return _NORM_RE.sub("", s or "")
+
+
+def _ungrounded_quote(plan: C.Plan, user_text: str):
+    """返回第一条未锚定在本轮用户原文上的证据引用（None=全部锚定）。
+    手册 §7.4：quote 是本轮原文的片段；引用历史句=路由在旧上下文上
+    锚定，整批计划不可信。空引用不声明锚定，放行。"""
+    hay = _norm_text(user_text)
+    for o in plan.operations:
+        q = getattr(o, "evidence", "")
+        if q and _norm_text(q) not in hay:
+            return q
+    return None
 
 
 @dataclass
@@ -265,18 +302,28 @@ class PlanRouter:
             else:
                 try:
                     plan = C.parse_plan(plan_json)
-                    return RouteResult(
-                        ok=True, plan=plan, plan_json=plan_json,
-                        attempts=attempts, finish_reason=res.finish_reason,
-                        text=res.text,
-                        latency_ms=int((time.monotonic() - started) * 1000),
-                        frames_meta={"tool_calls": n_calls})
+                    stale = _ungrounded_quote(plan, user_text)
+                    if stale is None:
+                        return RouteResult(
+                            ok=True, plan=plan, plan_json=plan_json,
+                            attempts=attempts,
+                            finish_reason=res.finish_reason,
+                            text=res.text,
+                            latency_ms=int(
+                                (time.monotonic() - started) * 1000),
+                            frames_meta={"tool_calls": n_calls})
+                    # 引用锚到历史句：与格式错同级——修复一轮，仍不接地
+                    # 则终态拒绝（错路由比拒绝更糟：会把闲聊轮变成任务轮）
+                    last_error = f"evidence quote not grounded: {stale!r}"
                 except C.PlanError as e:
                     last_error = f"parse: {e}"
             if i < self.repair_attempts:
-                messages = messages + [
-                    {"role": "user",
-                     "content": _REPAIR_NOTE.format(err=last_error)}]
+                if last_error.startswith("evidence quote"):
+                    note = _GROUNDING_NOTE.format(
+                        quote=last_error.split(": ", 1)[1], text=user_text)
+                else:
+                    note = _REPAIR_NOTE.format(err=last_error)
+                messages = messages + [{"role": "user", "content": note}]
                 continue
         return self._fail(last_error, attempts, last_finish, last_text,
                           started, n_calls)

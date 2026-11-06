@@ -184,6 +184,14 @@ _DLV_TRANSITIONS = {
     # 终态不再迁移（retry_exhausted 结果仍可查询，不写 delivered）
 }
 
+# 重开白名单：只有"从未完整听到"的终态可被用户显式重听（get_task 重播，
+# 2026-11-06 待办）重置为 pending——这不是自动重试，是 outbox 重入语义。
+# played_confirmed/sent_unconfirmed=已听到不重开；pending/rendering/sending
+# =在途会自然到达，不重排。
+_DLV_REOPEN_FROM = frozenset({
+    C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
+    C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED})
+
 
 class StoreError(Exception):
     """事务级失败：整批不提交。与语义拒绝（Receipt rejected）不同。"""
@@ -770,6 +778,13 @@ class AgentStore:
                           task_id=o.target_task_id,
                           revision=t["current_revision"], outcome=C.RC_INFO,
                           current_state=t["execution_status"])
+            # 重播（2026-11-06 待办）：结果已在但用户没完整听到（交付被打断/
+            # 掐死/抑制）→ 重排 deliver outbox 并重开交付行，回执改说
+            # "再说一遍"。用户显式追问 ≠ 自动重试，不违反"打断是终态"。
+            if (t["execution_status"] in (C.EXEC_COMPLETED,
+                                          C.EXEC_WAITING_INPUT)
+                    and self._redeliver_unheard(session_id, t)):
+                r.reason_code = "redelivering"
         else:
             tasks = self.task_view(session_id)
             if o.list_scope == "active":
@@ -848,6 +863,59 @@ class AgentStore:
             "AND task_id=? AND revision" + op + " AND state IN ('pending',"
             "'rendering','sending')",
             (C.DLV_SUPPRESSED, self._now(), session_id, task_id, revision))
+
+    def _reopen_delivery(self, delivery_id):
+        """必须已在 _tx 内。把"从未完整听到"的终态交付重置为 pending 并
+        清零重试计数（get_task 重播）。原子 WHERE 守卫：状态不在重开
+        白名单时静默不动。"""
+        self._conn.execute(
+            "UPDATE deliveries SET state=?, retries=0, updated_at=? "
+            "WHERE delivery_id=? AND state IN (?,?,?,?)",
+            (C.DLV_PENDING, self._now(), delivery_id,
+             C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
+             C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED))
+
+    def _redeliver_unheard(self, session_id, t):
+        """必须已在 _tx 内。任务已有结果但用户没完整听到 → 重排一条
+        deliver outbox（复用最近一条已完成 deliver 的原文 payload）并
+        重开交付行。返回 True 表示已重排（回执应说"再说一遍"）。
+        在途交付（outbox 未消费 / delivery pending-rendering-sending）会让
+        结果自然到达，不重排；已听到（played_confirmed /
+        sent_unconfirmed）不重播。"""
+        task_id = t["task_id"]
+        for row in self._conn.execute(
+                "SELECT payload_json FROM outbox WHERE session_id=? AND "
+                "kind='deliver' AND state IN ('pending','leased')",
+                (session_id,)).fetchall():
+            try:
+                if json.loads(row["payload_json"]).get("task_id") == task_id:
+                    return False
+            except (ValueError, TypeError):
+                continue
+        dlv = self._conn.execute(
+            "SELECT delivery_id, state FROM deliveries WHERE session_id=? "
+            "AND kind='result' AND task_id=? ORDER BY rowid DESC LIMIT 1",
+            (session_id, task_id)).fetchone()
+        if dlv is not None and dlv["state"] not in _DLV_REOPEN_FROM:
+            return False
+        src = None
+        for row in self._conn.execute(
+                "SELECT payload_json FROM outbox WHERE session_id=? AND "
+                "kind='deliver' AND state='done' ORDER BY outbox_id DESC",
+                (session_id,)).fetchall():
+            try:
+                p = json.loads(row["payload_json"])
+            except (ValueError, TypeError):
+                continue
+            if p.get("task_id") == task_id:
+                src = p
+                break
+        if src is None:
+            return False   # 无可重播的结果记录（如测试直改任务状态）
+        if dlv is not None:
+            self._reopen_delivery(dlv["delivery_id"])
+        self._enqueue(session_id, "deliver", src)
+        return True
 
     def record_delivery(self, session_id, kind, task_id=None, revision=None,
                         run_id=None, operation_id=None, speech_id=None,

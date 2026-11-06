@@ -202,8 +202,13 @@ def _parse_op(d) -> Op:
     if not isinstance(d, dict):
         raise PlanError("op entry not an object")
     kind = d.get("op")
-    ev = _need_str(d, "quote", 200, required=False) or _need_str(
-        d, "evidence_quote", 200, required=False)
+    # 引用三种写法都收：顶层 quote / evidence_quote / 嵌套 evidence.quote
+    # （few-shot 教的是嵌套形——2026-11-06 接地校验落地时发现嵌套形一直
+    # 被静默丢弃，Op.evidence 恒为空，路由审计与接地守卫都拿不到引用）
+    ev = _need_str(d, "quote", 200, required=False) \
+        or _need_str(d, "evidence_quote", 200, required=False)
+    if not ev and isinstance(d.get("evidence"), dict):
+        ev = _need_str(d["evidence"], "quote", 200, required=False)
     if kind == "create_task":
         return CreateTask(
             op=kind, evidence=ev,
@@ -404,8 +409,12 @@ def receipt_text(receipt: Receipt, label: str = "") -> str:
         if state == EXEC_CANCEL_REQUESTED:
             return f"{name}正在停止。"
         if state == EXEC_WAITING_INPUT:
+            if receipt.reason_code == "redelivering":
+                return "刚才的问题我没问完，我再问一次。"
             return f"{name}还差一点信息，稍后我会来问你。"
         if state == EXEC_COMPLETED:
+            if receipt.reason_code == "redelivering":
+                return f"{name}已经完成了，我再说一遍结果。"
             return f"{name}已经完成了。"
         if state == EXEC_FAILED:
             return f"{name}没有完成，需要的话我换个方式再试。"
