@@ -24,6 +24,7 @@ import json
 import os
 import re
 import threading
+import time
 
 import requests
 import torch
@@ -70,6 +71,15 @@ TOKENIZER = None
 MODEL = None
 GEN_LOCK = threading.Lock()  # serialize generate(); concurrent generate() on
                              # one model time-slices the GPU anyway
+
+
+def _log(msg):
+    """Timestamped server log (uvicorn access lines carry no timestamps —
+    2026-11-06: a 14.9s router call couldn't be attributed to lock queueing
+    vs generation after the fact)."""
+    now = time.time()
+    print(f"[llm] {time.strftime('%H:%M:%S', time.localtime(now))}"
+          f".{int(now % 1 * 1000):03d} {msg}", flush=True)
 # token ids banned in /agent_chat generations (set in load_model once the
 # tokenizer is up — see _stream_agent for why <|im_start|> must never be
 # sampled mid-turn)
@@ -116,7 +126,7 @@ def _build_prompt(messages, tools=None, thinking=False):
     )
 
 
-def _token_stream(messages, cancel_event, gen_kwargs):
+def _token_stream(messages, cancel_event, gen_kwargs, label="chat"):
     """Yield text fragments from the LLM; cancel_event aborts generation."""
     prompt = _build_prompt(messages)
     ids = TOKENIZER(prompt, return_tensors="pt").to(MODEL.device)
@@ -137,21 +147,32 @@ def _token_stream(messages, cancel_event, gen_kwargs):
         **gen_kwargs,
     )
     thread = threading.Thread(target=MODEL.generate, kwargs=kwargs)
-    with GEN_LOCK:
+    _log(f"gen:begin {label} prompt_tokens={ids['input_ids'].shape[1]}")
+    t_wait = time.perf_counter()
+    GEN_LOCK.acquire()
+    t_gen = time.perf_counter()
+    _log(f"gen:lock {label} queue_wait={t_gen - t_wait:.2f}s")
+    n_out = 0
+    try:
         thread.start()
         try:
             for text in streamer:
                 if cancel_event.is_set():
                     break
                 if text:
+                    n_out += len(text)
                     yield text
         finally:
             # make sure generate() exits promptly even if the consumer stopped
             cancel_event.set()
             thread.join()
+            _log(f"gen:end {label} gen_s={time.perf_counter() - t_gen:.2f}s "
+                 f"out_chars={n_out} cancelled={int(cancel_event.is_set())}")
+    finally:
+        GEN_LOCK.release()
 
 
-def _token_stream_prompt(prompt, cancel_event, gen_kwargs):
+def _token_stream_prompt(prompt, cancel_event, gen_kwargs, label="agent"):
     """Yield decoded deltas for a prebuilt prompt string (agent path, where
     the prompt depends on tools/thinking and is built by the caller)."""
     ids = TOKENIZER(prompt, return_tensors="pt").to(MODEL.device)
@@ -172,18 +193,29 @@ def _token_stream_prompt(prompt, cancel_event, gen_kwargs):
         **gen_kwargs,
     )
     thread = threading.Thread(target=MODEL.generate, kwargs=kwargs)
-    with GEN_LOCK:
+    _log(f"gen:begin {label} prompt_tokens={ids['input_ids'].shape[1]}")
+    t_wait = time.perf_counter()
+    GEN_LOCK.acquire()
+    t_gen = time.perf_counter()
+    _log(f"gen:lock {label} queue_wait={t_gen - t_wait:.2f}s")
+    n_out = 0
+    try:
         thread.start()
         try:
             for text in streamer:
                 if cancel_event.is_set():
                     break
                 if text:
+                    n_out += len(text)
                     yield text
         finally:
             # make sure generate() exits promptly even if the consumer stopped
             cancel_event.set()
             thread.join()
+            _log(f"gen:end {label} gen_s={time.perf_counter() - t_gen:.2f}s "
+                 f"out_chars={n_out} cancelled={int(cancel_event.is_set())}")
+    finally:
+        GEN_LOCK.release()
 
 
 def _clean_for_tts(text: str) -> str:
@@ -574,7 +606,10 @@ async def _stream_agent(request: Request, conversation, body, tools, thinking,
 
     def produce():
         try:
-            for text in _token_stream_prompt(prompt, cancel, gen_kwargs):
+            label = ("agent_v2" if v2 else "agent") + (
+                "+think" if thinking else "")
+            for text in _token_stream_prompt(prompt, cancel, gen_kwargs,
+                                             label=label):
                 loop.call_soon_threadsafe(queue.put_nowait, text)
         except Exception as e:
             print(f"[llm] agent stream error: {e}", flush=True)

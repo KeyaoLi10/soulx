@@ -1122,11 +1122,16 @@ def _make_agent_v2(session, client_id, mode=None):
 
     def _router_fn(sid, text, snap):
         # runtime.submit_request 的路由回调：完整 §7.1 快照 + 严格计划
+        t0 = time.monotonic()
         snap_full = agent_context.build_router_snapshot(
             runtime.store, sid, text, history=_history())
         rr = plan_router.route(snap_full, text, history=_history())
         if not rr.ok:
             raise RuntimeError(rr.error or "route failed")
+        # 客户端侧总耗时（含修复轮）——与 :6007 的 gen:begin/lock/end
+        # 时间戳对照可定位：排队等 GEN_LOCK vs 生成本身 vs 网络入队
+        logger.info("[%s][v2] route ok: %.1fs attempts=%d",
+                    sid[:8], time.monotonic() - t0, rr.attempts)
         return rr.plan_json
 
     db_dir = Path(__file__).parent / "checkpoints" / "agent_v2"
