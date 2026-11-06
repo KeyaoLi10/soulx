@@ -838,6 +838,7 @@ const settingsEls = {
   pvadProb: document.getElementById('pvadProb'),
   pvadNote: document.getElementById('pvadNote'),
   agentEnabled: document.getElementById('agentEnabled'),
+  agentRuntimeMode: document.getElementById('agentRuntimeMode'),
   playbackGuard: document.getElementById('playbackGuard'),
   taskList: document.getElementById('taskList'),
   taskEmpty: document.getElementById('taskEmpty'),
@@ -860,6 +861,7 @@ function currentSettings() {
     pvad_stream_gate: settingsEls.pvadStreamGate.checked,
     speaker_sep: settingsEls.speakerSep.checked,
     agent_enabled: settingsEls.agentEnabled.checked,
+    agent_runtime_mode: settingsEls.agentRuntimeMode.value,
     playback_guard: settingsEls.playbackGuard.checked,
     asr_correct: settingsEls.asrCorrect.checked,
     asr_correct_wait_ms: parseInt(settingsEls.asrCorrectWaitMs.value, 10) || 500,
@@ -920,6 +922,7 @@ function debouncedSend() {
       pvad_stream_gate: s.pvad_stream_gate,
       speaker_sep: s.speaker_sep,
       agent_enabled: s.agent_enabled,
+      agent_runtime_mode: s.agent_runtime_mode,
       playback_guard: s.playback_guard,
       asr_correct: s.asr_correct,
       asr_correct_wait_ms: s.asr_correct_wait_ms,
@@ -977,6 +980,7 @@ settingsEls.minSegLen.addEventListener('input', () => {
 
 // ==================== Speaker Gate (pvad sidecar) ====================
 settingsEls.pvadMode.addEventListener('change', debouncedSend);
+settingsEls.agentRuntimeMode.addEventListener('change', debouncedSend);
 settingsEls.pvadStreamGate.addEventListener('change', debouncedSend);
 settingsEls.speakerSep.addEventListener('change', debouncedSend);
 settingsEls.pvadThreshold.addEventListener('input', () => {

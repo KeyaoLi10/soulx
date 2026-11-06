@@ -85,10 +85,12 @@ from frc_engine import FrcEngine, services_available as frc_services_available
 # agent-runtime V2 发布开关（手册 §19）：legacy（默认——行为与今天完全
 # 一致，语音前端一行不改）/ shadow（后台观察路由，只写日志，等快脑空闲
 # 才跑，绝不与语音生成抢 GEN_LOCK）/ enforce（V2 控制器接管控制轮）。
-# 仅环境变量控制，不出现在 UI 设置里，避免误触。
-_AGENT_RUNTIME_MODE = os.environ.get("AGENT_RUNTIME_MODE", "legacy")
-if _AGENT_RUNTIME_MODE not in ("legacy", "shadow", "enforce"):
-    _AGENT_RUNTIME_MODE = "legacy"
+# 进程级默认由环境变量 AGENT_RUNTIME_MODE 固定；会话内可从前端 Settings
+# 面板（Background Tasks → Runtime）实时切换（settings.agent_runtime_mode，
+# pipeline 每轮快照读取——切换下一句话轮即生效）。
+def _agent_runtime_mode(settings) -> str:
+    mode = settings.get("agent_runtime_mode", "legacy")
+    return mode if mode in ("legacy", "shadow", "enforce") else "legacy"
 
 # Refactor 2026-10-30: app.py was a ~1960-line monolith. The three cohesive
 # layers it shared everything with now live in their own modules:
@@ -1012,9 +1014,10 @@ def _agent_deliver_entry(session, client_id, entry):
 # _run_speech_pipeline（三态语义原样传递）。
 # ---------------------------------------------------------------------------
 
-def _make_agent_v2(session, client_id):
+def _make_agent_v2(session, client_id, mode=None):
     """为一个会话构建 V2 控制器（AgentRuntimeV2 + PlanRouter + 窄适配层）。
-    全部语音前端能力以回调注入；adapter/runtime 不反向 import app。"""
+    全部语音前端能力以回调注入；adapter/runtime 不反向 import app。
+    mode 缺省取当前设置（会话内切换时由调用方传入切换后的值）。"""
     import hashlib
 
     from agent import context as agent_context
@@ -1022,6 +1025,8 @@ def _make_agent_v2(session, client_id):
     from agent.router import PlanRouter
     from agent.runtime import AgentRuntimeV2
     from agent.slow_brain import make_v2_runner
+
+    mode = mode or _agent_runtime_mode(session.settings)
 
     def _tts_pair():
         settings = dict(session.settings)
@@ -1093,7 +1098,7 @@ def _make_agent_v2(session, client_id):
         grace_gate=lambda sid: (
             _grace_s() <= 0
             or time.time() - session.last_voice_ts >= _grace_s()),
-        mode=_AGENT_RUNTIME_MODE,
+        mode=mode,
     )
     adapter = AgentFrontendAdapter(
         session_id=client_id,
@@ -1115,11 +1120,47 @@ def _make_agent_v2(session, client_id):
             min_seg_len=dict(session.settings).get("min_seg_len"),
         ),
         history_fn=_history,
-        mode=_AGENT_RUNTIME_MODE,
+        mode=mode,
     )
-    if _AGENT_RUNTIME_MODE == "enforce":
+    if mode == "enforce":
         runtime.start_background()
     return adapter
+
+
+def _ensure_agent_v2(session, client_id, mode):
+    """会话内实时切换（legacy → shadow/enforce）：会话创建于 legacy 时
+    session.agent_v2 为 None，首次需要时在此懒建。pipeline 线程可能并发，
+    双检 + session.lock 保证只建一次；初始化失败返回 None（退回 legacy
+    行为，绝不拖垮语音路径）。"""
+    if session.agent_v2 is not None:
+        return session.agent_v2
+    with session.lock:
+        if session.agent_v2 is not None:
+            return session.agent_v2
+        try:
+            session.agent_v2 = _make_agent_v2(session, client_id, mode)
+            logger.info("[%s] agent-runtime V2 ready (mode=%s)",
+                        client_id[:8], mode)
+        except Exception:  # noqa: BLE001 — V2 失败绝不影响语音
+            logger.exception(
+                "[%s] agent-runtime V2 init failed; falling back to "
+                "legacy path", client_id[:8])
+            session.agent_v2 = None
+    return session.agent_v2
+
+
+def _legacy_runtime_idle(session) -> bool:
+    """enforce 接管前的双出口防护（手册 §19：拥有任务的两套 runtime 不得
+    同时运行）：legacy AgentRuntime 无 queued/running 任务且交付队列为空
+    才允许 V2 接管控制轮；否则本轮继续走 legacy，等任务排空。"""
+    rt = session.agent_runtime
+    if rt is None:
+        return True
+    with rt.lock:
+        active = [t for t in rt.tasks.values()
+                  if t.status in ("queued", "running")]
+        agenda = list(rt.agenda)
+    return not active and not agenda
 
 
 def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
@@ -1306,22 +1347,37 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
             if settings.get("agent_enabled") and session.agent_runtime
             else None
         )
-        if (_AGENT_RUNTIME_MODE == "shadow" and session.agent_v2 is not None
-                and settings.get("agent_enabled")):
+        v2_mode = _agent_runtime_mode(settings)
+        if (v2_mode == "shadow" and settings.get("agent_enabled")):
             # 只观察：后台等快脑空闲再跑路由（GEN_LOCK 共享，绝不与语音
             # 生成抢锁），只写 route_log。下面的 legacy 生成本身不改。
-            session.agent_v2.observe(
-                asr_text, turn_trigger=turn_trigger or "",
-                source_commit_id=commit_id)
-        if (_AGENT_RUNTIME_MODE == "enforce" and session.agent_v2 is not None
-                and settings.get("agent_enabled")):
+            # 会话创建于 legacy 时在此懒建 V2（shadow 只读，可与 legacy
+            # runtime 安全并存）。
+            adapter = _ensure_agent_v2(session, client_id, "shadow")
+            if adapter is not None:
+                adapter.observe(
+                    asr_text, turn_trigger=turn_trigger or "",
+                    source_commit_id=commit_id)
+        if (v2_mode == "enforce" and settings.get("agent_enabled")):
             # V2 控制器接管本轮控制决策：路由（grace 门后提交）、模板回执
             # 上口、表达轮，全部由 adapter 后台驱动；本 worker 不再启动
             # legacy 生成。gen_in_progress 尚未置位，无需清理。
-            session.agent_v2.handle_utterance(
-                asr_text, turn_trigger=turn_trigger or "",
-                source_commit_id=commit_id)
-            return
+            adapter = _ensure_agent_v2(session, client_id, "enforce")
+            if adapter is not None and _legacy_runtime_idle(session):
+                # 懒建于 shadow 的 V2 后台线程未启动——接管前补启动
+                # （start 幂等，已是 enforce 建的则空操作）
+                adapter.runtime.start_background()
+                adapter.handle_utterance(
+                    asr_text, turn_trigger=turn_trigger or "",
+                    source_commit_id=commit_id)
+                return
+            if adapter is not None:
+                # legacy 还有在跑/待交付的后台任务：本轮仍走 legacy 生成
+                # （§19 双出口防护），任务排空后的下一轮起 enforce 接管
+                logger.info(
+                    "[%s] enforce deferred: legacy runtime still has "
+                    "work; this turn stays on the legacy path",
+                    client_id[:8])
         if agent_runtime:
             system_prompt = (
                 settings.get("system_prompt") or QwenLLM_stream.SYSTEM_PROMPT
@@ -1559,25 +1615,19 @@ async def websocket_endpoint(websocket: WebSocket):
             deliver=lambda entry: _agent_deliver_entry(session, client_id, entry),
         )
         # enforce 模式下不再启动 legacy runtime：V2 控制器接管控制轮，
-        # 双 runtime 同时运行会出现两个交付出口（同一结果播两遍）
+        # 双 runtime 同时运行会出现两个交付出口（同一结果播两遍）。
+        # 模式取自会话设置（前端 onopen 会推送面板值；进程级默认由
+        # AGENT_RUNTIME_MODE 环境变量固定）。会话内中途切换由
+        # pipeline_worker 的懒建 + 双出口防护兜住。
+        _v2_mode = _agent_runtime_mode(session.settings)
         if (session.settings.get("agent_enabled")
-                and _AGENT_RUNTIME_MODE != "enforce"):
+                and _v2_mode != "enforce"):
             session.agent_runtime.start()
 
         # agent-runtime V2 接入层：仅非 legacy 模式创建（默认 legacy 下
         # session.agent_v2 恒为 None，上面/下面的 V2 分支均不执行）
-        if _AGENT_RUNTIME_MODE != "legacy":
-            try:
-                session.agent_v2 = _make_agent_v2(session, client_id)
-                logger.info(
-                    "[%s] agent-runtime V2 ready (mode=%s)",
-                    client_id[:8], _AGENT_RUNTIME_MODE)
-            except Exception:
-                # V2 初始化失败绝不拖垮会话——退回 legacy 行为
-                logger.exception(
-                    "[%s] agent-runtime V2 init failed; falling back to "
-                    "legacy path", client_id[:8])
-                session.agent_v2 = None
+        if _v2_mode != "legacy":
+            _ensure_agent_v2(session, client_id, _v2_mode)
 
         # FireRedChat-architecture turn engine (only fed audio while
         # settings turn_engine == "frc"; started here so the UI switch is

@@ -229,6 +229,15 @@
           </label>
           <span class="block-hint">Complex requests are delegated to a background reasoning agent; results are spoken at the next natural pause.</span>
         </div>
+        <div class="field">
+          <label for="agentRuntimeMode">Runtime</label>
+          <select id="agentRuntimeMode" class="input">
+            <option value="legacy">Legacy · current task path (default)</option>
+            <option value="shadow">Shadow · V2 observe only</option>
+            <option value="enforce">Enforce · V2 takes over</option>
+          </select>
+          <span class="block-hint">Legacy = the current fast/slow-brain path. Shadow = the V2 router (route_turn plan) runs in the background and only logs its decisions — speech is untouched (see web.log "[shadow]"). Enforce = V2 takes over control turns: template receipts, then the slow brain, results spoken at the next quiet gap. Switching is live (next turn); while legacy background tasks are still running, enforce waits for them to drain. V2 tasks do not yet appear in this panel — check web.log.</span>
+        </div>
         <div id="taskList" class="task-list"></div>
         <p id="taskEmpty" class="task-empty">No background tasks.</p>
       </section>
@@ -252,7 +261,7 @@
     </aside>
   </main>
 
-  <script src="script.js?v=20261106a"></script>
+  <script src="script.js?v=20261106b"></script>
 </body>
 
 </html>

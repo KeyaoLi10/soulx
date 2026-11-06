@@ -73,6 +73,20 @@ DEFAULT_SETTINGS = {
     # Fast/slow brain agent (delegate_task → background slow brain on
     # :6008, results delivered at the next quiet gap)
     "agent_enabled": True,
+    # Which agent runtime drives control turns (manual §19, 2026-11-06).
+    # legacy = the current path (fast brain calls delegate_task itself +
+    # auto_cancel/auto_delegate safety nets) — the default, byte-identical
+    # to pre-V2 behavior. shadow = the V2 router (route_turn plan_json)
+    # runs in the background and only logs its decisions (route_log /
+    # web.log "[..][shadow]"); speech is untouched. enforce = V2 takes
+    # over control turns (plan commit after the shared grace gate →
+    # template receipts → expression round); the legacy AgentRuntime
+    # stops receiving new work. Live-switchable from the web UI (a
+    # session created under legacy lazily builds V2 on first need); the
+    # process-wide default can also be pinned via the AGENT_RUNTIME_MODE
+    # env var at startup. While legacy background tasks are still
+    # running, enforce defers to the legacy path until they drain.
+    "agent_runtime_mode": os.environ.get("AGENT_RUNTIME_MODE", "legacy"),
     # Voice frontend processing mode. "soulx" = SoulX-Duplug turn server
     # (:8000, the default this system was built around). "frc" =
     # FireRedChat architecture (frc_engine.py): pvad speech-activity
@@ -133,6 +147,7 @@ SETTING_RULES = {
 TTS_ENGINES = ("voxcpm", "firered")
 PVAD_MODES = ("off", "shadow", "enforce")
 TURN_ENGINES = ("soulx", "frc")
+AGENT_RUNTIME_MODES = ("legacy", "shadow", "enforce")
 
 
 def sanitize_updates(data) -> dict:
@@ -164,6 +179,8 @@ def sanitize_updates(data) -> dict:
         clean["pvad_mode"] = data["pvad_mode"]
     if data.get("turn_engine") in TURN_ENGINES:
         clean["turn_engine"] = data["turn_engine"]
+    if data.get("agent_runtime_mode") in AGENT_RUNTIME_MODES:
+        clean["agent_runtime_mode"] = data["agent_runtime_mode"]
     if "agent_enabled" in data:
         clean["agent_enabled"] = bool(data["agent_enabled"])
     if "playback_guard" in data:
