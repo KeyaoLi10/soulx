@@ -45,6 +45,15 @@ ROUTER_FAIL_TEXT = "这个我一时没理清要做什么，你能再说一遍吗
 # 无声兜底（2026-11-06 listening 卡死事故家族）：receipts 模式提交了计划
 # 却一个字都没上口（模板空洞，如列表查询）——控制轮绝不能无声结束。
 SILENT_TURN_ACK_TEXT = "好的。"
+# UI 泵轮询间隔（秒）：V2 任务面板（task_update）只读 store，不进控制平面
+UI_POLL_S = 1.0
+# V2 execution_status -> 前端 task_update 的 status 词汇（未知值透传，
+# 前端 TASK_STATUS_LABEL 兜底显示原文）
+_UI_STATUS_MAP = {
+    "queued": "queued", "running": "running", "completed": "completed",
+    "failed": "failed", "canceled": "canceled", "superseded": "canceled",
+    "cancel_requested": "running", "blocked_dependency": "queued",
+}
 
 
 class AgentFrontendAdapter:
@@ -60,10 +69,14 @@ class AgentFrontendAdapter:
                  grace_poll_s: float = GRACE_POLL_S,
                  shadow_idle_wait_s: float = 30.0,
                  on_event: Optional[Callable] = None,
-                 release_gen_fn: Optional[Callable[[int], None]] = None):
+                 release_gen_fn: Optional[Callable[[int], None]] = None,
+                 ui_poll_s: float = UI_POLL_S):
         """runtime: AgentRuntimeV2；router: PlanRouter；snapshot_builder:
         (user_text, request_id, history) -> snapshot dict（agent.context）。
-        on_event(event, data)：前端任务面板等 UI 通知（可选）。
+        on_event(event, data)：前端任务面板等 UI 通知——传入即启动 UI 泵
+        （轮询 store.task_panel_rows，diff 后推 task_update，与 legacy
+        面板同一消息契约；2026-11-06 enforce 实测反馈：V2 任务在面板上
+        不可见）。
         release_gen_fn(gen_sn)：释放收音循环在 turn commit 时置位的
         gen_in_progress（app._end_generation，gen_serial 不匹配时为 no-op）。
         enforce 轮的生命周期跨越路由(~5s)到上口结束，期间标志由本 worker
@@ -85,10 +98,15 @@ class AgentFrontendAdapter:
         self.shadow_idle_wait_s = shadow_idle_wait_s
         self.on_event = on_event
         self.release_gen_fn = release_gen_fn
+        self.ui_poll_s = ui_poll_s
         self._utterance_lock = threading.Lock()   # 串行化 utterance 处理
         self._stop = threading.Event()
         # 当前挂起的控制轮线程（一次只有一个；新话轮到来时旧线程自行退出）
         self._active_turn: dict = {}
+        if on_event is not None:
+            threading.Thread(
+                target=self._ui_pump, daemon=True,
+                name=f"agent-v2-ui-{self.session_id[:8]}").start()
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -102,6 +120,36 @@ class AgentFrontendAdapter:
         except Exception:  # noqa: BLE001
             pass
         self.runtime.stop_background()
+
+    # ------------------------------------------------------------------ UI
+
+    def _ui_pump(self):
+        """V2 任务面板泵：轮询 store.task_panel_rows，diff 后经 on_event 推
+        task_update（与 legacy 面板同一消息契约 {task_id, goal, status,
+        progress, result}）。只读，绝不影响控制平面；store 关闭后静默退出。"""
+        seen = {}
+        while not self._stop.wait(self.ui_poll_s):
+            try:
+                rows = self.runtime.store.task_panel_rows(self.session_id)
+            except Exception:  # noqa: BLE001 — store 可能已随会话关闭
+                continue
+            for r in rows:
+                status = _UI_STATUS_MAP.get(
+                    r["execution_status"], r["execution_status"])
+                if status == "completed" and r.get("delivered"):
+                    status = "delivered"
+                key = (status, r.get("progress", ""), r.get("result", ""))
+                if seen.get(r["task_id"]) == key:
+                    continue
+                seen[r["task_id"]] = key
+                try:
+                    self.on_event("task_update", {
+                        "task_id": r["task_id"], "goal": r.get("goal", ""),
+                        "status": status, "progress": r.get("progress", ""),
+                        "result": r.get("result", "")})
+                except Exception:  # noqa: BLE001 — UI 绝不能拖垮 adapter
+                    logger.exception("[%s][v2] task_update emit failed",
+                                     self.session_id[:8])
 
     # ------------------------------------------------------------------ shadow
 

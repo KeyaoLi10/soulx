@@ -49,6 +49,7 @@ ROUTER_SYSTEM_PROMPT = """你是对话系统的控制路由器。本轮只调用
 evidence.quote 必须是本轮用户原文的连续片段，绝不能引用历史对话、任务名或你自己的话。
 "你在吗/你听得到吗/喂"这类确认在场或催促的话是闲聊：reply_mode=direct 且 operations 为空列表，不要当成任务追问。
 get_task 只在本轮原文确实在问任务的状态或结果时使用。
+用户同一句话里既有"等一下/停一下"又有别的要求时，停发言和其他要求必须都出操作（如 stop_speech + create_task），不能只停发言把其余要求丢掉。
 runtime 能直接读取的状态和时间不用委派。
 需要外部事实、工具或长工作时创建/继续任务；不可编造执行结果。
 没有真实工具结果，不得把"我已经查到"当作事实。
@@ -176,6 +177,19 @@ def _few_shots() -> List[dict]:
     out += _fs("喂，你听得到吗？",
                {"schema_version": 1, "operations": [],
                 "reply_mode": "direct"})
+    # 16 同句"停一下"+新要求：两个都要处理（2026-11-06 enforce 实测：
+    # "等一下等一下……我想看看湖人最近一场比赛"被路由成只出 stop_speech，
+    # 同句查询被整个吞掉 → 长无声）
+    out += _fs("等一下等一下，我想看看湖人最近一场比赛的情况怎么样。",
+               {"schema_version": 1, "operations": [
+                   {"op": "stop_speech",
+                    "evidence": {"quote": "等一下等一下"}},
+                   {"op": "create_task", "local_ref": "L1",
+                    "label": "湖人比赛",
+                    "goal": "查询湖人队最近一场比赛的情况",
+                    "evidence": {"quote":
+                                 "我想看看湖人最近一场比赛的情况怎么样"}}],
+                "reply_mode": "receipts"})
     return out
 
 
@@ -197,6 +211,15 @@ _GROUNDING_NOTE = (
     "route_turn；如果本轮没有提到任何任务或操作，用 reply_mode="
     "direct 且 operations 为空列表。")
 
+# 覆盖修复提示：stop_speech-only 计划吞掉了同句的其余要求（2026-11-06
+# enforce 实测："等一下等一下……我想看看湖人最近一场比赛的情况怎么样"
+# 只出 stop_speech → 21s 无声，用户以为卡死）
+_COVERAGE_NOTE = (
+    "本轮用户原文里除了“{quote}”还有别的要求（引用之外还有 {n} 个字），"
+    "但计划只有 stop_speech——同句的其他要求也必须出对应操作（如 "
+    "create_task），不能只停发言把其余要求丢掉。本轮用户原文是：{text}\n"
+    "重新调用 route_turn。")
+
 # 引用接地归一化：忽略空白与常见中英文标点（ASR 断句差异）
 _NORM_RE = re.compile(r"[\s，。？！,.?!、·\"'“”‘’…（）()【】\[\]]")
 
@@ -215,6 +238,24 @@ def _ungrounded_quote(plan: C.Plan, user_text: str):
         if q and _norm_text(q) not in hay:
             return q
     return None
+
+
+# stop_speech-only 吞句判定的剩余字数阈值：引用之外的原文超过这个数
+# （归一化后），认为同句还有未处理的要求（口语填充词"呃呃呃/嗯那个"
+# 通常 <10 字；实测事故句剩余 30 字）
+_STOP_ONLY_LEFTOVER_CHARS = 16
+
+
+def _stop_only_leftover(plan: C.Plan, user_text: str):
+    """stop_speech-only 计划 + 引用之外还有大量原文 → 返回剩余字数
+    （0=无问题）。只检查"唯一操作是 stop_speech"这个吞句形态：停发言
+    是对"等一下"的反射，最容易把同句的其余要求整个丢掉。"""
+    if len(plan.operations) != 1 \
+            or plan.operations[0].op != "stop_speech":
+        return 0
+    quote = _norm_text(getattr(plan.operations[0], "evidence", ""))
+    leftover = len(_norm_text(user_text)) - len(quote)
+    return leftover if leftover > _STOP_ONLY_LEFTOVER_CHARS else 0
 
 
 @dataclass
@@ -303,24 +344,37 @@ class PlanRouter:
                 try:
                     plan = C.parse_plan(plan_json)
                     stale = _ungrounded_quote(plan, user_text)
-                    if stale is None:
-                        return RouteResult(
-                            ok=True, plan=plan, plan_json=plan_json,
-                            attempts=attempts,
-                            finish_reason=res.finish_reason,
-                            text=res.text,
-                            latency_ms=int(
-                                (time.monotonic() - started) * 1000),
-                            frames_meta={"tool_calls": n_calls})
-                    # 引用锚到历史句：与格式错同级——修复一轮，仍不接地
-                    # 则终态拒绝（错路由比拒绝更糟：会把闲聊轮变成任务轮）
-                    last_error = f"evidence quote not grounded: {stale!r}"
+                    if stale is not None:
+                        # 引用锚到历史句：与格式错同级——修复一轮，仍不
+                        # 接地则终态拒绝（错路由比拒绝更糟：会把闲聊轮
+                        # 变成任务轮）
+                        last_error = f"evidence quote not grounded: {stale}"
+                    else:
+                        leftover = _stop_only_leftover(plan, user_text)
+                        if not leftover:
+                            return RouteResult(
+                                ok=True, plan=plan, plan_json=plan_json,
+                                attempts=attempts,
+                                finish_reason=res.finish_reason,
+                                text=res.text,
+                                latency_ms=int(
+                                    (time.monotonic() - started) * 1000),
+                                frames_meta={"tool_calls": n_calls})
+                        # stop_speech-only 吞句：修复一轮，仍吞则终态
+                        # 拒绝（无声 + 请求被丢比让用户重说一遍更糟）
+                        last_error = (
+                            f"stop_speech-only plan left {leftover} "
+                            "chars unhandled")
                 except C.PlanError as e:
                     last_error = f"parse: {e}"
             if i < self.repair_attempts:
                 if last_error.startswith("evidence quote"):
                     note = _GROUNDING_NOTE.format(
                         quote=last_error.split(": ", 1)[1], text=user_text)
+                elif last_error.startswith("stop_speech-only"):
+                    note = _COVERAGE_NOTE.format(
+                        quote=getattr(plan.operations[0], "evidence", ""),
+                        n=last_error.split()[2], text=user_text)
                 else:
                     note = _REPAIR_NOTE.format(err=last_error)
                 messages = messages + [{"role": "user", "content": note}]

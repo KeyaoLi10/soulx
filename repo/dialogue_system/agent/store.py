@@ -357,6 +357,44 @@ class AgentStore:
                 "task_id=? AND revision=?",
                 (session_id, task_id, revision)).fetchone()
 
+    def task_panel_rows(self, session_id):
+        """前端任务面板只读视图（V2）：任务 + 最近进度/结果 + 结果是否
+        已完整播出。供 adapter 的 UI 泵轮询——读侧专用，不进控制平面。"""
+        with self._lock:
+            tasks = self._conn.execute(
+                "SELECT t.task_id, t.label, t.execution_status, r.goal "
+                "FROM tasks t JOIN task_revisions r "
+                "ON r.session_id=t.session_id AND r.task_id=t.task_id "
+                "AND r.revision=t.current_revision "
+                "WHERE t.session_id=? ORDER BY t.created_at DESC",
+                (session_id,)).fetchall()
+            progress, result, delivered = {}, {}, {}
+            for e in self._conn.execute(
+                    "SELECT task_id, type, payload_json FROM events WHERE "
+                    "session_id=? AND task_id IS NOT NULL AND type IN "
+                    "('progress','completed','failed') ORDER BY seq",
+                    (session_id,)).fetchall():
+                try:
+                    p = json.loads(e["payload_json"])
+                except (ValueError, TypeError):
+                    p = {}
+                if e["type"] == "progress":
+                    progress[e["task_id"]] = str(p.get("desc", ""))[:120]
+                else:
+                    result[e["task_id"]] = str(p.get("summary", ""))[:400]
+            for d in self._conn.execute(
+                    "SELECT task_id, state FROM deliveries WHERE "
+                    "session_id=? AND kind='result' AND task_id IS NOT NULL "
+                    "ORDER BY rowid", (session_id,)).fetchall():
+                delivered[d["task_id"]] = d["state"] == C.DLV_PLAYED_CONFIRMED
+            return [{
+                "task_id": t["task_id"], "goal": t["goal"] or t["label"],
+                "execution_status": t["execution_status"],
+                "progress": progress.get(t["task_id"], ""),
+                "result": result.get(t["task_id"], ""),
+                "delivered": delivered.get(t["task_id"], False),
+            } for t in tasks]
+
     # -------------------------------------------------------------- 事件
 
     def _append_event(self, session_id, etype, task_id=None, revision=None,

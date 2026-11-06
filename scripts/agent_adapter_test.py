@@ -59,12 +59,14 @@ MIXED_PLAN = plan_json([
 
 
 def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
-             can_deliver=True, runner=None):
-    """router_plans: 弹出式（字符串=计划 JSON；Exception=抛出）。"""
+             can_deliver=True, runner=None, ui=False):
+    """router_plans: 弹出式（字符串=计划 JSON；Exception=抛出）。
+    ui=True 时挂 on_event（UI 泵 0.05s 轮询，事件进 state["ui_events"]）。"""
     state = {
         "speak_calls": [], "gen_calls": [], "router_calls": 0,
         "grace_open": grace_open, "can_deliver": can_deliver,
         "grace_s": 0.0, "last_voice_ts": 0.0, "gen_releases": [],
+        "ui_events": [],
     }
     plans = list(router_plans)
     lock = threading.Lock()
@@ -124,6 +126,9 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
         generate_fn=lambda stop_event: iter(["你好呀，我是表达轮。"]),
         history_fn=lambda: [{"role": "user", "content": "hi"}],
         release_gen_fn=lambda sn: state["gen_releases"].append(sn),
+        on_event=(lambda e, d: state["ui_events"].append((e, d)))
+                  if ui else None,
+        ui_poll_s=0.05,
         mode="enforce")
     rt_ref[0] = rt
     return rt, adapter, state
@@ -396,6 +401,35 @@ n_after = rt.store._conn.execute(
     "SELECT COUNT(*) c FROM outbox WHERE kind='deliver'").fetchone()["c"]
 check("14g in-flight delivery not double-enqueued",
       ok and n_before == n_after, f"{n_before} -> {n_after}")
+
+# ==== 场景 15：V2 任务面板 UI 泵（2026-11-06 enforce 实测反馈：
+# enforce 下前端看不到慢脑任务）================================================
+def _slow_runner(snap, cancel_event, progress_cb):
+    time.sleep(0.3)     # 让 queued/running 在 0.05s 轮询下可见
+    return {"type": "completed",
+            "payload": {"summary": "北京晴", "facts": [], "sources": [],
+                        "outcome": "complete"}}
+
+
+rt, ad, st = make_env(tmp, [CREATE_PLAN], ui=True, runner=_slow_runner)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")
+ok = wait(lambda: any(e == "task_update" and d["status"] in ("queued",
+                                                             "running")
+                      for e, d in st["ui_events"]))
+check("15 ui pump emits task_update lifecycle", ok,
+      str(st["ui_events"][:6]))
+ok = wait(lambda: any(e == "task_update" and d["status"] == "delivered"
+                      for e, d in st["ui_events"]))
+check("15b delivered status after playback", ok,
+      str(st["ui_events"][-3:]))
+check("15c goal carried to panel",
+      any(d.get("goal") == "查北京天气" for e, d in st["ui_events"]
+          if e == "task_update"), str(st["ui_events"][:3]))
+check("15d legacy message contract (task_id/goal/status/progress/result)",
+      all(set(d) == {"task_id", "goal", "status", "progress", "result"}
+          for e, d in st["ui_events"] if e == "task_update"),
+      str(st["ui_events"][:1]))
 
 for r in [r for r in [rt] if r]:
     pass

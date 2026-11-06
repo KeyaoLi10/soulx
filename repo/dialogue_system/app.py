@@ -1139,6 +1139,9 @@ def _make_agent_v2(session, client_id, mode=None):
         ),
         history_fn=_history,
         mode=mode,
+        # V2 任务面板：与 legacy 同一 task_update 消息契约（UI 泵只读
+        # store，不进控制平面）——2026-11-06 enforce 实测反馈补上
+        on_event=lambda event, data: emit_to_room(client_id, event, data),
     )
     if mode == "enforce":
         runtime.start_background()

@@ -355,6 +355,48 @@ tr, calls = _mk_transport([_tool_call_result(GROUNDED_GET)])
 rr = PlanRouter(transport=tr).route(SNAP, "那个，天气怎么样了？！")
 check("B17 punctuation-tolerant grounding", rr.ok, rr.to_log())
 
+# B18 stop_speech-only 吞句（2026-11-06 实测："等一下等一下……我想看看
+# 湖人最近一场比赛"只出 stop_speech，同句查询被丢 → 21s 无声）
+STOP_ONLY = json.dumps({"schema_version": 1, "operations": [
+    {"op": "stop_speech", "evidence": {"quote": "等一下"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+STOP_PLUS_CREATE = json.dumps({"schema_version": 1, "operations": [
+    {"op": "stop_speech", "evidence": {"quote": "等一下等一下"}},
+    {"op": "create_task", "local_ref": "L1", "label": "湖人比赛",
+     "goal": "查询湖人队最近一场比赛的情况",
+     "evidence": {"quote": "我想看看湖人最近一场比赛的情况怎么样"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+tr, calls = _mk_transport([_tool_call_result(STOP_ONLY),
+                           _tool_call_result(STOP_PLUS_CREATE)])
+rr = PlanRouter(transport=tr).route(
+    SNAP, "等一下等一下，我想看看湖人最近一场比赛的情况怎么样。")
+check("B18 stop-only swallowing repaired to stop+create",
+      rr.ok and rr.attempts == 2
+      and [o.op for o in rr.plan.operations]
+      == ["stop_speech", "create_task"], rr.to_log())
+note = calls[1]["messages"][-1]
+check("B18b coverage note carries utterance",
+      "等一下等一下" in note["content"]
+      and "create_task" in note["content"], note["content"][:80])
+
+# B19 短的纯停发言不误伤（引用外剩余 < 阈值）
+tr, calls = _mk_transport([_tool_call_result(
+    json.dumps({"schema_version": 1, "operations": [
+        {"op": "stop_speech", "evidence": {"quote": "停一下"}}],
+        "reply_mode": "receipts"}, ensure_ascii=False))])
+rr = PlanRouter(transport=tr).route(SNAP, "停一下停一下。")
+check("B19 short stop-only passes without repair",
+      rr.ok and rr.attempts == 1, rr.to_log())
+
+# B20 修复后仍吞句 → 终态拒绝（无声+丢请求比让用户重说更糟）
+tr, calls = _mk_transport([_tool_call_result(STOP_ONLY),
+                           _tool_call_result(STOP_ONLY)])
+rr = PlanRouter(transport=tr).route(
+    SNAP, "等一下等一下，我想看看湖人最近一场比赛的情况怎么样。")
+check("B20 persistent stop-only swallow terminal",
+      not rr.ok and "unhandled" in rr.error and rr.attempts == 2,
+      rr.to_log())
+
 # ==== C. context.build_router_snapshot ======================================
 
 tmp = tempfile.mkdtemp(prefix="agent_router_ctx_")

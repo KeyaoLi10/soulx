@@ -236,7 +236,7 @@
             <option value="shadow">Shadow · V2 observe only</option>
             <option value="enforce">Enforce · V2 takes over</option>
           </select>
-          <span class="block-hint">Legacy = the current fast/slow-brain path. Shadow = the V2 router (route_turn plan) runs in the background and only logs its decisions — speech is untouched (see web.log "[shadow]"). Enforce = V2 takes over control turns: template receipts, then the slow brain, results spoken at the next quiet gap. Switching is live (next turn); while legacy background tasks are still running, enforce waits for them to drain. V2 tasks do not yet appear in this panel — check web.log.</span>
+          <span class="block-hint">Legacy = the current fast/slow-brain path. Shadow = the V2 router (route_turn plan) runs in the background and only logs its decisions — speech is untouched (see web.log "[shadow]"). Enforce = V2 takes over control turns: template receipts, then the slow brain, results spoken at the next quiet gap. Switching is live (next turn); while legacy background tasks are still running, enforce waits for them to drain. V2 tasks show up in this panel too (read-only UI pump, ~1s).</span>
         </div>
         <div id="taskList" class="task-list"></div>
         <p id="taskEmpty" class="task-empty">No background tasks.</p>
