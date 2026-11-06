@@ -173,7 +173,8 @@ CREATE TABLE IF NOT EXISTS route_log(
 # 交付状态机（手册 §5.3）
 _DLV_TRANSITIONS = {
     C.DLV_PENDING: {C.DLV_RENDERING, C.DLV_SENDING, C.DLV_SUPPRESSED,
-                    C.DLV_FAILED, C.DLV_RETRY_EXHAUSTED},
+                    C.DLV_FAILED, C.DLV_RETRY_EXHAUSTED,
+                    C.DLV_VOICED_BY_LANE},
     # rendering->pending：静默掐死重试（一个字没播，重新渲染重试）
     C.DLV_RENDERING: {C.DLV_SENDING, C.DLV_SUPPRESSED, C.DLV_FAILED,
                       C.DLV_PENDING, C.DLV_RETRY_EXHAUSTED},
@@ -182,15 +183,17 @@ _DLV_TRANSITIONS = {
                              C.DLV_INTERRUPTED_PARTIAL,
                              C.DLV_INTERRUPTED_BEFORE_AUDIO},
     # 终态不再迁移（retry_exhausted 结果仍可查询，不写 delivered）
+    C.DLV_VOICED_BY_LANE: set(),
 }
 
 # 重开白名单：只有"从未完整听到"的终态可被用户显式重听（get_task 重播，
 # 2026-11-06 待办）重置为 pending——这不是自动重试，是 outbox 重入语义。
 # played_confirmed/sent_unconfirmed=已听到不重开；pending/rendering/sending
-# =在途会自然到达，不重排。
+# =在途会自然到达，不重排。voiced_by_lane 是闲聊路代播的"估计已听到"，
+# 例外可重开：用户显式追问时闲聊路可能已死/被打断，必须能补播。
 _DLV_REOPEN_FROM = frozenset({
     C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
-    C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED})
+    C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED, C.DLV_VOICED_BY_LANE})
 
 
 class StoreError(Exception):
@@ -222,6 +225,12 @@ class AgentStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._migrate()
+        # 闲聊路（voice lane）已口播的结果记账 {(task_id, revision)}：
+        # get_task 提交时 chitchat_spoke → 闲聊路会把结果说出来，交付泵
+        # 看到就不再补播（2026-11-07 实测：湖人结果闲聊路说完开拓者，
+        # 交付泵 34 次尝试后又把同一条播了一遍）。显式追问重排交付时
+        # 清除（_redeliver_unheard）。
+        self._voiced_by_lane = set()
 
     # ------------------------------------------------------------------ 基础
 
@@ -386,7 +395,8 @@ class AgentStore:
                     "SELECT task_id, state FROM deliveries WHERE "
                     "session_id=? AND kind='result' AND task_id IS NOT NULL "
                     "ORDER BY rowid", (session_id,)).fetchall():
-                delivered[d["task_id"]] = d["state"] == C.DLV_PLAYED_CONFIRMED
+                delivered[d["task_id"]] = d["state"] in (
+                    C.DLV_PLAYED_CONFIRMED, C.DLV_VOICED_BY_LANE)
             return [{
                 "task_id": t["task_id"], "goal": t["goal"] or t["label"],
                 "execution_status": t["execution_status"],
@@ -844,6 +854,13 @@ class AgentStore:
                              and t["execution_status"] == C.EXEC_COMPLETED)
                     and self._redeliver_unheard(session_id, t)):
                 r.reason_code = "redelivering"
+            if (chitchat_spoke
+                    and t["execution_status"] == C.EXEC_COMPLETED):
+                # 闲聊路会把这条结果口播出来（报任务情况）→ 记账，交付
+                # 泵不再补播同一条。waiting_input 不记：闲聊路不知道问题
+                # 内容，问题重播不受影响。
+                self._voiced_by_lane.add(
+                    (o.target_task_id, t["current_revision"]))
         else:
             tasks = self.task_view(session_id)
             if o.list_scope == "active":
@@ -929,10 +946,17 @@ class AgentStore:
         白名单时静默不动。"""
         self._conn.execute(
             "UPDATE deliveries SET state=?, retries=0, updated_at=? "
-            "WHERE delivery_id=? AND state IN (?,?,?,?)",
+            "WHERE delivery_id=? AND state IN (?,?,?,?,?)",
             (C.DLV_PENDING, self._now(), delivery_id,
              C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
-             C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED))
+             C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED,
+             C.DLV_VOICED_BY_LANE))
+
+    def was_voiced_by_lane(self, task_id, revision) -> bool:
+        """该 (task_id, revision) 的结果已被闲聊路口播（交付泵据此跳过
+        补播）。"""
+        with self._lock:
+            return (task_id, revision) in self._voiced_by_lane
 
     def _redeliver_unheard(self, session_id, t):
         """必须已在 _tx 内。任务已有结果但用户没完整听到 → 重排一条
@@ -942,6 +966,10 @@ class AgentStore:
         结果自然到达，不重排；已听到（played_confirmed /
         sent_unconfirmed）不重播。"""
         task_id = t["task_id"]
+        # 用户显式追问 = 重新要这个结果：清掉闲聊路口播记账，否则交付
+        # 泵会把重排的 deliver 当"已说过"拒掉
+        self._voiced_by_lane.discard(
+            (task_id, t["current_revision"]))
         for row in self._conn.execute(
                 "SELECT payload_json FROM outbox WHERE session_id=? AND "
                 "kind='deliver' AND state IN ('pending','leased')",

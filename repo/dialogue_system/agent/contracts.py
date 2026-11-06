@@ -53,6 +53,10 @@ DLV_SUPPRESSED = "suppressed"
 DLV_RETRY_EXHAUSTED = "retry_exhausted"
 # 播放证据分级：当前只有服务端估计（手册 §13.4），ACK 是 P5 可选项
 DLV_PLAYED_CONFIRMED = "played_confirmed"
+# 闲聊路（voice lane）代播：用户确实听到了，但出口是闲聊路而非交付泵。
+# 与 played_confirmed 的区别：这是"估计已听到"——显式追问（get_task 重播）
+# 仍可重开补播，兑现"只跳本轮"的语义（2026-11-07 双路实测双播事故）。
+DLV_VOICED_BY_LANE = "voiced_by_lane"
 
 # 回执 outcome（手册 §13.1）
 RC_ACCEPTED = "accepted"

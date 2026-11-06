@@ -46,11 +46,13 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 # 纯应答/附和：整句只由应答词构成（"嗯""好的好的""对"……）。这类话永远
-# 不承载控制意图，但只在上一话轮还活着（路由在飞/计划挂起）时吸收——
-# 不作废挂起计划、不再起一路路由、不另起闲聊路。2026-11-06 实测事故：
-# 天气请求路由 6.3s 期间用户一句"嗯，好的好的"把成果作废重来，连环
-# 重路由四次，任务 25s 后才创建、UI 面板迟迟不出现。注意"停"绝不能
-# 入表——"你停停停"是控制意图，必须照常走路由。
+# 不承载控制意图。吸收条件 = 上一话轮还活着（路由在飞/计划挂起）或面板
+# 上有任务（用户大概率在回应任务交付）——两种情况下都不作废挂起计划、
+# 不再起一路路由、不另起闲聊路。2026-11-06 实测事故：天气请求路由 6.3s
+# 期间用户一句"嗯，好的好的"把成果作废重来，连环重路由四次，任务 25s
+# 后才创建；2026-11-07 实测事故：任务完成后每句"啊好吧/嗯好的"都触发
+# 一次闲聊路全盘复述天气+湖人，循环播报停不下来。注意"停"绝不能入表
+# ——"你停停停"是控制意图，必须照常走路由。
 _ACK_RE = re.compile(
     r"^[嗯呃啊哦噢诶哎唉呀哟呦哈嘿好的对是行呢吧的了嘛呗"
     r"\s，。？！、,.?!…]+$")
@@ -247,14 +249,16 @@ class AgentFrontendAdapter:
             prev_turn = self._active_turn
             prev = prev_turn.get("thread")
             prev_alive = prev is not None and prev.is_alive()
-            # 纯应答吸收（_ACK_RE 注释）：上一轮还活着时一句"嗯/好的"
-            # 既不作废其挂起计划也不重路由。上一轮已结束（空闲）时照常
-            # 走完整路径——孤零零一句应答也该有人接话。
+            # 纯应答吸收（_ACK_RE 注释）：上一轮活着或面板有任务时一句
+            # "嗯/好的"既不作废其挂起计划也不重路由、不另起闲聊路。
+            # 完全空闲（无活跃轮、无任务）时照常走完整路径——孤零零
+            # 一句应答也该有人接话。
             if (text.strip() and _ACK_RE.match(text.strip())
                     and (prev_alive
-                         or self.runtime.pending_exists(self.session_id))):
-                logger.info("[%s][v2] pure ack absorbed (prev turn alive): "
-                            "%s", self.session_id[:8], text)
+                         or self.runtime.pending_exists(self.session_id)
+                         or self._panel_has_tasks())):
+                logger.info("[%s][v2] pure ack absorbed: %s",
+                            self.session_id[:8], text)
                 return
             if (prev is not None and prev.is_alive()
                     and not prev_turn.get("committed")):
@@ -331,6 +335,15 @@ class AgentFrontendAdapter:
         except Exception:  # noqa: BLE001
             logger.exception("[%s][v2] gen flag release failed",
                              self.session_id[:8])
+
+    def _panel_has_tasks(self) -> bool:
+        """面板上还有任务（含已完成）→ 用户的应答大概率是在回应任务
+        交付，吸收之（2026-11-07 实测：每句"嗯好的"都触发一次闲聊路
+        全盘复述，循环播报停不下来）。store 已关等异常按无任务处理。"""
+        try:
+            return bool(self.runtime.store.task_panel_rows(self.session_id))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _turn_worker(self, turn, text, turn_trigger, source_commit_id, gen_sn):
         try:

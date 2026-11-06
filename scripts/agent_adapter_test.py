@@ -246,7 +246,9 @@ check("5d only new plan committed", ok,
       str([t["label"] for t in rt.store.task_view("s1")]))
 
 # ==== 场景 6：路由失败 → 固定澄清话术 ======================================
-rt, ad, st = make_env(tmp, [RuntimeError := Exception("router timeout")])
+# （注意别用海象绑定 RuntimeError——会把内置类覆盖成实例，后续所有
+# raise RuntimeError 都变成 TypeError）
+rt, ad, st = make_env(tmp, [Exception("router timeout")])
 rt_ref[0] = rt
 ad.handle_utterance("嗯……")
 ok = wait(lambda: st["speak_calls"] != [])
@@ -261,7 +263,10 @@ ok = wait(lambda: any("表达轮" in str(x) for x in st["speak_calls"]))
 check("7 direct mode runs expression round", ok, str(st["speak_calls"]))
 
 # ==== 场景 8：mixed → 回执 + 表达轮 ========================================
-rt, ad, st = make_env(tmp, [MIXED_PLAN])
+# T1 的 runner 挂在 cancel_event 上保持 running：默认 runner 会抢先几毫秒把
+# T1 跑成 completed，取消回执就变"刚好已经完成了"（竞态 flake，2026-11-07）
+rt, ad, st = make_env(tmp, [MIXED_PLAN], runner=lambda s, c, p: (
+    c.wait(15), {"type": "canceled"})[1])
 rt_ref[0] = rt
 # 先造一个 T1 供取消
 pre = C.parse_plan(plan_json([
@@ -607,7 +612,9 @@ check("20d no silent-turn ack piled on top",
       str(st["speak_calls"]))
 
 # 21 闲聊路失败 → 全套回退（方案 C）：回执照旧 + direct 走表达轮。
-# 路由人为放慢 0.2s 保证失败先于 commit 落账（确定性排序）。
+# 两轮路由都人为放慢 0.2s：保证失败先于 commit 落账（确定性排序）——
+# turn 2 的 direct 路由若是瞬时的，_chitchat_alive 可能在闲聊路线程
+# 抛异常前就读到"活着"，表达轮被错误跳过（2026-11-07 暴露的竞态）。
 def _boom_chitchat(stop_event):
     raise RuntimeError("chitchat down")
 
@@ -617,8 +624,13 @@ def _slow_create():
     return CREATE_PLAN
 
 
+def _slow_direct():
+    time.sleep(0.2)
+    return DIRECT_PLAN
+
+
 DIRECT_PLAN = plan_json([], reply_mode="direct")
-rt, ad, st = make_env(tmp, [_slow_create, DIRECT_PLAN],
+rt, ad, st = make_env(tmp, [_slow_create, _slow_direct],
                       chitchat_impl=_boom_chitchat)
 rt_ref[0] = rt
 ad.handle_utterance("帮我查北京天气")
@@ -779,10 +791,18 @@ check("26b ack triggers no re-route",
       st["router_calls"] == 1, str(st["router_calls"]))
 check("26c ack starts no second chitchat lane",
       chitchat_starts["n"] == 1, str(chitchat_starts["n"]))
-time.sleep(0.4)                          # 上一轮结束后空闲
-ad.handle_utterance("好的。")             # 空闲应答 → 正常路径
-ok = wait(lambda: st["router_calls"] == 2)
-check("26d idle ack routes normally", ok, str(st["router_calls"]))
+time.sleep(0.4)                          # 上一轮结束后（面板已有 T1）
+ad.handle_utterance("嗯，好的好的。")     # 面板有任务 → 吸收（场景 28 验证）
+time.sleep(0.3)
+check("26d ack with panel tasks also absorbed",
+      st["router_calls"] == 1 and chitchat_starts["n"] == 1,
+      f"routes={st['router_calls']} chats={chitchat_starts['n']}")
+rt2, ad2, st2 = make_env(tmp, [DIRECT_PLAN], chitchat_impl=_std_chitchat)
+rt_ref[0] = rt2
+ad2.handle_utterance("好的。")             # 空面板+无活跃轮 → 正常路径
+ok = wait(lambda: st2["router_calls"] == 1)
+check("26e idle ack with empty panel routes normally", ok,
+      str(st2["router_calls"]))
 
 # 27 手动停止（duplex_stop）：掐闲聊路、作废挂起计划、停交付泵——
 # 停止后一个字都不再出（2026-11-06 实测：停止后闲聊路仍播完整段）
@@ -809,6 +829,75 @@ check("27c scheduler pump stopped",
       rt.scheduler._thread is None or not rt.scheduler._thread.is_alive())
 check("27d delivery pump stopped",
       rt.delivery._thread is None or not rt.delivery._thread.is_alive())
+
+# 28 面板有任务时的应答吸收（独立于 26 的 prev-alive 场景）：任务完成、
+# 轮已结束后，用户应答不再触发闲聊路全盘复述（2026-11-07 实测：每句
+# "啊好吧/嗯好的"都复述一遍天气+湖人，循环播报停不下来）
+rt, ad, st = make_env(tmp, [CREATE_PLAN], chitchat_impl=_counting_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
+check("28 task created (panel non-empty)", ok)
+time.sleep(0.4)                          # 轮结束、无挂起、线程已退
+routes_before = st["router_calls"]
+chats_before = chitchat_starts["n"]
+ad.handle_utterance("啊，好吧。")
+ad.handle_utterance("嗯，好的好的。")
+time.sleep(0.4)
+check("28b acks with panel tasks absorbed (no route, no chitchat)",
+      st["router_calls"] == routes_before
+      and chitchat_starts["n"] == chats_before,
+      f"routes={st['router_calls']}/{routes_before} "
+      f"chats={chitchat_starts['n']}/{chats_before}")
+
+# 29 闲聊路已口播的结果，交付泵不再补播：get_task 提交时 chitchat_spoke
+# 记账 → 交付行直接落 played_confirmed、outbox 完结；闲聊路失败后的
+# 显式追问恢复完整重播（2026-11-07 实测：湖人结果闲聊路说完开拓者，
+# 交付泵 34 次尝试后又播了一遍）
+chat29 = {"boom": False}
+
+
+def _ctl29(stop_event):
+    if chat29["boom"]:
+        raise RuntimeError("chitchat down")
+    return iter(["嗯，结果我跟你说过了。"])
+
+
+rt, ad, st = make_env(
+    tmp, [CREATE_PLAN, GET_PLAN, GET_PLAN], chitchat_impl=_ctl29,
+    runner=lambda s, c, p: {"type": "completed",
+                            "payload": {"summary": "晴转多云十五度",
+                                        "facts": [], "sources": [],
+                                        "outcome": "complete"}})
+rt_ref[0] = rt
+st["can_deliver"] = False            # 结果压在 outbox：交付行尚未出生
+ad.handle_utterance("查一下北京天气")
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None
+          and rt.store.task_row("s1", "T1")["execution_status"]
+          == C.EXEC_COMPLETED)
+check("29 task completed, delivery held", ok)
+ad.handle_utterance("天气怎么样了")     # get_task + 闲聊路活着
+ok = wait(lambda: _committed_count(rt) >= 2)
+check("29b get_task committed with chitchat alive", ok)
+st["can_deliver"] = True
+time.sleep(0.3)
+for _ in range(6):
+    rt.delivery.pump()
+    time.sleep(0.05)
+check("29c delivery pump does not re-speak lane-voiced result",
+      not any("晴转多云" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+row = rt.store._conn.execute(
+    "SELECT state FROM deliveries WHERE session_id='s1' AND kind='result' "
+    "AND task_id='T1' ORDER BY rowid DESC LIMIT 1").fetchone()
+check("29d delivery row lands voiced_by_lane via lane",
+      row is not None and row["state"] == C.DLV_VOICED_BY_LANE,
+      str(dict(row) if row else None))
+chat29["boom"] = True
+ad.handle_utterance("再讲一遍结果")     # 闲聊路失败 → 显式追问恢复重播
+ok = wait(lambda: any("晴转多云" in str(x) for x in st["speak_calls"]))
+check("29e explicit re-ask after lane failure replays in full", ok,
+      str(st["speak_calls"]))
 
 # ==== 场景 9：close 释放 ====================================================
 rt, ad, st = make_env(tmp, [])
