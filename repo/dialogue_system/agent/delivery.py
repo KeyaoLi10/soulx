@@ -137,19 +137,6 @@ class DeliveryManager:
         if task_id and not env.valid_for(self._task_rev_map(session_id)):
             self.store.complete_outbox(item["outbox_id"], item["token"])
             return
-        # 闲聊路已口播过这条结果（get_task 提交时 chitchat_spoke 记账）
-        # → 不再补播：记一条 voiced_by_lane 交付行（用户确实听到了，
-        # 出口是闲聊路而非交付泵）并完结 outbox。落 voiced_by_lane 而非
-        # played_confirmed：这是"估计已听到"，显式追问仍可重开补播。
-        # 2026-11-07 双路实测：湖人结果闲聊路说完开拓者，交付泵 34 次
-        # 尝试后又播了一遍。
-        if task_id and self.store.was_voiced_by_lane(task_id, revision or 0):
-            delivery_id = self.store.record_delivery(
-                session_id, payload.get("kind", "result"), task_id=task_id,
-                revision=revision, run_id=payload.get("run_id"))
-            self.store.set_delivery_state(delivery_id, C.DLV_VOICED_BY_LANE)
-            self.store.complete_outbox(item["outbox_id"], item["token"])
-            return
         # 话权：等有界时间，拿不到归还重试
         deadline = time.monotonic() + self.delivery_wait_s
         while time.monotonic() < deadline and not self._stop.is_set():

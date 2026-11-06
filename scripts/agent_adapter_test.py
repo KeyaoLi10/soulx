@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "repo" / "dialogue_system"))
 
 from agent import contracts as C  # noqa: E402
+from agent import context as agent_context  # noqa: E402
 from agent import slow_brain as SB  # noqa: E402
 from agent.frontend_adapter import (ROUTER_FAIL_TEXT,  # noqa: E402
                                     SILENT_TURN_ACK_TEXT,
@@ -690,17 +691,24 @@ time.sleep(0.4)
 for _ in range(6):
     rt.delivery.pump()
     time.sleep(0.05)
-check("23e completed-result replay skipped this turn (voiced by chitchat)",
-      not any("北京晴" in str(x) for x in st["speak_calls"]),
+# 单一出口（2026-11-07 重构）：闲聊路只说桥接短语，不再代播结果——
+# get_task 显式追问必须由交付泵重播，闲聊路活着也不跳过
+check("23e explicit ask replays in full even with chitchat alive",
+      any("北京晴" in str(x) for x in st["speak_calls"]),
       str(st["speak_calls"]))
-check("23f retraction flag untouched by skipped replay",
-      rt.store.task_row("s1", "T1")["cancel_intent"] == 1)
-chat_ctl["boom"] = True
-ad.handle_utterance("再讲一遍骑士队结果")    # get_task + 闲聊路失败
-ok = wait(lambda: any("北京晴" in str(x) for x in st["speak_calls"]))
-check("23g next explicit ask replays in full", ok, str(st["speak_calls"]))
-check("23h replay clears retraction flag",
+check("23f replay clears retraction flag",
       rt.store.task_row("s1", "T1")["cancel_intent"] == 0)
+row = rt.store._conn.execute(
+    "SELECT state FROM deliveries WHERE session_id='s1' AND kind='result' "
+    "AND task_id='T1' ORDER BY rowid DESC LIMIT 1").fetchone()
+check("23g delivery row played_confirmed after pump replay",
+      row is not None and row["state"] == C.DLV_PLAYED_CONFIRMED,
+      str(dict(row) if row else None))
+chat_ctl["boom"] = True
+ad.handle_utterance("再讲一遍骑士队结果")    # 已交付(played_confirmed)后的追问
+ok = wait(lambda: sum("北京晴" in str(x) for x in st["speak_calls"]) >= 2)
+check("23h re-ask on played_confirmed replays again", ok,
+      str(st["speak_calls"]))
 
 # 24 stop-only 计划掐掉闲聊路生成器（纪律是"停一下→不出声"）
 STOP_PLAN = plan_json([{"op": "stop_speech",
@@ -850,53 +858,38 @@ check("28b acks with panel tasks absorbed (no route, no chitchat)",
       f"routes={st['router_calls']}/{routes_before} "
       f"chats={chitchat_starts['n']}/{chats_before}")
 
-# 29 闲聊路已口播的结果，交付泵不再补播：get_task 提交时 chitchat_spoke
-# 记账 → 交付行直接落 played_confirmed、outbox 完结；闲聊路失败后的
-# 显式追问恢复完整重播（2026-11-07 实测：湖人结果闲聊路说完开拓者，
-# 交付泵 34 次尝试后又播了一遍）
-chat29 = {"boom": False}
-
-
-def _ctl29(stop_event):
-    if chat29["boom"]:
-        raise RuntimeError("chitchat down")
-    return iter(["嗯，结果我跟你说过了。"])
-
+# 29 单一出口（2026-11-07 复播事故根修）：闲聊路面板注入不含结果原文
+# （render_chitchat_context），结果首播/重播全走交付泵；get_task 对已
+# 交付（played_confirmed）的结果也重开重播——"再讲一遍"由泵兑现
+ctx = agent_context.render_chitchat_context([
+    {"task_id": "T1", "goal": "查北京天气", "execution_status": "completed",
+     "progress": "", "result": "晴转多云十五度", "delivered": False},
+    {"task_id": "T2", "goal": "查湖人比赛", "execution_status": "completed",
+     "progress": "", "result": "对阵开拓者", "delivered": True},
+])
+check("29 chitchat context hides undelivered result text",
+      "晴转多云" not in ctx and "结果待播报" in ctx, ctx[:200])
+check("29b chitchat context marks delivered, hides its result text",
+      "开拓者" not in ctx and "结果已播报过" in ctx, ctx[:200])
 
 rt, ad, st = make_env(
-    tmp, [CREATE_PLAN, GET_PLAN, GET_PLAN], chitchat_impl=_ctl29,
+    tmp, [CREATE_PLAN, GET_PLAN], chitchat_impl=_std_chitchat,
     runner=lambda s, c, p: {"type": "completed",
                             "payload": {"summary": "晴转多云十五度",
                                         "facts": [], "sources": [],
                                         "outcome": "complete"}})
 rt_ref[0] = rt
-st["can_deliver"] = False            # 结果压在 outbox：交付行尚未出生
 ad.handle_utterance("查一下北京天气")
-ok = wait(lambda: rt.store.task_row("s1", "T1") is not None
-          and rt.store.task_row("s1", "T1")["execution_status"]
-          == C.EXEC_COMPLETED)
-check("29 task completed, delivery held", ok)
-ad.handle_utterance("天气怎么样了")     # get_task + 闲聊路活着
-ok = wait(lambda: _committed_count(rt) >= 2)
-check("29b get_task committed with chitchat alive", ok)
-st["can_deliver"] = True
-time.sleep(0.3)
-for _ in range(6):
-    rt.delivery.pump()
-    time.sleep(0.05)
-check("29c delivery pump does not re-speak lane-voiced result",
-      not any("晴转多云" in str(x) for x in st["speak_calls"]),
-      str(st["speak_calls"]))
-row = rt.store._conn.execute(
-    "SELECT state FROM deliveries WHERE session_id='s1' AND kind='result' "
-    "AND task_id='T1' ORDER BY rowid DESC LIMIT 1").fetchone()
-check("29d delivery row lands voiced_by_lane via lane",
-      row is not None and row["state"] == C.DLV_VOICED_BY_LANE,
-      str(dict(row) if row else None))
-chat29["boom"] = True
-ad.handle_utterance("再讲一遍结果")     # 闲聊路失败 → 显式追问恢复重播
 ok = wait(lambda: any("晴转多云" in str(x) for x in st["speak_calls"]))
-check("29e explicit re-ask after lane failure replays in full", ok,
+check("29c pump speaks result (first outlet)", ok, str(st["speak_calls"]))
+ok = wait(lambda: rt.store._conn.execute(
+    "SELECT state FROM deliveries WHERE session_id='s1' AND kind='result' "
+    "AND task_id='T1' ORDER BY rowid DESC LIMIT 1").fetchone()["state"]
+    == C.DLV_PLAYED_CONFIRMED)
+check("29d delivery row played_confirmed", ok)
+ad.handle_utterance("再讲一遍结果")     # 已交付后的显式追问
+ok = wait(lambda: sum("晴转多云" in str(x) for x in st["speak_calls"]) >= 2)
+check("29e re-ask on delivered result replays via pump", ok,
       str(st["speak_calls"]))
 
 # ==== 场景 9：close 释放 ====================================================

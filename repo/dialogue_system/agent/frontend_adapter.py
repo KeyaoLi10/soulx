@@ -240,7 +240,7 @@ class AgentFrontendAdapter:
           2. 闲聊路（chitchat_fn）与路由并行启动：闲聊路过 grace 门后
              生成+流式上口，负责本轮常规口播
           3. submit_request（路由，3-6s）→ 计划挂起 → 等 grace 门开
-             → commit（闲聊路活着时受理/状态类回执静音+get_task 跳重播）
+             → commit（闲聊路活着时受理/状态类回执静音；结果重播不跳——交付泵单一出口）
           4. 纠错/失败类回执上口；闲聊路失败时 clarify/表达轮兜底
         """
         with self._utterance_lock:

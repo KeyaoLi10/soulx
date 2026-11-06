@@ -647,8 +647,9 @@ class AgentRuntimeV2:
         """grace 通过后由 adapter 调用（§6.1：复用同一 grace 结论作为
         业务提交门，不复制第二套计时阈值）。返回 None = 无待提交计划。
         chitchat_spoke：闲聊路（voice lane）已/将会口播 → 受理/状态类
-        回执不再渲染（QUIET_IF_VOICED_OUTCOMES），get_task 对已完成任务
-        跳过结果重播；纠错/失败类照常。"""
+        回执不再渲染（QUIET_IF_VOICED_OUTCOMES）；纠错/失败类照常。
+        结果重播不受它影响：交付泵是结果播报的唯一出口（2026-11-07
+        单一出口重构），get_task 显式追问一律重排。"""
         with self._pending_lock:
             entry = self._pending.pop(session_id, None)
         if entry is None:
@@ -661,8 +662,7 @@ class AgentRuntimeV2:
             return None
         res = self.store.commit_plan(session_id, entry["request_id"],
                                      entry["plan"],
-                                     plan_version=entry["version"],
-                                     chitchat_spoke=chitchat_spoke)
+                                     plan_version=entry["version"])
         texts = self._receipt_texts(session_id, res,
                                     chitchat_spoke=chitchat_spoke)
         # plan 一并带回：adapter 需要 reply_mode/direct_question 决定

@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
   <title>Voice Studio</title>
-  <link rel="stylesheet" href="style.css?v=20261103a">
+  <link rel="stylesheet" href="style.css?v=20261107a">
 </head>
 
 <body>
@@ -46,10 +46,22 @@
     </div>
   </header>
 
-  <!-- ===== Console: full-width stage + right rail ===== -->
+  <!-- ===== Console: task column (left) + stage (center) + right rail ===== -->
   <main class="console">
 
-    <!-- Stage (left, takes all remaining width) -->
+    <!-- Task column (left): always visible without scrolling -->
+    <aside class="task-col">
+      <section class="rail-block task-col-block">
+        <div class="block-head">
+          <h2>Background Tasks</h2>
+          <span id="taskCount" class="gate-badge" data-state="off">0</span>
+        </div>
+        <div id="taskList" class="task-list"></div>
+        <p id="taskEmpty" class="task-empty">No background tasks.</p>
+      </section>
+    </aside>
+
+    <!-- Stage (center, takes all remaining width) -->
     <section class="stage">
 
       <div class="orb-zone">
@@ -216,11 +228,10 @@
         <p class="block-hint">First gate-passed turn auto-enrolls the main speaker. Unknown signal never blocks the conversation (fail-open).</p>
       </section>
 
-      <!-- Background Tasks (fast/slow brain agent) -->
+      <!-- Agent (fast/slow brain settings; execution status lives in the left column) -->
       <section class="rail-block">
         <div class="block-head">
-          <h2>Background Tasks</h2>
-          <span id="taskCount" class="gate-badge" data-state="off">0</span>
+          <h2>Agent</h2>
         </div>
         <div class="field">
           <label for="agentEnabled" class="toggle-row">
@@ -236,10 +247,8 @@
             <option value="shadow">Shadow · V2 observe only</option>
             <option value="enforce">Enforce · V2 takes over</option>
           </select>
-          <span class="block-hint">Legacy = the current fast/slow-brain path. Shadow = the V2 router (route_turn plan) runs in the background and only logs its decisions — speech is untouched (see web.log "[shadow]"). Enforce = V2 takes over control turns: template receipts, then the slow brain, results spoken at the next quiet gap. Switching is live (next turn); while legacy background tasks are still running, enforce waits for them to drain. V2 tasks show up in this panel too (read-only UI pump, ~1s).</span>
+          <span class="block-hint">Legacy = the current fast/slow-brain path. Shadow = the V2 router (route_turn plan) runs in the background and only logs its decisions — speech is untouched (see web.log "[shadow]"). Enforce = V2 takes over control turns: template receipts, then the slow brain, results spoken by the delivery pump at the next quiet gap. Switching is live (next turn); while legacy background tasks are still running, enforce waits for them to drain. V2 tasks show up in the left panel too (read-only UI pump, ~1s).</span>
         </div>
-        <div id="taskList" class="task-list"></div>
-        <p id="taskEmpty" class="task-empty">No background tasks.</p>
       </section>
 
       <!-- Conversation -->

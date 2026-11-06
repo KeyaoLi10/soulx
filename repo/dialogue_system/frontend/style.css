@@ -185,18 +185,40 @@ body {
   outline: none;
 }
 
-/* ===== Console layout: stage + rail, full width ===== */
+/* ===== Console layout: task column + stage + rail, full width ===== */
 .console {
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr 400px;
+  grid-template-columns: 300px minmax(0, 1fr) 400px;
   gap: 20px;
   padding: 20px 24px;
   min-height: 0;
   width: 100%;
 }
 
-/* ===== Stage (left) ===== */
+/* ===== Task column (left) ===== */
+.task-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.task-col-block {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.task-col-block .task-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 2px;
+}
+
+/* ===== Stage (center) ===== */
 .stage {
   display: flex;
   flex-direction: column;
@@ -776,7 +798,7 @@ input[type="range"] {
 
 .hidden { display: none !important; }
 
-/* ===== Responsive: rail drops below stage ===== */
+/* ===== Responsive: columns stack, stage first ===== */
 @media (max-width: 980px) {
   body { overflow: auto; }
 
@@ -785,7 +807,10 @@ input[type="range"] {
     overflow: visible;
   }
 
-  .stage { min-height: 72vh; }
+  .stage { order: 1; min-height: 72vh; }
+  .task-col { order: 2; }
+  .task-col-block { min-height: 140px; max-height: 45vh; }
+  .rail { order: 3; }
   .transcript-block { min-height: 200px; }
 }
 

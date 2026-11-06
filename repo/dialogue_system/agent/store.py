@@ -173,8 +173,7 @@ CREATE TABLE IF NOT EXISTS route_log(
 # 交付状态机（手册 §5.3）
 _DLV_TRANSITIONS = {
     C.DLV_PENDING: {C.DLV_RENDERING, C.DLV_SENDING, C.DLV_SUPPRESSED,
-                    C.DLV_FAILED, C.DLV_RETRY_EXHAUSTED,
-                    C.DLV_VOICED_BY_LANE},
+                    C.DLV_FAILED, C.DLV_RETRY_EXHAUSTED},
     # rendering->pending：静默掐死重试（一个字没播，重新渲染重试）
     C.DLV_RENDERING: {C.DLV_SENDING, C.DLV_SUPPRESSED, C.DLV_FAILED,
                       C.DLV_PENDING, C.DLV_RETRY_EXHAUSTED},
@@ -183,17 +182,18 @@ _DLV_TRANSITIONS = {
                              C.DLV_INTERRUPTED_PARTIAL,
                              C.DLV_INTERRUPTED_BEFORE_AUDIO},
     # 终态不再迁移（retry_exhausted 结果仍可查询，不写 delivered）
-    C.DLV_VOICED_BY_LANE: set(),
 }
 
-# 重开白名单：只有"从未完整听到"的终态可被用户显式重听（get_task 重播，
-# 2026-11-06 待办）重置为 pending——这不是自动重试，是 outbox 重入语义。
-# played_confirmed/sent_unconfirmed=已听到不重开；pending/rendering/sending
-# =在途会自然到达，不重排。voiced_by_lane 是闲聊路代播的"估计已听到"，
-# 例外可重开：用户显式追问时闲聊路可能已死/被打断，必须能补播。
+# 重开白名单：显式追问（get_task）可重置为 pending 并重排 deliver——
+# 这不是自动重试，是 outbox 重入语义（2026-11-06 待办）。2026-11-07
+# 起结果播报收归交付泵单一出口：闲聊路不再代播结果（只说桥接短语），
+# 所以"已听到"（played_confirmed/sent_unconfirmed）也必须可重开——
+# 用户说"再讲一遍"时唯一能说话的就是交付泵。在途
+# （pending/rendering/sending）不重排：结果会自然到达。
 _DLV_REOPEN_FROM = frozenset({
     C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
-    C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED, C.DLV_VOICED_BY_LANE})
+    C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED,
+    C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED})
 
 
 class StoreError(Exception):
@@ -225,12 +225,6 @@ class AgentStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._migrate()
-        # 闲聊路（voice lane）已口播的结果记账 {(task_id, revision)}：
-        # get_task 提交时 chitchat_spoke → 闲聊路会把结果说出来，交付泵
-        # 看到就不再补播（2026-11-07 实测：湖人结果闲聊路说完开拓者，
-        # 交付泵 34 次尝试后又把同一条播了一遍）。显式追问重排交付时
-        # 清除（_redeliver_unheard）。
-        self._voiced_by_lane = set()
 
     # ------------------------------------------------------------------ 基础
 
@@ -395,8 +389,7 @@ class AgentStore:
                     "SELECT task_id, state FROM deliveries WHERE "
                     "session_id=? AND kind='result' AND task_id IS NOT NULL "
                     "ORDER BY rowid", (session_id,)).fetchall():
-                delivered[d["task_id"]] = d["state"] in (
-                    C.DLV_PLAYED_CONFIRMED, C.DLV_VOICED_BY_LANE)
+                delivered[d["task_id"]] = d["state"] == C.DLV_PLAYED_CONFIRMED
             return [{
                 "task_id": t["task_id"], "goal": t["goal"] or t["label"],
                 "execution_status": t["execution_status"],
@@ -436,7 +429,7 @@ class AgentStore:
     # -------------------------------------------------------------- 提交计划
 
     def commit_plan(self, session_id, request_id, plan, plan_version=1,
-                    _fail_after=None, chitchat_spoke=False):
+                    _fail_after=None):
         """应用一个已通过 parse_plan 的计划（手册 §8）。
 
         - 幂等：同一 (request_id, plan_version) 重放 → 返回旧回执，
@@ -445,18 +438,13 @@ class AgentStore:
         - 语义拒绝（unknown_task/stale_revision/queue_full）不回滚整批：
           该 op 得 rejected 回执，其余 op 照常提交（显式逐项结果，§8）。
         - _fail_after：仅测试用——处理完第 N 个 op 后抛错，模拟崩溃窗口。
-        - chitchat_spoke：闲聊路（voice lane）已把任务情况口播 →
-          get_task 对已完成任务不再重排结果重播（冗余）；交付行不动，
-          用户下次显式追问仍可完整重播——不是持久标记。等补充信息
-          （waiting_input）的问题重播不受影响：闲聊路不知道问题内容。
         """
         with self._tx():
             return self._commit_plan_locked(
-                session_id, request_id, plan, plan_version, _fail_after,
-                chitchat_spoke)
+                session_id, request_id, plan, plan_version, _fail_after)
 
     def _commit_plan_locked(self, session_id, request_id, plan, plan_version,
-                            _fail_after, chitchat_spoke=False):
+                            _fail_after):
         op_ids = [C.operation_id_for(request_id, plan_version, i)
                   for i in range(len(plan.operations))]
         # 幂等重放：原子提交保证 operation_id 全存在或全不存在
@@ -490,7 +478,7 @@ class AgentStore:
         receipts, queries = [], []
         for idx, (o, oid) in enumerate(zip(plan.operations, op_ids)):
             receipt = self._apply_op(session_id, request_id, o, oid, idx,
-                                     bindings, chitchat_spoke=chitchat_spoke)
+                                     bindings)
             receipts.append(receipt)
             if isinstance(o, C.RuntimeQuery):
                 queries.append({"query": o.query, "value": self._now()})
@@ -535,8 +523,7 @@ class AgentStore:
         for n in graph:
             visit(n)
 
-    def _apply_op(self, session_id, request_id, o, oid, idx, bindings,
-                  chitchat_spoke=False):
+    def _apply_op(self, session_id, request_id, o, oid, idx, bindings):
         """单个 op 的事务内应用。返回 Receipt。语义拒绝返回 rejected 回执，
         不抛异常。"""
         if isinstance(o, C.CreateTask):
@@ -559,8 +546,7 @@ class AgentStore:
         if isinstance(o, C.CancelTasks):
             return self._op_cancel(session_id, request_id, o, oid, idx)
         if isinstance(o, C.GetTask):
-            return self._op_get(session_id, request_id, o, oid, idx,
-                                chitchat_spoke=chitchat_spoke)
+            return self._op_get(session_id, request_id, o, oid, idx)
         if isinstance(o, C.AnswerTaskQuestion):
             return self._op_answer(session_id, request_id, o, oid, idx)
         if isinstance(o, C.RuntimeQuery):
@@ -829,8 +815,7 @@ class AgentStore:
 
     # -- get / answer --------------------------------------------------------
 
-    def _op_get(self, session_id, request_id, o, oid, idx,
-                chitchat_spoke=False):
+    def _op_get(self, session_id, request_id, o, oid, idx):
         if o.target_task_id:
             t = self.task_row(session_id, o.target_task_id)
             if t is None:
@@ -843,24 +828,15 @@ class AgentStore:
                           task_id=o.target_task_id,
                           revision=t["current_revision"], outcome=C.RC_INFO,
                           current_state=t["execution_status"])
-            # 重播（2026-11-06 待办）：结果已在但用户没完整听到（交付被打断/
-            # 掐死/抑制）→ 重排 deliver outbox 并重开交付行，回执改说
-            # "再说一遍"。用户显式追问 ≠ 自动重试，不违反"打断是终态"。
-            # 闲聊路已把结果摘要口播（chitchat_spoke）→ 本轮重播冗余，跳过
-            # （方案 A：只跳本轮，交付行不动，下次显式追问仍可完整重播）。
+            # 重播（2026-11-06 待办 → 2026-11-07 单一出口重构）：结果已在
+            # → 显式追问重排 deliver outbox 并重开交付行（含已完整听到的
+            # played_confirmed——闲聊路不再代播结果，"再讲一遍"只能由交付
+            # 泵兑现），回执改说"再说一遍"。在途交付不双排。用户显式追问
+            # ≠ 自动重试，不违反"打断是终态"。
             if (t["execution_status"] in (C.EXEC_COMPLETED,
                                           C.EXEC_WAITING_INPUT)
-                    and not (chitchat_spoke
-                             and t["execution_status"] == C.EXEC_COMPLETED)
                     and self._redeliver_unheard(session_id, t)):
                 r.reason_code = "redelivering"
-            if (chitchat_spoke
-                    and t["execution_status"] == C.EXEC_COMPLETED):
-                # 闲聊路会把这条结果口播出来（报任务情况）→ 记账，交付
-                # 泵不再补播同一条。waiting_input 不记：闲聊路不知道问题
-                # 内容，问题重播不受影响。
-                self._voiced_by_lane.add(
-                    (o.target_task_id, t["current_revision"]))
         else:
             tasks = self.task_view(session_id)
             if o.list_scope == "active":
@@ -941,35 +917,26 @@ class AgentStore:
             (C.DLV_SUPPRESSED, self._now(), session_id, task_id, revision))
 
     def _reopen_delivery(self, delivery_id):
-        """必须已在 _tx 内。把"从未完整听到"的终态交付重置为 pending 并
-        清零重试计数（get_task 重播）。原子 WHERE 守卫：状态不在重开
-        白名单时静默不动。"""
+        """必须已在 _tx 内。把已完成交付重置为 pending 并清零重试计数
+        （get_task 显式追问重播）。原子 WHERE 守卫：状态不在重开
+        白名单（在途状态）时静默不动。"""
         self._conn.execute(
             "UPDATE deliveries SET state=?, retries=0, updated_at=? "
-            "WHERE delivery_id=? AND state IN (?,?,?,?,?)",
+            "WHERE delivery_id=? AND state IN (?,?,?,?,?,?)",
             (C.DLV_PENDING, self._now(), delivery_id,
              C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
              C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED,
-             C.DLV_VOICED_BY_LANE))
-
-    def was_voiced_by_lane(self, task_id, revision) -> bool:
-        """该 (task_id, revision) 的结果已被闲聊路口播（交付泵据此跳过
-        补播）。"""
-        with self._lock:
-            return (task_id, revision) in self._voiced_by_lane
+             C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED))
 
     def _redeliver_unheard(self, session_id, t):
-        """必须已在 _tx 内。任务已有结果但用户没完整听到 → 重排一条
+        """必须已在 _tx 内。任务已有结果 → 显式追问（get_task）重排一条
         deliver outbox（复用最近一条已完成 deliver 的原文 payload）并
         重开交付行。返回 True 表示已重排（回执应说"再说一遍"）。
         在途交付（outbox 未消费 / delivery pending-rendering-sending）会让
         结果自然到达，不重排；已听到（played_confirmed /
-        sent_unconfirmed）不重播。"""
+        sent_unconfirmed）也重排——结果播报的唯一出口是交付泵，用户
+        "再讲一遍"只能由它兑现（2026-11-07 单一出口重构）。"""
         task_id = t["task_id"]
-        # 用户显式追问 = 重新要这个结果：清掉闲聊路口播记账，否则交付
-        # 泵会把重排的 deliver 当"已说过"拒掉
-        self._voiced_by_lane.discard(
-            (task_id, t["current_revision"]))
         for row in self._conn.execute(
                 "SELECT payload_json FROM outbox WHERE session_id=? AND "
                 "kind='deliver' AND state IN ('pending','leased')",
