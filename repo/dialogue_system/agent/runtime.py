@@ -643,9 +643,12 @@ class AgentRuntimeV2:
                 "text": text, "request_seq": request_seq}
         return {"ok": True, "request_id": request_id, "plan": plan}
 
-    def commit_pending(self, session_id):
+    def commit_pending(self, session_id, chitchat_spoke=False):
         """grace 通过后由 adapter 调用（§6.1：复用同一 grace 结论作为
-        业务提交门，不复制第二套计时阈值）。返回 None = 无待提交计划。"""
+        业务提交门，不复制第二套计时阈值）。返回 None = 无待提交计划。
+        chitchat_spoke：闲聊路（voice lane）已/将会口播 → 受理/状态类
+        回执不再渲染（QUIET_IF_VOICED_OUTCOMES），get_task 对已完成任务
+        跳过结果重播；纠错/失败类照常。"""
         with self._pending_lock:
             entry = self._pending.pop(session_id, None)
         if entry is None:
@@ -658,8 +661,10 @@ class AgentRuntimeV2:
             return None
         res = self.store.commit_plan(session_id, entry["request_id"],
                                      entry["plan"],
-                                     plan_version=entry["version"])
-        texts = self._receipt_texts(session_id, res)
+                                     plan_version=entry["version"],
+                                     chitchat_spoke=chitchat_spoke)
+        texts = self._receipt_texts(session_id, res,
+                                    chitchat_spoke=chitchat_spoke)
         # plan 一并带回：adapter 需要 reply_mode/direct_question 决定
         # 是否追加表达轮（§7.3 mixed 不能被控制操作吞掉）
         return {"result": res, "texts": texts, "plan": entry["plan"],
@@ -679,11 +684,15 @@ class AgentRuntimeV2:
 
     # ------------------------------------------------------------- 回执话术
 
-    def _receipt_texts(self, session_id, res):
+    def _receipt_texts(self, session_id, res, chitchat_spoke=False):
         labels = {t["task_id"]: t["label"] for t in
                   self.store.task_view(session_id)}
         texts = []
         for r in res.receipts:
+            # 闲聊路已口播受理/状态 → 此类回执冗余，不再上口（双路并行
+            # 设计：闲聊路看同一份任务面板）；纠错/失败类不在静音集合。
+            if chitchat_spoke and r.outcome in _C.QUIET_IF_VOICED_OUTCOMES:
+                continue
             t = _C.receipt_text(r, label=labels.get(r.task_id, ""))
             if t:
                 texts.append(t)

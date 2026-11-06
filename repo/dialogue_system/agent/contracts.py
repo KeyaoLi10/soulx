@@ -65,6 +65,15 @@ RC_REJECTED = "rejected"
 RC_ANSWERED = "answered"
 RC_INFO = "info"
 
+# 闲聊路（voice lane）已开口时无需再播的回执类别：受理/状态播报类——
+# 闲聊路看同一份任务面板，会把这些内容自然地说出来。纠错/失败类
+# （RC_REJECTED）绝不在此列：闲聊路不知道拒绝原因，必须由回执把
+# 真相说出口（2026-11-06 双路并行设计，方案 A/B/C）。
+QUIET_IF_VOICED_OUTCOMES = {
+    RC_ACCEPTED, RC_UPDATED, RC_CANCEL_REQUESTED, RC_CANCELED,
+    RC_ALREADY_COMPLETED, RC_DELIVERY_SUPPRESSED, RC_ANSWERED, RC_INFO,
+}
+
 # 与 clients/llm_client.TOOL_QUIET 同值（legacy 路径继续用那边；此处解耦
 # 供新 runtime 与测试使用，避免 agent 包 import 语音客户端）
 TOOL_QUIET = "[[quiet]]"

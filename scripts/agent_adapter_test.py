@@ -59,10 +59,13 @@ MIXED_PLAN = plan_json([
 
 
 def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
-             can_deliver=True, runner=None, ui=False, speak_impl=None):
+             can_deliver=True, runner=None, ui=False, speak_impl=None,
+             chitchat_impl=None):
     """router_plans: 弹出式（字符串=计划 JSON；Exception=抛出；callable=
     调用取返回值——用于卡住某次路由制造竞态）。speak_impl 可注入自定义
-    上口（如门控回执制造"已提交但线程存活"）。
+    上口（如门控回执制造"已提交但线程存活"）。chitchat_impl 可注入
+    闲聊路（callable(stop_event) -> 生成器，可抛异常/门控阻塞）；
+    缺省 None = 不起闲聊路（旧场景验证无闲聊路的仲裁原语义）。
     ui=True 时挂 on_event（UI 泵 0.05s 轮询，事件进 state["ui_events"]）。"""
     state = {
         "speak_calls": [], "gen_calls": [], "router_calls": 0,
@@ -110,6 +113,8 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
         return rs[len(state["speak_calls"]) - 1] if rs else True
 
     speak_fn = speak_impl or default_speak
+    # 闲聊路仅在新场景显式注入（旧场景验证的是无闲聊路的仲裁原语义）
+    chitchat_fn = chitchat_impl or None
 
     def deliver_speak(env, text, stop_event):
         state["speak_calls"].append(text)
@@ -134,6 +139,7 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
         last_voice_ts_fn=lambda: state["last_voice_ts"],
         speak_fn=speak_fn,
         can_deliver_fn=lambda: state["can_deliver"],
+        chitchat_fn=chitchat_fn,
         generate_fn=lambda stop_event: iter(["你好呀，我是表达轮。"]),
         history_fn=lambda: [{"role": "user", "content": "hi"}],
         release_gen_fn=lambda sn: state["gen_releases"].append(sn),
@@ -568,6 +574,183 @@ check("19e explicit get_task re-delivers after retraction", ok,
       str(st["speak_calls"]))
 check("19f retraction flag cleared by re-delivery",
       rt.store.task_row("s1", "T1")["cancel_intent"] == 0)
+
+# ==== 场景 20-25：双路并行（2026-11-06 闲聊路设计，方案 A/B/C）===========
+# 闲聊路（chitchat_fn）与路由路并行：闲聊路负责常规口播，路由路只在
+# 后台做任务机器；仲裁 = 受理/状态类回执静音（QUIET_IF_VOICED_OUTCOMES）
+# + get_task 跳结果重播 + 失败/纠错类照播 + 闲聊路故障全套回退。
+
+def _std_chitchat(stop_event):
+    return iter(["好，我去查一下。"])
+
+
+def _committed_count(rt):
+    return rt.store._conn.execute(
+        "SELECT COUNT(*) AS n FROM requests WHERE state='committed'"
+    ).fetchone()["n"]
+
+
+# 20 任务轮双路：闲聊路应承，受理回执静音，任务照常创建
+rt, ad, st = make_env(tmp, [CREATE_PLAN], chitchat_impl=_std_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")
+ok = wait(lambda: any("好，我去查一下" in str(x) for x in st["speak_calls"]))
+check("20 chitchat lane voices acceptance", ok, str(st["speak_calls"]))
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
+check("20b router lane still creates the task", ok)
+time.sleep(0.3)
+check("20c acceptance receipt quiet (voiced by chitchat)",
+      not any("已经安排好了" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+check("20d no silent-turn ack piled on top",
+      not any(x == "好的。" for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+
+# 21 闲聊路失败 → 全套回退（方案 C）：回执照旧 + direct 走表达轮。
+# 路由人为放慢 0.2s 保证失败先于 commit 落账（确定性排序）。
+def _boom_chitchat(stop_event):
+    raise RuntimeError("chitchat down")
+
+
+def _slow_create():
+    time.sleep(0.2)
+    return CREATE_PLAN
+
+
+DIRECT_PLAN = plan_json([], reply_mode="direct")
+rt, ad, st = make_env(tmp, [_slow_create, DIRECT_PLAN],
+                      chitchat_impl=_boom_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")
+ok = wait(lambda: any("已经安排好了" in str(x) for x in st["speak_calls"]))
+check("21 chitchat failure falls back to receipt", ok, str(st["speak_calls"]))
+ad.handle_utterance("你好呀")
+ok = wait(lambda: any("表达轮" in str(x) for x in st["speak_calls"]))
+check("21b chitchat failure falls back to expression round", ok,
+      str(st["speak_calls"]))
+
+# 22 纠错类回执不静音：闲聊路活着，unknown_task 的拒绝回执照播
+UNKNOWN_CANCEL = plan_json([{"op": "cancel_tasks", "targets": [
+    {"task_id": "T9", "expected_revision": 1}]}], reply_mode="receipts")
+rt, ad, st = make_env(tmp, [UNKNOWN_CANCEL], chitchat_impl=_std_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("把那个取消")
+ok = wait(lambda: any("我没有找到你说的那个任务" in str(x)
+                      for x in st["speak_calls"]))
+check("22 rejected receipt still speaks with chitchat alive", ok,
+      str(st["speak_calls"]))
+
+# 23 get_task + 闲聊路活着 → 已完成结果不再重排重播（方案 A：只跳本轮，
+# 交付行不动）；闲聊路失败后的下一次追问恢复重播
+chat_ctl = {"boom": False}
+
+
+def _ctl_chitchat(stop_event):
+    if chat_ctl["boom"]:
+        raise RuntimeError("chitchat down")
+    return iter(["好，我去查一下。"])
+
+
+rt, ad, st = make_env(tmp, [CREATE_PLAN, CANCEL_PLAN, GET_PLAN, GET_PLAN],
+                      chitchat_impl=_ctl_chitchat)
+rt_ref[0] = rt
+st["can_deliver"] = False            # 结果压 outbox：交付行尚未创建
+ad.handle_utterance("查一下骑士队的比赛")
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None
+          and rt.store.task_row("s1", "T1")["execution_status"]
+          == C.EXEC_COMPLETED)
+check("23 task completed, result held", ok)
+ad.handle_utterance("不对，我要查的是湖人队")
+ok = wait(lambda: rt.store.task_row("s1", "T1")["cancel_intent"] == 1)
+check("23b retraction still lands (router lane unaffected)", ok)
+st["can_deliver"] = True
+time.sleep(0.4)
+for _ in range(6):
+    rt.delivery.pump()
+    time.sleep(0.05)
+check("23c retracted result stays silent",
+      not any("北京晴" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+ad.handle_utterance("骑士队结果怎么样")      # get_task + 闲聊路活着
+ok = wait(lambda: _committed_count(rt) >= 3)
+check("23d get_task committed with chitchat alive", ok)
+time.sleep(0.4)
+for _ in range(6):
+    rt.delivery.pump()
+    time.sleep(0.05)
+check("23e completed-result replay skipped this turn (voiced by chitchat)",
+      not any("北京晴" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+check("23f retraction flag untouched by skipped replay",
+      rt.store.task_row("s1", "T1")["cancel_intent"] == 1)
+chat_ctl["boom"] = True
+ad.handle_utterance("再讲一遍骑士队结果")    # get_task + 闲聊路失败
+ok = wait(lambda: any("北京晴" in str(x) for x in st["speak_calls"]))
+check("23g next explicit ask replays in full", ok, str(st["speak_calls"]))
+check("23h replay clears retraction flag",
+      rt.store.task_row("s1", "T1")["cancel_intent"] == 0)
+
+# 24 stop-only 计划掐掉闲聊路生成器（纪律是"停一下→不出声"）
+STOP_PLAN = plan_json([{"op": "stop_speech",
+                        "evidence": {"quote": "停一下"}}],
+                      reply_mode="receipts")
+
+
+def _slow_stop():
+    time.sleep(0.25)
+    return STOP_PLAN
+
+
+def _make_gated_chitchat(gate):
+    """门控闲聊路：生成器在 gate 放行前阻塞（制造"commit 先于开口"
+    的确定性时序）。"""
+    def _f(stop_event):
+        def _gen():
+            gate.wait(timeout=8)
+            if stop_event.is_set():
+                return
+            yield "诶怎么了？"
+        return _gen()
+    return _f
+
+
+chat_gate = threading.Event()
+rt, ad, st = make_env(tmp, [_slow_stop],
+                      chitchat_impl=_make_gated_chitchat(chat_gate))
+rt_ref[0] = rt
+ad.handle_utterance("停一下")
+ok = wait(lambda: rt.store._conn.execute(
+    "SELECT COUNT(*) AS n FROM outbox WHERE kind='stop_speech'"
+).fetchone()["n"] >= 1)
+check("24 stop-only plan committed", ok)
+chat_gate.set()                      # commit 之后才放行生成器
+time.sleep(0.3)
+check("24b stop-only cuts chitchat generator",
+      not any("诶怎么了" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+
+# 25 续说作废同时掐闲聊路：旧轮生成器死，新轮正常开口
+def _slow_old():
+    time.sleep(0.3)
+    return CREATE_PLAN
+
+
+gate25 = threading.Event()
+rt, ad, st = make_env(tmp, [_slow_old, CREATE_PLAN],
+                      chitchat_impl=_make_gated_chitchat(gate25))
+rt_ref[0] = rt
+ad.handle_utterance("帮我查那个")     # 旧轮：闲聊路门控阻塞
+time.sleep(0.05)
+ad.handle_utterance("查北京天气")     # 新轮作废旧轮（含闲聊路 stop）
+ok = wait(lambda: st["router_calls"] == 2)
+check("25 continuation re-routes", ok)
+gate25.set()                         # 放行后：旧轮 stop 已置→沉默，新轮开口
+time.sleep(0.3)
+check("25b abandoned turn's chitchat never speaks (only new turn's)",
+      sum("诶怎么了" in str(x) for x in st["speak_calls"]) == 1,
+      str(st["speak_calls"]))
+check("25c abandoned turn's plan never commits",
+      _committed_count(rt) == 1, str(_committed_count(rt)))
 
 # ==== 场景 9：close 释放 ====================================================
 rt, ad, st = make_env(tmp, [])

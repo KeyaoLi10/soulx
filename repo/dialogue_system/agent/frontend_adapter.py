@@ -12,8 +12,14 @@
                                 与 _run_speech_pipeline 完全一致的三态：
                                 True=完整播出 False=播出后打断 None=静默掐死
   can_deliver_fn()    -> bool    现有话权结论（_agent_can_deliver）
+  chitchat_fn(stop_event) -> segment 生成器
+                                闲聊路（voice lane）：任务面板注入的
+                                generate_with_history，与本轮路由并行，
+                                负责本轮全部常规口播（2026-11-06 双路
+                                并行设计，方案 B）
   generate_fn(stop_event) -> segment 生成器
-                                表达轮（direct/mixed 的 direct_question）
+                                表达轮兜底（方案 C）：仅闲聊路失败/缺席
+                                时 direct/mixed 才走旧串行路径
   history_fn()        -> [{role, content}]   最近对话（喂路由快照）
   release_gen_fn(gen_sn) -> None  释放收音循环 commit 时置位的
                                 gen_in_progress（enforce 无声轮兜底，
@@ -63,6 +69,7 @@ class AgentFrontendAdapter:
                  last_voice_ts_fn: Callable[[], float],
                  speak_fn: Callable,
                  can_deliver_fn: Callable[[], bool],
+                 chitchat_fn: Optional[Callable] = None,
                  generate_fn: Optional[Callable] = None,
                  history_fn: Optional[Callable] = None,
                  mode: str = "shadow",
@@ -91,6 +98,7 @@ class AgentFrontendAdapter:
         self.last_voice_ts_fn = last_voice_ts_fn
         self.speak_fn = speak_fn
         self.can_deliver_fn = can_deliver_fn
+        self.chitchat_fn = chitchat_fn
         self.generate_fn = generate_fn
         self.history_fn = history_fn or (lambda: [])
         self.mode = mode
@@ -214,11 +222,13 @@ class AgentFrontendAdapter:
         在 finally 里释放；被更新的话轮取代时 gen_serial 已变，释放
         自然成为 no-op）。
 
-        流程（§6/§7）：
+        流程（§6/§7，2026-11-06 双路并行）：
           1. 上一话轮的计划还没过 grace 门 → 作废（续说场景，§6.2）
-          2. submit_request（路由，3-6s）→ 计划挂起
-          3. 等 grace 门开（共享阈值，轮询 last_voice_ts）→ commit
-          4. 回执模板话术上口（speak_fn 三态）；direct/mixed 追加表达轮
+          2. 闲聊路（chitchat_fn）与路由并行启动：闲聊路过 grace 门后
+             生成+流式上口，负责本轮常规口播
+          3. submit_request（路由，3-6s）→ 计划挂起 → 等 grace 门开
+             → commit（闲聊路活着时受理/状态类回执静音+get_task 跳重播）
+          4. 纠错/失败类回执上口；闲聊路失败时 clarify/表达轮兜底
         """
         with self._utterance_lock:
             self._turn_seq += 1
@@ -234,6 +244,11 @@ class AgentFrontendAdapter:
                 self.runtime.discard_pending(self.session_id,
                                              reason="continuation")
                 prev_turn["abandoned"] = True
+                # 闲聊路一并作废：停生成（已发射的音频由新话轮的上口
+                # interrupt 掐掉，与回执让路同一套语义）
+                prev_stop = prev_turn.get("chitchat_stop")
+                if prev_stop is not None:
+                    prev_stop.set()
                 # 续说合并：被作废片段的文本并入新句一起重路由（镜像 LLM
                 # 侧按句 groupby 的合并语义——碎片单独路由时快脑只能对着
                 # 半句话脑补 goal，2026-11-06 湖人任务就是这么造出来的）。
@@ -242,7 +257,13 @@ class AgentFrontendAdapter:
                     text = prev_text + "\n" + text
 
         turn = {"thread": None, "abandoned": False, "committed": False,
-                "text": text, "seq": turn_seq}
+                "text": text, "seq": turn_seq,
+                # 闲聊路（voice lane）状态：stop 掐生成；rc 三态与 speak_fn
+                # 一致；failed=异常（仲裁回退旧路径）；done=线程收尾
+                "chitchat_stop": threading.Event(),
+                "chitchat_rc": None, "chitchat_failed": False,
+                "chitchat_started": False,
+                "chitchat_done": threading.Event()}
         th = threading.Thread(
             target=self._turn_worker, daemon=True,
             name=f"agent-v2-turn-{self.session_id[:8]}",
@@ -277,15 +298,67 @@ class AgentFrontendAdapter:
             # （2026-11-06 listening 卡死事故的致命一环）。
             self._release_gen(gen_sn)
 
+    def _chitchat_worker(self, turn):
+        """闲聊路（voice lane）：grace 门开后生成 + 流式上口，与路由路
+        并行。rc 三态与 speak_fn 一致；异常记 chitchat_failed（仲裁时
+        回退旧路径——回执上口/表达轮兜底，方案 C）。"""
+        rc = None
+        try:
+            # 与路由路同一个 grace 门（§6.1：不复制第二套计时阈值）——
+            # 续说窗口内绝不开口，否则续说会被半句闲聊打断
+            grace_s = float(self.grace_s_fn() or 0.0)
+            if grace_s > 0:
+                while True:
+                    if self._stop.is_set() or turn.get("abandoned"):
+                        return
+                    if time.time() - self.last_voice_ts_fn() >= grace_s:
+                        break
+                    time.sleep(self.grace_poll_s)
+            if self._stop.is_set() or turn.get("abandoned"):
+                return
+            stop_event = turn["chitchat_stop"]
+            gen = self.chitchat_fn(stop_event)
+            rc = self.speak_fn(gen, stop_event)
+        except Exception:  # noqa: BLE001 — 闲聊路失败回退回执路径
+            logger.exception("[%s][v2] chitchat lane failed",
+                             self.session_id[:8])
+            turn["chitchat_failed"] = True
+            rc = None
+        finally:
+            turn["chitchat_rc"] = rc
+            turn["chitchat_done"].set()
+
+    @staticmethod
+    def _chitchat_alive(turn) -> bool:
+        """仲裁用：闲聊路会开口/已开口。running 或已播出（True/False，
+        含播出后被掐）都算——受理类回执的口播职责已移交闲聊路。"""
+        if not turn.get("chitchat_started") or turn.get("chitchat_failed"):
+            return False
+        if turn["chitchat_done"].is_set():
+            return turn.get("chitchat_rc") in (True, False)
+        return True
+
     def _turn_worker_inner(self, turn, text, turn_trigger, source_commit_id):
+        # 闲聊路先行启动（与路由并行——提速的全部来源）：grace 门后生成，
+        # 首句 ~1s 即流式进 TTS，不等路由裁决
+        if self.chitchat_fn is not None:
+            turn["chitchat_started"] = True
+            threading.Thread(
+                target=self._chitchat_worker, daemon=True,
+                name=f"agent-v2-chat-{self.session_id[:8]}",
+                args=(turn,)).start()
         res = self.runtime.submit_request(
             self.session_id, text, source_commit_id=source_commit_id,
             request_seq=turn.get("seq"))
         if not res.get("ok"):
-            # 路由失败/超时：终态 + 固定澄清（§6.2），队列已释放
+            # 路由失败/超时：终态 + 固定澄清（§6.2），队列已释放。
+            # 闲聊路活着时不再说——本轮口播已由它负责（纯闲聊轮路由失败
+            # 完全无感才是对的）；代价是任务轮的"我去查"可能没有后台任务
+            # 兑现（罕见：传输故障本来就已是降级态，用户重问即恢复）。
             logger.info("[%s][v2] route failed: %s", self.session_id[:8],
                         res.get("error"))
-            self._speak_safe(ROUTER_FAIL_TEXT)
+            if not self._chitchat_alive(turn):
+                self._speak_safe(ROUTER_FAIL_TEXT)
             return
         # grace 提交门（§6.1）：窗口内只挂起；复用前端同一阈值
         grace_s = float(self.grace_s_fn() or 0.0)
@@ -304,26 +377,39 @@ class AgentFrontendAdapter:
         if (self._stop.is_set() or turn.get("abandoned")
                 or not self.runtime.pending_exists(self.session_id)):
             return
-        out = self.runtime.commit_pending(self.session_id)
+        chitchat_alive = self._chitchat_alive(turn)
+        out = self.runtime.commit_pending(self.session_id,
+                                          chitchat_spoke=chitchat_alive)
         if out is None:
             return  # 门又关上（续说抢先）——计划仍挂起，交由下一轮处理
         turn["committed"] = True
-        # 回执话术：程序模板，不让模型自由解释（§13.1）
+        plan = out.get("plan")
+        ops = [getattr(o, "op", "") for o in
+               (plan.operations if plan is not None else [])]
+        # stop-only：闲聊路的纪律是"停一下→不出声"，commit 后把生成器
+        # 也掐掉（防模型不守规矩多话；已发射音频由 stop_speech 交付泵处理）
+        if ops == ["stop_speech"]:
+            turn["chitchat_stop"].set()
+        # 回执话术：程序模板，不让模型自由解释（§13.1）。闲聊路活着时
+        # 受理/状态类已被 commit_pending 过滤（QUIET_IF_VOICED_OUTCOMES），
+        # 这里剩下的只剩纠错/失败类——它们必须上口（闲聊路不知道拒绝原因）
         for receipt_text in out.get("texts") or []:
             if not self._speak_safe(receipt_text):
                 return   # 打断即终态，本轮后续回执不再上口
-        plan = out.get("plan")
-        # 澄清话术（clarify 模式）：路由没听懂时要问的问题也是控制轮的
-        # 终态，必须上口——漏掉就是无声轮（2026-11-06 事故家族）
+        # 澄清话术（clarify 模式）：闲聊路按同一条"没说清要反问"纪律自己
+        # 问；只有闲聊路失败/缺席时路由的反问才上口（兜底，方案 C）
         if (plan is not None and plan.reply_mode == "clarify"
                 and plan.clarification):
-            self._speak_safe(plan.clarification)
+            if not self._chitchat_alive(turn):
+                self._speak_safe(plan.clarification)
             return
-        # 表达轮：direct/mixed 的 direct_question 走正常生成（§7.3：不能
-        # 因为本轮有一个控制操作就吞掉另一个问题）
+        # 表达轮兜底（方案 C）：direct/mixed 的 direct_question 只在闲聊路
+        # 失败/缺席时走旧串行路径——绝不让闲聊路故障变成无声轮（§7.3：
+        # 不能因为本轮有一个控制操作就吞掉另一个问题）
         if (self.generate_fn is not None and plan is not None
                 and plan.reply_mode in ("direct", "mixed")
-                and (plan.direct_question or plan.reply_mode == "direct")):
+                and (plan.direct_question or plan.reply_mode == "direct")
+                and not self._chitchat_alive(turn)):
             stop_event = threading.Event()
             try:
                 gen = self.generate_fn(stop_event)
@@ -335,10 +421,9 @@ class AgentFrontendAdapter:
                                  self.session_id[:8])
             return
         # 无声兜底：计划已提交却一个字都没上口（模板空洞，如列表查询）。
+        # 闲聊路还活着/已开口就不补——它（可能还在生成）就是本轮的口播。
         # stop_speech 除外——它的回执就是安静本身，再说一个字就自相矛盾。
-        if not (out.get("texts") or []):
-            ops = [getattr(o, "op", "") for o in
-                   (plan.operations if plan is not None else [])]
+        if not (out.get("texts") or []) and not self._chitchat_alive(turn):
             if "stop_speech" not in ops:
                 self._speak_safe(SILENT_TURN_ACK_TEXT)
 

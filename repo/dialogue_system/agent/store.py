@@ -426,7 +426,7 @@ class AgentStore:
     # -------------------------------------------------------------- 提交计划
 
     def commit_plan(self, session_id, request_id, plan, plan_version=1,
-                    _fail_after=None):
+                    _fail_after=None, chitchat_spoke=False):
         """应用一个已通过 parse_plan 的计划（手册 §8）。
 
         - 幂等：同一 (request_id, plan_version) 重放 → 返回旧回执，
@@ -435,13 +435,18 @@ class AgentStore:
         - 语义拒绝（unknown_task/stale_revision/queue_full）不回滚整批：
           该 op 得 rejected 回执，其余 op 照常提交（显式逐项结果，§8）。
         - _fail_after：仅测试用——处理完第 N 个 op 后抛错，模拟崩溃窗口。
+        - chitchat_spoke：闲聊路（voice lane）已把任务情况口播 →
+          get_task 对已完成任务不再重排结果重播（冗余）；交付行不动，
+          用户下次显式追问仍可完整重播——不是持久标记。等补充信息
+          （waiting_input）的问题重播不受影响：闲聊路不知道问题内容。
         """
         with self._tx():
             return self._commit_plan_locked(
-                session_id, request_id, plan, plan_version, _fail_after)
+                session_id, request_id, plan, plan_version, _fail_after,
+                chitchat_spoke)
 
     def _commit_plan_locked(self, session_id, request_id, plan, plan_version,
-                            _fail_after):
+                            _fail_after, chitchat_spoke=False):
         op_ids = [C.operation_id_for(request_id, plan_version, i)
                   for i in range(len(plan.operations))]
         # 幂等重放：原子提交保证 operation_id 全存在或全不存在
@@ -475,7 +480,7 @@ class AgentStore:
         receipts, queries = [], []
         for idx, (o, oid) in enumerate(zip(plan.operations, op_ids)):
             receipt = self._apply_op(session_id, request_id, o, oid, idx,
-                                     bindings)
+                                     bindings, chitchat_spoke=chitchat_spoke)
             receipts.append(receipt)
             if isinstance(o, C.RuntimeQuery):
                 queries.append({"query": o.query, "value": self._now()})
@@ -520,7 +525,8 @@ class AgentStore:
         for n in graph:
             visit(n)
 
-    def _apply_op(self, session_id, request_id, o, oid, idx, bindings):
+    def _apply_op(self, session_id, request_id, o, oid, idx, bindings,
+                  chitchat_spoke=False):
         """单个 op 的事务内应用。返回 Receipt。语义拒绝返回 rejected 回执，
         不抛异常。"""
         if isinstance(o, C.CreateTask):
@@ -543,7 +549,8 @@ class AgentStore:
         if isinstance(o, C.CancelTasks):
             return self._op_cancel(session_id, request_id, o, oid, idx)
         if isinstance(o, C.GetTask):
-            return self._op_get(session_id, request_id, o, oid, idx)
+            return self._op_get(session_id, request_id, o, oid, idx,
+                                chitchat_spoke=chitchat_spoke)
         if isinstance(o, C.AnswerTaskQuestion):
             return self._op_answer(session_id, request_id, o, oid, idx)
         if isinstance(o, C.RuntimeQuery):
@@ -812,7 +819,8 @@ class AgentStore:
 
     # -- get / answer --------------------------------------------------------
 
-    def _op_get(self, session_id, request_id, o, oid, idx):
+    def _op_get(self, session_id, request_id, o, oid, idx,
+                chitchat_spoke=False):
         if o.target_task_id:
             t = self.task_row(session_id, o.target_task_id)
             if t is None:
@@ -828,8 +836,12 @@ class AgentStore:
             # 重播（2026-11-06 待办）：结果已在但用户没完整听到（交付被打断/
             # 掐死/抑制）→ 重排 deliver outbox 并重开交付行，回执改说
             # "再说一遍"。用户显式追问 ≠ 自动重试，不违反"打断是终态"。
+            # 闲聊路已把结果摘要口播（chitchat_spoke）→ 本轮重播冗余，跳过
+            # （方案 A：只跳本轮，交付行不动，下次显式追问仍可完整重播）。
             if (t["execution_status"] in (C.EXEC_COMPLETED,
                                           C.EXEC_WAITING_INPUT)
+                    and not (chitchat_spoke
+                             and t["execution_status"] == C.EXEC_COMPLETED)
                     and self._redeliver_unheard(session_id, t)):
                 r.reason_code = "redelivering"
         else:

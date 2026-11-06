@@ -112,3 +112,50 @@ def render_snapshot_message(snapshot: dict, user_text: str) -> str:
         + "\n【用户原文】\n" + user_text
         + "\n请调用 route_turn 给出本轮控制计划。"
     )
+
+
+# ---------------------------------------------------------------------------
+# 闲聊路（voice lane）注入（2026-11-06 双路并行设计）
+# 用户话同时进闲聊路与路由路：闲聊路负责本轮全部口播（看任务面板如实
+# 报情况/应承新任务/正常闲聊），路由路只在后台做任务机器。此模板经
+# generate_with_history 的 extra_context 注入（user-role note，仅本轮）。
+# ---------------------------------------------------------------------------
+
+_CHITCHAT_STATUS_ZH = {
+    "queued": "排队中", "running": "进行中", "completed": "已完成",
+    "failed": "失败", "canceled": "已取消", "superseded": "已被新版本取代",
+    "cancel_requested": "正在停止", "blocked_dependency": "等前置任务",
+    "waiting_input": "等你补充信息",
+}
+
+CHITCHAT_CONTEXT_TEMPLATE = """【任务面板】（后台任务系统实时状态，仅供口播参考）
+{panel}
+
+【本轮口播纪律】
+用户这轮话由你负责口播；后台另有一套任务系统会实际执行任务，创建、取消、修改都不用你操心，你只管把话说好。
+- 用户提到面板里的任务：如实讲它的情况；已完成且有结果的，把结果讲出来（两三句内）。
+- 用户提出新的任务需求（要查、要算、要多步工作）：口头应承一句（如"好，我去查一下"），绝对不要编造结果。
+- 用户要取消或修改任务：口头应承（如"好的，我把它取消"）即可。
+- 纯聊天、问知识、问你的情况：正常回答。
+- 用户在说"停一下/等一下/别说了"：你不要出声，保持安静。
+- 任务需求信息不全（没说哪天、哪个、去哪）：直接反问，不要替用户猜。
+- 除非面板上该任务确实已完成且有结果，绝不说"已经查到了/已经做完了"。
+保持口语、简短，一般一到三句。"""
+
+
+def render_chitchat_context(panel_rows, max_tasks: int = 8):
+    """任务面板行（store.task_panel_rows）→ 闲聊路 extra_context 文本。
+    max_tasks 限界防止长会话把面板撑爆 prompt。"""
+    lines = []
+    for r in (panel_rows or [])[:max_tasks]:
+        st = _CHITCHAT_STATUS_ZH.get(r.get("execution_status"),
+                                     r.get("execution_status", ""))
+        bits = ["- {}「{}」{}".format(
+            r.get("task_id", ""), r.get("goal") or "", st)]
+        if r.get("progress"):
+            bits.append(f"进度：{r['progress']}")
+        if r.get("result"):
+            bits.append(f"结果：{r['result']}")
+        lines.append("，".join(bits))
+    panel = "\n".join(lines) if lines else "（当前没有任何任务）"
+    return CHITCHAT_CONTEXT_TEMPLATE.format(panel=panel)

@@ -1118,6 +1118,25 @@ def _make_agent_v2(session, client_id, mode=None):
     def _history():
         return [dict(m) for m in llm.get_session(client_id)]
 
+    def _chitchat_fn(stop_event):
+        """闲聊路（voice lane）生成器：任务面板注入 + generate_with_history。
+        与路由路并行，adapter 在 grace 门后消费流式上口（方案 B：走
+        :6007 /chat——表达轮基础设施全复用，流式/句级 TTS/Elva 人设/
+        打断/历史回写都现成）。面板读失败不拦说话（空面板照常闲聊）。"""
+        settings = dict(session.settings)
+        try:
+            panel = runtime.store.task_panel_rows(client_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("[%s][v2] chitchat panel read failed",
+                             client_id[:8])
+            panel = []
+        return llm.generate_with_history(
+            client_id, stop_event=stop_event,
+            system_prompt=settings.get("system_prompt") or None,
+            max_history=settings.get("max_history"),
+            min_seg_len=settings.get("min_seg_len"),
+            extra_context=agent_context.render_chitchat_context(panel))
+
     plan_router = PlanRouter()
 
     def _router_fn(sid, text, snap):
@@ -1162,6 +1181,8 @@ def _make_agent_v2(session, client_id, mode=None):
         last_voice_ts_fn=lambda: session.last_voice_ts,
         speak_fn=_speak,
         can_deliver_fn=lambda: _agent_can_deliver(session),
+        # 闲聊路（voice lane）：与路由并行，负责本轮常规口播
+        chitchat_fn=_chitchat_fn,
         release_gen_fn=lambda sn: _end_generation(session, sn),
         generate_fn=lambda stop_event: llm.generate_with_history(
             client_id,
