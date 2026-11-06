@@ -1004,6 +1004,19 @@ def _agent_deliver_entry(session, client_id, entry):
         ret = _run_speech_pipeline(
             session, client_id, gen, current_stop_event, tts_client, tts_options
         )
+        if ret is True:
+            # 发射完成 ≠ 播放完成：chunk 边发射边在浏览器里放（RTF≈0.36，
+            # 发射领先播放数秒）。此前 played_confirmed 在发射结束就置位
+            # （2026-11-06 湖人事故：服务端 33s 认定播完，浏览器 40s 才放
+            # 完）。握着 gen 标志等到播放时钟走完再返回；确认打断会把
+            # playback_end 清零，循环自然提前退出。
+            drain_deadline = time.time() + 30.0
+            while (not current_stop_event.is_set()
+                   and time.time() < drain_deadline):
+                with session.lock:
+                    if time.time() >= session.playback_end:
+                        break
+                time.sleep(0.25)
         if ret is None:
             # Silent kill: retract the result note. While it sits in
             # history the user's next ordinary reply reads it and speaks
@@ -1061,6 +1074,21 @@ def _make_agent_v2(session, client_id, mode=None):
         legacy _agent_deliver_entry 完全相同的 _run_speech_pipeline。
         三态 True/False/None 原样返回（§13 交付语义）。"""
         tts_client, tts_options = _tts_pair()
+        # 回执让路（2026-11-06 湖人事故第 4 环）：路由慢时（13s）回执上口
+        # 时上一个任务的播报还在浏览器里放——设计假设"回执紧跟用户说话"
+        # 被打破，无条件 interrupt 直接把天气播报掐在 6.5/11s。用户自交付
+        # 开播后没再开口（last_voice_ts < assistant_audible_ts）= 在安静
+        # 听，回执等播报放完再上口；用户插话过则照旧立刻掐断（对话优先）。
+        # 有界 20s：playback_end 是发射侧估计，卡住不能把回执饿死。
+        yield_deadline = time.time() + 20.0
+        while (not stop_event.is_set() and time.time() < yield_deadline):
+            with session.lock:
+                playing = time.time() < session.playback_end
+                user_spoke_since = (
+                    session.last_voice_ts >= session.assistant_audible_ts)
+            if not playing or user_spoke_since:
+                break
+            time.sleep(0.1)
         # forensic cut first, while the pending state still names the reply
         # whose playback this delivery is about to stop
         session.cut_pending_audio()

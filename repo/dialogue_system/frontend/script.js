@@ -424,6 +424,23 @@ let lastFinalUserBody = null;
 // nothing at all.
 let stablePartial = null;   // prefix confirmed by a later partial
 let pendingPartial = null;  // newest partial, not yet confirmed
+// Unfrozen user bubbles opened by partials (2026-11-06 phantom 「你帮我」:
+// an assistant turn_start landing BETWEEN two partials of one utterance
+// re-split the live stream — the next partial opened a SECOND bubble, and
+// the append-fold only removed the last one, orphaning the first with
+// whatever the stability gate had confirmed ("你帮我") forever in the
+// transcript. Every partial-opened bubble is tracked here and swept on
+// final / fold / selftalk_drop, so a split can no longer leave one behind.)
+let liveUserBodies = [];
+
+function sweepLiveUserBodies(keep) {
+  liveUserBodies = liveUserBodies.filter((b) => {
+    if (b === keep) return false;       // kept element, just untracked
+    if (!b.isConnected) return false;   // already removed elsewhere
+    b.closest('.msg')?.remove();
+    return false;
+  });
+}
 
 function handleUserTranscription({ text, final, append }) {
   if (!text) return;
@@ -444,14 +461,11 @@ function handleUserTranscription({ text, final, append }) {
     // Continued utterance (server flagged it: previous user turn recent,
     // no assistant audio in between — the same merge the LLM applies via
     // groupby). Fold into the previous frozen bubble instead of opening a
-    // third one, and drop the live partial bubble this continuation was
-    // streaming into (it opened its own bubble once the previous froze).
-    if (
-      lastMsg && lastMsg.role === 'user' && !userBubbleFinal &&
-      lastMsg.body !== lastFinalUserBody
-    ) {
-      lastMsg.body.closest('.msg')?.remove();
-    }
+    // third one, and drop the live partial bubble(s) this continuation was
+    // streaming into — ALL of them: a turn_start between two partials
+    // splits the stream into several bubbles, and only the newest is
+    // lastMsg (2026-11-06 「你帮我」 phantom).
+    sweepLiveUserBodies(null);
     lastFinalUserBody.textContent += text;
     lastMsg = { role: 'user', body: lastFinalUserBody };
     userBubbleFinal = true;
@@ -473,11 +487,15 @@ function handleUserTranscription({ text, final, append }) {
   } else {
     lastMsg = { role: 'user', body: addMessage('user', text) };
     userBubbleFinal = false;
+    if (!final) liveUserBodies.push(lastMsg.body);
   }
   if (final) {
     userBubbleFinal = true;
     lastFinalUserBody = lastMsg.body;
     stablePartial = pendingPartial = null;
+    // Freeze keeps this bubble; any OTHER unfrozen partial bubbles (the
+    // turn_start split) are stale stream fragments — remove them.
+    sweepLiveUserBodies(lastMsg.body);
     flashBody(lastMsg.body);
   }
 }
@@ -1041,7 +1059,9 @@ function handleSelftalkDrop({ reason } = {}) {
     lastMsg.body.parentElement?.remove();
     lastMsg = null;
   }
-  // the dropped turn's partial candidates are stale too
+  // the dropped turn's partial candidates are stale too — and so are any
+  // other unfrozen partial bubbles a mid-stream turn_start split off
+  sweepLiveUserBodies(null);
   stablePartial = pendingPartial = null;
   flashGateNote(reason === 'blip'
     ? '已忽略幻影语音片段（未检测到有效人声）'

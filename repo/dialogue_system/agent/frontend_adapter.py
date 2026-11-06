@@ -101,8 +101,12 @@ class AgentFrontendAdapter:
         self.ui_poll_s = ui_poll_s
         self._utterance_lock = threading.Lock()   # 串行化 utterance 处理
         self._stop = threading.Event()
-        # 当前挂起的控制轮线程（一次只有一个；新话轮到来时旧线程自行退出）
+        # 当前挂起的控制轮线程（一次只有一个；新话轮到来时旧线程自行退出）。
+        # turn dict 由 worker 自己持有引用：self._active_turn 会被新话轮重绑，
+        # 旧 worker 若读它就永远读到新 dict——2026-11-06 湖人双任务事故里
+        # abandoned 标志因此是死代码（置了没人看见）。
         self._active_turn: dict = {}
+        self._turn_seq = 0
         if on_event is not None:
             threading.Thread(
                 target=self._ui_pump, daemon=True,
@@ -217,18 +221,34 @@ class AgentFrontendAdapter:
           4. 回执模板话术上口（speak_fn 三态）；direct/mixed 追加表达轮
         """
         with self._utterance_lock:
-            prev = self._active_turn.get("thread")
-            if prev is not None and prev.is_alive():
-                # 上一计划未提交：续说作废（§6.2 旧计划作废，重新路由）
+            self._turn_seq += 1
+            turn_seq = self._turn_seq
+            prev_turn = self._active_turn
+            prev = prev_turn.get("thread")
+            if (prev is not None and prev.is_alive()
+                    and not prev_turn.get("committed")):
+                # 上一计划未提交：续说作废（§6.2 旧计划作废，重新路由）。
+                # 已提交轮不再 discard——pending 早已弹出，只会留下一条空的
+                # "discarded" route_log 噪声行。abandoned 置在 prev_turn
+                # （worker 自己持有的 dict）上才真正生效。
                 self.runtime.discard_pending(self.session_id,
                                              reason="continuation")
-                self._active_turn["abandoned"] = True
+                prev_turn["abandoned"] = True
+                # 续说合并：被作废片段的文本并入新句一起重路由（镜像 LLM
+                # 侧按句 groupby 的合并语义——碎片单独路由时快脑只能对着
+                # 半句话脑补 goal，2026-11-06 湖人任务就是这么造出来的）。
+                prev_text = (prev_turn.get("text") or "").strip()
+                if prev_text:
+                    text = prev_text + "\n" + text
 
+        turn = {"thread": None, "abandoned": False, "committed": False,
+                "text": text, "seq": turn_seq}
         th = threading.Thread(
             target=self._turn_worker, daemon=True,
             name=f"agent-v2-turn-{self.session_id[:8]}",
-            args=(text, turn_trigger, source_commit_id, gen_sn))
-        self._active_turn = {"thread": th, "abandoned": False}
+            args=(turn, text, turn_trigger, source_commit_id, gen_sn))
+        turn["thread"] = th
+        self._active_turn = turn
         th.start()
 
     def _release_gen(self, gen_sn):
@@ -242,9 +262,10 @@ class AgentFrontendAdapter:
             logger.exception("[%s][v2] gen flag release failed",
                              self.session_id[:8])
 
-    def _turn_worker(self, text, turn_trigger, source_commit_id, gen_sn):
+    def _turn_worker(self, turn, text, turn_trigger, source_commit_id, gen_sn):
         try:
-            self._turn_worker_inner(text, turn_trigger, source_commit_id)
+            self._turn_worker_inner(turn, text, turn_trigger,
+                                    source_commit_id)
         except Exception:  # noqa: BLE001 — 控制轮失败必须落到固定澄清话术
             logger.exception("[%s][v2] turn worker crashed",
                              self.session_id[:8])
@@ -256,9 +277,10 @@ class AgentFrontendAdapter:
             # （2026-11-06 listening 卡死事故的致命一环）。
             self._release_gen(gen_sn)
 
-    def _turn_worker_inner(self, text, turn_trigger, source_commit_id):
+    def _turn_worker_inner(self, turn, text, turn_trigger, source_commit_id):
         res = self.runtime.submit_request(
-            self.session_id, text, source_commit_id=source_commit_id)
+            self.session_id, text, source_commit_id=source_commit_id,
+            request_seq=turn.get("seq"))
         if not res.get("ok"):
             # 路由失败/超时：终态 + 固定澄清（§6.2），队列已释放
             logger.info("[%s][v2] route failed: %s", self.session_id[:8],
@@ -272,19 +294,20 @@ class AgentFrontendAdapter:
             while time.time() < deadline:
                 if self._stop.is_set():
                     return
-                if self._active_turn.get("abandoned"):
+                if turn.get("abandoned"):
                     return   # 续说：旧计划已作废，新话轮线程接管
                 if not self.runtime.pending_exists(self.session_id):
                     return  # 已被作废/提交
                 if time.time() - self.last_voice_ts_fn() >= grace_s:
                     break
                 time.sleep(self.grace_poll_s)
-        if (self._stop.is_set() or self._active_turn.get("abandoned")
+        if (self._stop.is_set() or turn.get("abandoned")
                 or not self.runtime.pending_exists(self.session_id)):
             return
         out = self.runtime.commit_pending(self.session_id)
         if out is None:
             return  # 门又关上（续说抢先）——计划仍挂起，交由下一轮处理
+        turn["committed"] = True
         # 回执话术：程序模板，不让模型自由解释（§13.1）
         for receipt_text in out.get("texts") or []:
             if not self._speak_safe(receipt_text):

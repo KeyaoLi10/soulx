@@ -59,11 +59,14 @@ MIXED_PLAN = plan_json([
 
 
 def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
-             can_deliver=True, runner=None, ui=False):
-    """router_plans: 弹出式（字符串=计划 JSON；Exception=抛出）。
+             can_deliver=True, runner=None, ui=False, speak_impl=None):
+    """router_plans: 弹出式（字符串=计划 JSON；Exception=抛出；callable=
+    调用取返回值——用于卡住某次路由制造竞态）。speak_impl 可注入自定义
+    上口（如门控回执制造"已提交但线程存活"）。
     ui=True 时挂 on_event（UI 泵 0.05s 轮询，事件进 state["ui_events"]）。"""
     state = {
         "speak_calls": [], "gen_calls": [], "router_calls": 0,
+        "routed_texts": [],
         "grace_open": grace_open, "can_deliver": can_deliver,
         "grace_s": 0.0, "last_voice_ts": 0.0, "gen_releases": [],
         "ui_events": [],
@@ -71,19 +74,25 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
     plans = list(router_plans)
     lock = threading.Lock()
 
-    def router_fn(sid, text, snap):
+    def _pop_plan():
         with lock:
             state["router_calls"] += 1
             item = plans.pop(0) if plans else CREATE_PLAN
+        if callable(item):
+            item = item()
+        return item
+
+    def router_fn(sid, text, snap):
+        with lock:
+            state["routed_texts"].append(text)
+        item = _pop_plan()
         if isinstance(item, Exception):
             raise item
         return item
 
     def transport(messages, tools, stop_event=None, **kw):
         # shadow 观察走 PlanRouter 的真路径（v2 NDJSON 客户端打桩）
-        with lock:
-            state["router_calls"] += 1
-            item = plans.pop(0) if plans else CREATE_PLAN
+        item = _pop_plan()
         if isinstance(item, Exception):
             return ControlResult(error="http: " + str(item))
         return ControlResult(
@@ -93,12 +102,14 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
 
     plan_router = PlanRouter(transport=transport)
 
-    def speak_fn(item, stop_event):
+    def default_speak(item, stop_event):
         if hasattr(item, "__iter__") and not isinstance(item, (str, bytes)):
             item = "".join(item)          # 表达轮生成器：消费成文本
         state["speak_calls"].append(item)
         rs = speak_results or []
         return rs[len(state["speak_calls"]) - 1] if rs else True
+
+    speak_fn = speak_impl or default_speak
 
     def deliver_speak(env, text, stop_event):
         state["speak_calls"].append(text)
@@ -433,6 +444,92 @@ check("15d legacy message contract (task_id/goal/status/progress/result)",
 
 for r in [r for r in [rt] if r]:
     pass
+
+# ==== 场景 16：路由竞态作废——abandoned 真正生效 + 旧路由结果不得覆盖新
+# 挂起计划（2026-11-06 湖人双任务事故：碎片1路由在途时碎片2已提交，
+# abandoned 原是死代码——置在旧 dict 上、worker 读的是重绑后的新 dict，
+# 于是碎片1的旧计划照样入库成了重复任务）====================================
+OLD_FRAG_PLAN = plan_json([{"op": "create_task", "local_ref": "L1",
+                            "label": "旧碎片", "goal": "旧的"}])
+NEW_MERGED_PLAN = plan_json([{"op": "create_task", "local_ref": "L1",
+                              "label": "新合并", "goal": "新的"}])
+route1_entered = threading.Event()
+route1_release = threading.Event()
+
+
+def _slow_route():
+    route1_entered.set()
+    route1_release.wait(5.0)      # 碎片1路由卡在途（事故里 6s）
+    return OLD_FRAG_PLAN
+
+
+rt, ad, st = make_env(tmp, [_slow_route, NEW_MERGED_PLAN])
+rt_ref[0] = rt
+ad.handle_utterance("你再查一下那个湖人队")
+ok = wait(lambda: route1_entered.is_set())
+check("16 fragment-1 route in flight", ok)
+ad.handle_utterance("你昨天的比赛结果怎么样吧？")
+ok = wait(lambda: rt.pending_exists("s1"))
+check("16b fragment-2 plan pending while old route still running", ok)
+check("16c fragments merged for re-route",
+      st["routed_texts"][1] == "你再查一下那个湖人队\n你昨天的比赛结果怎么样吧？",
+      str(st["routed_texts"]))
+route1_release.set()
+ok = wait(lambda: any(t["label"] == "新合并" for t in rt.store.task_view("s1")))
+check("16d merged plan committed", ok,
+      str([t["label"] for t in rt.store.task_view("s1")]))
+check("16e stale fragment-1 plan never committed",
+      not any(t["label"] == "旧碎片" for t in rt.store.task_view("s1")),
+      str([t["label"] for t in rt.store.task_view("s1")]))
+
+# ==== 场景 17：续说合并链——多段碎片累积并入（turn["text"] 持合并文本）====
+rt, ad, st = make_env(tmp, [CREATE_PLAN, CREATE_PLAN, CREATE_PLAN])
+rt_ref[0] = rt
+st["grace_s"] = 5.0                     # 门一直关着：全部停留未提交
+st["last_voice_ts"] = time.time()
+ad.handle_utterance("你再查一下那个湖人队")
+ok = wait(lambda: rt.pending_exists("s1"))
+ad.handle_utterance("你昨天的比赛结果")
+ok = wait(lambda: st["router_calls"] == 2)
+ad.handle_utterance("结果怎么样吧")
+ok = wait(lambda: st["router_calls"] == 3)
+check("17 fragment chain accumulates into one merged re-route",
+      st["routed_texts"][1] == "你再查一下那个湖人队\n你昨天的比赛结果"
+      and st["routed_texts"][2]
+      == "你再查一下那个湖人队\n你昨天的比赛结果\n结果怎么样吧",
+      str(st["routed_texts"]))
+
+# ==== 场景 18：已提交轮不再作废——回执在播时新话轮照常独立路由，不合并、
+# 不留空 discard 噪声行 ======================================================
+speak_gate = threading.Event()
+_gated = {"state": None}
+
+
+def _gated_speak(item, stop_event):
+    s = _gated["state"]
+    if isinstance(item, str):
+        s["speak_calls"].append(item)
+        if "安排好" in item:
+            speak_gate.wait(5.0)   # 回执卡住：turn 已 committed、线程存活
+    return True
+
+
+rt, ad, st = make_env(tmp, [CREATE_PLAN, CREATE_PLAN], speak_impl=_gated_speak)
+_gated["state"] = st
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")
+ok = wait(lambda: any("安排好" in str(x) for x in st["speak_calls"]))
+check("18 receipt speaking (turn committed, thread alive)", ok,
+      str(st["speak_calls"]))
+ad.handle_utterance("再查上海天气")
+ok = wait(lambda: st["router_calls"] == 2)
+check("18b committed turn: new utterance routed alone (no merge)",
+      st["routed_texts"][1] == "再查上海天气", str(st["routed_texts"]))
+disc = rt.store._conn.execute(
+    "SELECT COUNT(*) c FROM route_log WHERE snapshot_json "
+    "LIKE '%discarded%'").fetchone()["c"]
+check("18c no spurious discard row for committed turn", disc == 0, str(disc))
+speak_gate.set()
 
 # ==== 场景 9：close 释放 ====================================================
 rt, ad, st = make_env(tmp, [])

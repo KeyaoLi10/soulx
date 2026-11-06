@@ -19,9 +19,12 @@ says the user is idle (not generating, playback finished, no voice activity
 for a moment) — the user can keep chatting while the slow brain works, and
 the result only arrives at a natural gap.
 """
+import logging
 import re
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 from agent.slow_brain import SlowBrain
 from clients.llm_client import TOOL_QUIET  # [[quiet]] success marker this
@@ -575,10 +578,16 @@ class AgentRuntimeV2:
         }
 
     def submit_request(self, session_id, text, source_commit_id=None,
-                       input_revision=1, engine_epoch="", connection_epoch=0):
+                       input_revision=1, engine_epoch="", connection_epoch=0,
+                       request_seq=None):
         """登记请求 → 快照 → 路由（锁外、只读推断，grace 内允许）。
         返回 dict；plan 保持在 pending，等 grace 通过后 commit_pending。
-        路由失败/超时 → ok=False，终态释放，不让后续请求等（§6.2）。"""
+        路由失败/超时 → ok=False，终态释放，不让后续请求等（§6.2）。
+
+        request_seq：话轮单调序号（adapter 在 utterance 锁下递增）。路由
+        完成顺序可能倒置（前一句路由 13s、后一句 5s），晚到的旧话轮结果
+        不得覆盖新话轮已挂起的计划——2026-11-06 湖人双任务事故的反序分支。
+        None = 不参与排序（兼容旧调用/测试）。"""
         self.store.ensure_session(session_id)
         if connection_epoch:
             self.store.bind_connection_epoch(session_id, connection_epoch)
@@ -615,11 +624,23 @@ class AgentRuntimeV2:
         ver = self._plan_version.get(session_id, 0) + 1
         self._plan_version[session_id] = ver
         with self._pending_lock:
+            entry = self._pending.get(session_id)
+            if (request_seq is not None and entry is not None
+                    and entry.get("request_seq") is not None
+                    and request_seq < entry["request_seq"]):
+                # 晚到的旧话轮路由结果：新话轮的计划已挂起，不得覆盖。
+                # 旧 worker 会在 abandoned 检查处自行退出。
+                logger.info("[%s] stale route result dropped "
+                            "(seq %s < pending seq %s)",
+                            session_id[:8], request_seq,
+                            entry["request_seq"])
+                return {"ok": True, "request_id": request_id, "plan": plan,
+                        "stale": True}
             # 前一句路由未结束、后一句已到：后句覆盖前句的 pending 计划
             # （§6.2：前操作未提交 → 后句作为修订，提交一个最终计划）
             self._pending[session_id] = {
                 "request_id": request_id, "plan": plan, "version": ver,
-                "text": text}
+                "text": text, "request_seq": request_seq}
         return {"ok": True, "request_id": request_id, "plan": plan}
 
     def commit_pending(self, session_id):
