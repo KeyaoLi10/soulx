@@ -8,6 +8,7 @@ length 截断 / 协议错误一律不提交，最多一次格式修复后给出�
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from typing import Callable, List, Optional
 
 from agent import contracts as C
 from agent.context import render_snapshot_message
+
+logger = logging.getLogger(__name__)
 
 # ---- 工具面：单个 route_turn，参数是完整 JSON 字符串（§7.3）--------------
 ROUTE_TURN_TOOL = {
@@ -397,6 +400,10 @@ class PlanRouter:
                 except C.PlanError as e:
                     last_error = f"parse: {e}"
             if i < self.repair_attempts:
+                # 修复轮原因必须可见：attempts=2 直接把路由耗时翻倍
+                # （2026-11-07 复读事故 16s/20.6s 两例），不记原因无从优化
+                logger.info("[router] repair %d/%d after: %s",
+                            i, self.repair_attempts, last_error)
                 if last_error.startswith("evidence quote"):
                     note = _GROUNDING_NOTE.format(
                         quote=last_error.split(": ", 1)[1], text=user_text)

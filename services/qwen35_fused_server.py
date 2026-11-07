@@ -163,11 +163,15 @@ def _token_stream(messages, cancel_event, gen_kwargs, label="chat"):
                     n_out += len(text)
                     yield text
         finally:
-            # make sure generate() exits promptly even if the consumer stopped
+            # make sure generate() exits promptly even if the consumer stopped.
+            # Log the flag BEFORE setting it — the unconditional set made
+            # cancelled=1 appear on every normal completion (misleading when
+            # diagnosing the 2026-11-07 dead-route pileup).
+            was_cancelled = cancel_event.is_set()
             cancel_event.set()
             thread.join()
             _log(f"gen:end {label} gen_s={time.perf_counter() - t_gen:.2f}s "
-                 f"out_chars={n_out} cancelled={int(cancel_event.is_set())}")
+                 f"out_chars={n_out} cancelled={int(was_cancelled)}")
     finally:
         GEN_LOCK.release()
 
@@ -209,11 +213,15 @@ def _token_stream_prompt(prompt, cancel_event, gen_kwargs, label="agent"):
                     n_out += len(text)
                     yield text
         finally:
-            # make sure generate() exits promptly even if the consumer stopped
+            # make sure generate() exits promptly even if the consumer stopped.
+            # Log the flag BEFORE setting it — the unconditional set made
+            # cancelled=1 appear on every normal completion (misleading when
+            # diagnosing the 2026-11-07 dead-route pileup).
+            was_cancelled = cancel_event.is_set()
             cancel_event.set()
             thread.join()
             _log(f"gen:end {label} gen_s={time.perf_counter() - t_gen:.2f}s "
-                 f"out_chars={n_out} cancelled={int(cancel_event.is_set())}")
+                 f"out_chars={n_out} cancelled={int(was_cancelled)}")
     finally:
         GEN_LOCK.release()
 

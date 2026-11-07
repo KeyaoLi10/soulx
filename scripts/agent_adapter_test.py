@@ -86,9 +86,12 @@ def make_env(tmpdir, router_plans, speak_results=None, grace_open=True,
             item = item()
         return item
 
-    def router_fn(sid, text, snap):
+    def router_fn(sid, text, snap, stop_event=None):
         with lock:
             state["routed_texts"].append(text)
+        if stop_event is not None:
+            state["router_stop_events"] = state.get(
+                "router_stop_events", []) + [stop_event]
         item = _pop_plan()
         if isinstance(item, Exception):
             raise item
@@ -909,6 +912,97 @@ ad.handle_utterance("再讲一遍结果")     # 已交付后的显式追问
 ok = wait(lambda: sum("晴转多云" in str(x) for x in st["speak_calls"]) >= 2)
 check("29e re-ask on delivered result replays via pump", ok,
       str(st["speak_calls"]))
+
+# ==== 场景 30-33：长间隔落地 + 路由取消（2026-11-07 复读事故根修）=========
+# 事故：路由 10-20s > 用户开口间隔 → 每句被下一句作废，请求永远
+# registered、任务建不出来 → 闲聊路对空面板连应三遍"我去查一下"。
+# 修 = ①窗口外（独立话轮）新话轮把挂起计划 land 落地（跳 grace +
+# create 去重）不合并文本；②被取代话轮的在途路由断流（释放 GEN_LOCK）。
+
+def _slow_create():
+    time.sleep(0.3)
+    return CREATE_PLAN
+
+# 30 长间隔落地：turn1 路由完成但提交门关着（worker 退场、计划挂起），
+# 用户隔很久说新句 → 计划被 land 落地，任务建出来，文本不合并
+rt, ad, st = make_env(tmp, [_slow_create, DIRECT_PLAN],
+                      chitchat_impl=_std_chitchat)
+rt_ref[0] = rt
+st["grace_open"] = False               # 提交门关：路由完成也提交不了
+ad.handle_utterance("帮我查北京天气")
+ok = wait(lambda: rt.pending_age("s1") is not None)
+check("30 stale plan parked (grace shut)", ok)
+time.sleep(0.15)                       # worker 退场（commit 被门退回）
+st["grace_open"] = True
+ad._active_turn["started_at"] -= 100   # 用户隔了 100s → 独立话轮
+ad.handle_utterance("另外聊点别的")
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
+check("30 fresh turn lands parked plan (task created)", ok)
+check("30b fresh turn does not merge old text",
+      "北京天气" not in st["routed_texts"][-1], str(st["routed_texts"]))
+ok = wait(lambda: _committed_count(rt) == 2)
+check("30c both requests committed (no eternal registered)", ok)
+
+# 31 碎片续说回归：窗口内新句仍走 discard+合并重路由（半句话不能单独路由）
+rt, ad, st = make_env(tmp, [_slow_create, DIRECT_PLAN],
+                      chitchat_impl=_std_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查那个")
+time.sleep(0.05)
+ad.handle_utterance("北京天气怎么样")
+ok = wait(lambda: st["router_calls"] == 2)
+check("31 fragment within window still merges",
+      "帮我查那个" in st["routed_texts"][-1], str(st["routed_texts"]))
+
+# 32 land 去重：挂起计划的 create 与现有任务同主题（label/goal 二元
+# 字组相交）→ 丢弃该 op，不建双任务连环播报；不同主题照常落地
+rt, ad, st = make_env(tmp, [])
+rt_ref[0] = rt
+rt.router = lambda sid, text, snap: CREATE_PLAN
+rt.submit_request("s1", "查北京天气")
+rt.commit_pending("s1")
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
+check("32 setup T1 exists", ok)
+rt.submit_request("s1", "再查一遍北京天气")   # 同主题 create 挂起
+landed = rt.land_pending("s1")
+n_tasks = rt.store._conn.execute(
+    "SELECT COUNT(*) AS n FROM tasks WHERE session_id='s1'"
+).fetchone()["n"]
+check("32 land dedupes same-topic create",
+      landed is None and n_tasks == 1, f"landed={landed} n={n_tasks}")
+SHANGHAI_PLAN = plan_json([
+    {"op": "create_task", "local_ref": "L1", "label": "查天气",
+     "goal": "查上海天气"}], reply_mode="receipts")
+rt.router = lambda sid, text, snap: SHANGHAI_PLAN
+rt.submit_request("s1", "查上海天气")
+landed = rt.land_pending("s1")
+ok = wait(lambda: rt.store.task_row("s1", "T2") is not None)
+check("32b different-topic create lands", landed is not None and ok,
+      str(landed is not None))
+
+# 33 路由取消：被取代话轮的在途路由收到 stop_event；取消不是失败，
+# 绝不说 ROUTER_FAIL_TEXT
+_release33 = threading.Event()
+
+def _hanging_route():
+    _release33.wait(5.0)
+    return CREATE_PLAN
+
+rt, ad, st = make_env(tmp, [_hanging_route, DIRECT_PLAN],
+                      chitchat_impl=_std_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")   # 路由挂住在途
+time.sleep(0.05)
+ad.handle_utterance("算了聊别的")       # 取代：route_stop 应置位
+ok = wait(lambda: st.get("router_stop_events")
+          and st["router_stop_events"][0].is_set())
+check("33 superseded turn's route_stop set", ok)
+_release33.set()                       # 放行旧路由（真实链路里已被断流）
+time.sleep(0.3)
+check("33b cancelled turn never speaks ROUTER_FAIL_TEXT",
+      all("没理清" not in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+
 
 # ==== 场景 9：close 释放 ====================================================
 rt, ad, st = make_env(tmp, [])

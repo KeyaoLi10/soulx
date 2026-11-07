@@ -1194,12 +1194,15 @@ def _make_agent_v2(session, client_id, mode=None):
 
     plan_router = PlanRouter()
 
-    def _router_fn(sid, text, snap):
-        # runtime.submit_request 的路由回调：完整 §7.1 快照 + 严格计划
+    def _router_fn(sid, text, snap, stop_event=None):
+        # runtime.submit_request 的路由回调：完整 §7.1 快照 + 严格计划。
+        # stop_event：话轮被取代时断流（服务端取消生成释放 GEN_LOCK，
+        # 2026-11-07 复读事故：死路由排队把新路由拖到 16-20s）
         t0 = time.monotonic()
         snap_full = agent_context.build_router_snapshot(
             runtime.store, sid, text, history=_history())
-        rr = plan_router.route(snap_full, text, history=_history())
+        rr = plan_router.route(snap_full, text, history=_history(),
+                               stop_event=stop_event)
         if not rr.ok:
             raise RuntimeError(rr.error or "route failed")
         # 客户端侧总耗时（含修复轮）——与 :6007 的 gen:begin/lock/end

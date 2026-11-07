@@ -579,7 +579,7 @@ class AgentRuntimeV2:
 
     def submit_request(self, session_id, text, source_commit_id=None,
                        input_revision=1, engine_epoch="", connection_epoch=0,
-                       request_seq=None):
+                       request_seq=None, stop_event=None):
         """登记请求 → 快照 → 路由（锁外、只读推断，grace 内允许）。
         返回 dict；plan 保持在 pending，等 grace 通过后 commit_pending。
         路由失败/超时 → ok=False，终态释放，不让后续请求等（§6.2）。
@@ -587,7 +587,13 @@ class AgentRuntimeV2:
         request_seq：话轮单调序号（adapter 在 utterance 锁下递增）。路由
         完成顺序可能倒置（前一句路由 13s、后一句 5s），晚到的旧话轮结果
         不得覆盖新话轮已挂起的计划——2026-11-06 湖人双任务事故的反序分支。
-        None = 不参与排序（兼容旧调用/测试）。"""
+        None = 不参与排序（兼容旧调用/测试）。
+
+        stop_event：话轮被取代/手动停止时置位 → 传输层立即断流（服务端
+        看到 disconnect 会取消生成、释放 GEN_LOCK），新话轮的路由不用
+        排在死话轮的生成后面（2026-11-07 复读事故：三路并发死路由把
+        queue_wait 推到 5-10s，最新路由 16-20s 才回，永远赶不上用户的
+        下一句话）。None = 不取消（兼容旧签名/测试桩）。"""
         self.store.ensure_session(session_id)
         if connection_epoch:
             self.store.bind_connection_epoch(session_id, connection_epoch)
@@ -597,7 +603,11 @@ class AgentRuntimeV2:
         snapshot = self.snapshot_for_router(session_id)
         t0 = time.monotonic()
         try:
-            plan_json = self.router(session_id, text, snapshot)
+            if stop_event is not None:
+                plan_json = self.router(session_id, text, snapshot,
+                                        stop_event=stop_event)
+            else:
+                plan_json = self.router(session_id, text, snapshot)
         except Exception as e:  # noqa: BLE001 — 路由失败必须是终态
             self.store.log_route(session_id, request_id, self.mode,
                                  snapshot=snapshot, parse_ok=False,
@@ -640,7 +650,8 @@ class AgentRuntimeV2:
             # （§6.2：前操作未提交 → 后句作为修订，提交一个最终计划）
             self._pending[session_id] = {
                 "request_id": request_id, "plan": plan, "version": ver,
-                "text": text, "request_seq": request_seq}
+                "text": text, "request_seq": request_seq,
+                "created_at": time.time()}
         return {"ok": True, "request_id": request_id, "plan": plan}
 
     def commit_pending(self, session_id, chitchat_spoke=False):
@@ -678,9 +689,109 @@ class AgentRuntimeV2:
         self.store.log_route(session_id, None, self.mode,
                              snapshot={"discarded": reason})
 
+    def land_pending(self, session_id, chitchat_spoke=False):
+        """长间隔新话轮的落地通道（2026-11-07 复读事故根修）。
+
+        事故链：路由慢（10-20s）> 用户开口间隔 → 每句都被下一句作废，
+        请求永远停在 registered、任务永远建不出来 → 闲聊路每轮只能对
+        空面板应承"我去查一下，马上告诉你"（用户听感=复读）。
+
+        修法：用户隔了很久才说下一句时，上一句早已是一句说完整的
+        话——它已路由完成的挂起计划不再等 grace 门（grace 只属于
+        续说窗口内的半句），由新话轮的 worker 在路由前强制提交。
+        create 先对当前活跃任务做二元字组去重：挂起计划的快照可能
+        早于其他 create 落地，不去重会建出同主题双任务连环播报
+        （晚六事故同款）。"""
+        with self._pending_lock:
+            entry = self._pending.pop(session_id, None)
+        if entry is None:
+            return None
+        plan = self._dedupe_creates(session_id, entry["plan"])
+        if plan is None:
+            logger.info("[%s] land_pending: all creates deduped, "
+                        "nothing to land", session_id[:8])
+            return None
+        res = self.store.commit_plan(session_id, entry["request_id"],
+                                     plan,
+                                     plan_version=entry["version"])
+        texts = self._receipt_texts(session_id, res,
+                                    chitchat_spoke=chitchat_spoke)
+        logger.info("[%s] land_pending: committed stale plan for req %s",
+                    session_id[:8], entry["request_id"])
+        return {"result": res, "texts": texts, "plan": plan,
+                "request_id": entry["request_id"]}
+
+    # 落地去重认的"任务还在"状态：非终态一律算（completed 且结果还没
+    # 播出去的也算——重复 create 会连环播报）；canceled/superseded 与
+    # completed+已播/已取消播报不算（用户重问该重跑/走 get_task）
+    _LAND_DEDUPE_ACTIVE = (_C.EXEC_QUEUED, _C.EXEC_RUNNING,
+                           _C.EXEC_WAITING_INPUT, _C.EXEC_CANCEL_REQUESTED,
+                           _C.EXEC_BLOCKED_DEPENDENCY)
+
+    def _dedupe_creates(self, session_id, plan):
+        """挂起计划里的 create_task 与现有任务同主题则丢弃该 op。
+        同主题判定：goal（缺 label 兜底）归一化二元字组的交集占较小
+        一方 ≥ 一半——纯 label 会误杀（"查天气"是所有天气查询的通用
+        label，北京/上海会被并成一个任务），纯 bigram 相交也会误杀
+        （"查北京天气"/"查上海天气" 共享"天气"）。全部 op 被滤掉 →
+        返回 None。"""
+        from agent.router import _bigrams, _norm_text
+        creates = [o for o in plan.operations
+                   if getattr(o, "op", "") == "create_task"]
+        if not creates:
+            return plan
+        existing = []
+        for r in self.store.task_panel_rows(session_id):
+            alive = (r.get("execution_status") in self._LAND_DEDUPE_ACTIVE
+                     or (r.get("execution_status") == _C.EXEC_COMPLETED
+                         and not r.get("delivered")
+                         and not r.get("suppressed")))
+            if not alive:
+                continue
+            bg = _bigrams(_norm_text(r.get("goal")
+                                     or r.get("label") or ""))
+            if bg:
+                existing.append((r.get("task_id"), bg))
+        if not existing:
+            return plan
+        kept, dropped = [], []
+        for o in plan.operations:
+            if getattr(o, "op", "") == "create_task":
+                new_bg = _bigrams(_norm_text(
+                    getattr(o, "goal", "") or getattr(o, "label", "")))
+                hit = None
+                for tid, bg in existing:
+                    inter = len(new_bg & bg)
+                    if inter and inter >= 0.5 * min(len(new_bg), len(bg)):
+                        hit = tid
+                        break
+                if hit is not None:
+                    dropped.append("{}→{}".format(
+                        getattr(o, "label", "") or getattr(o, "goal", ""),
+                        hit))
+                    continue
+            kept.append(o)
+        if dropped:
+            logger.info("[%s] land_pending dedupe: dropped create %s",
+                        session_id[:8], ",".join(dropped))
+        if not kept:
+            return None
+        if len(kept) == len(plan.operations):
+            return plan
+        import dataclasses
+        return dataclasses.replace(plan, operations=kept)
+
     def pending_exists(self, session_id):
         with self._pending_lock:
             return session_id in self._pending
+
+    def pending_age(self, session_id):
+        """挂起计划的年龄（秒）；无挂起 → None。续说合并窗口用它判定
+        新话轮是碎片续说还是独立话轮（worker 已退、计划被 grace 门
+        退回的僵尸场景下，这是唯一的时间基准）。"""
+        with self._pending_lock:
+            e = self._pending.get(session_id)
+            return time.time() - e["created_at"] if e else None
 
     # ------------------------------------------------------------- 回执话术
 
