@@ -104,6 +104,10 @@ def mk_session():
     s.playback_run_serial = 0
     s.playback_run_first_ts = None
     s.playback_run_total = 0.0
+    # 慢脑播报打断保护（2026-11-07 起交付路径会触碰这两个字段）
+    import collections as _c
+    s.bargein_times = _c.deque()
+    s.delivery_speech_active = False
     s.audio_tts = _AudioTTS()
     # app.py 的 ChatSession.cut_pending_audio：forensic cut 的会话侧入口
     # （pending 状态还在时把未播尾巴切在打断点）。桩里直接转发给

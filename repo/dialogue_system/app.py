@@ -295,6 +295,17 @@ class ChatSession:
         # its next chunk — its finally can land seconds into the new
         # generation)
         self.gen_serial = 0
+        # 慢脑结果播报打断保护（2026-11-07）：交付泵发起的结果播报
+        # （emission + playback 全程）期间为 True。此间 barge-in 不走
+        # 普通的 3-chunk-in-1.6s 阈值，须持续 ~1s（≥5 个 nonidle chunk
+        # 且首块距今 ≥1s）才真正打断——用户一句"嗯，好"（0.3-0.5s，
+        # 3 chunk）不再掐死刚开口的结果播报（当日 18:09:41 事故：天气
+        # 播报开口 0.15s 即被 ratio 0.22 掐断，interrupted_partial 终态
+        # 结果永久丢失）。生命周期：_speak/_agent_deliver_entry 置位；
+        # 清除=新一代语音真正上口时（_speak 非 delivery 路径 / 用户轮
+        # 生成起点——吸收轮不说话，播报照常放，保护不中断）或
+        # _playback_bargein_deferred 发现话权早已空闲时懒清。
+        self.delivery_speech_active = False
         # Wall-clock of the last user voice activity (barge-in chunks or a
         # completed turn) — the delivery arbiter waits for a quiet gap.
         self.last_voice_ts = 0.0
@@ -475,6 +486,14 @@ _BARGEIN_MIN_CHUNKS = 0   # consecutive nonidle chunks before a barge-in
 # and the zero-latency first-chunk path is unchanged.
 _PLAYBACK_BARGEIN_WINDOW_S = 1.6   # evidence window (~10 chunks)
 _PLAYBACK_BARGEIN_NONIDLE = 3      # nonidle chunks needed inside it
+# 慢脑结果播报的打断保护阈值（2026-11-07，与上面普通阈值分开）：交付泵
+# 发起的结果播报期间，barge-in 须"持续判定"——窗口内 ≥5 个 nonidle
+# chunk 且首块距今 ≥1s（约等于持续说话 1s）才真正打断。短应答
+# （"嗯，好"≈3 chunk/0.3s）与回声毛刺都过不了；真人持续插话 ~1s 内
+# 攒满。播报开始前积累的证据在开口时清零（用户在播报开口前说的那声
+# "好"不能白送满窗计数——18:09:41 事故正是这样 0.15s 掐断的）。
+_RESULT_DELIVERY_BARGEIN_NONIDLE = 5
+_RESULT_DELIVERY_BARGEIN_SPAN_S = 1.0
 # (bargein_audio's gap-tolerant retention lives in pvad_gate.py:
 #  _PVAD_BARGEIN_RETAIN_S — see the 2026-11-05 background-video report)
 
@@ -545,10 +564,23 @@ def _playback_bargein_deferred(session, now=None):
     nonidle evidence so far is too sparse to interrupt on — the deferred
     barge-in keeps counting (bargein_streak is NOT reset) and confirms
     on its own once the window fills, so a genuine talker only loses
-    ~1 s, once."""
+    ~1 s, once.
+
+    慢脑结果播报（delivery_speech_active）走独立的持续判定阈值
+    （2026-11-07）：≥_RESULT_DELIVERY_BARGEIN_NONIDLE 个 nonidle chunk
+    且首块距今 ≥_RESULT_DELIVERY_BARGEIN_SPAN_S 才放行。该保护是结果
+    交付语义，不是回声防御——不受 playback_guard 开关影响。"""
     now = now if now is not None else time.time()
     if not _reply_in_flight(session):
+        # 话权早已空闲：迟到的保护标志顺手清掉（正常情况下新一代语音
+        # 上口时已清过，这里兜 playback 结束后无人再开口的场景）
+        if session.delivery_speech_active:
+            session.delivery_speech_active = False
         return False
+    if session.delivery_speech_active:
+        times = session.bargein_times
+        return not (len(times) >= _RESULT_DELIVERY_BARGEIN_NONIDLE
+                    and now - times[0] >= _RESULT_DELIVERY_BARGEIN_SPAN_S)
     if not _playback_guard_active(session):
         return False
     return len(session.bargein_times) < _PLAYBACK_BARGEIN_NONIDLE
@@ -1000,6 +1032,12 @@ def _agent_deliver_entry(session, client_id, entry):
         min_seg_len=settings.get("min_seg_len"),
     )
     gen_sn = _begin_generation(session)
+    # 慢脑播报打断保护（legacy 交付路径同样挂上，与 V2 _speak 一致）：
+    # 置位在 _begin_generation 之后，不在这里的 finally 清——覆盖整个
+    # playback（下面的 drain 循环本来就握到播放走完）。
+    with session.lock:
+        session.delivery_speech_active = True
+        session.bargein_times.clear()
     try:
         ret = _run_speech_pipeline(
             session, client_id, gen, current_stop_event, tts_client, tts_options
@@ -1069,10 +1107,14 @@ def _make_agent_v2(session, client_id, mode=None):
         }
         return tts_client, tts_options
 
-    def _speak(item, stop_event):
+    def _speak(item, stop_event, delivery_protect=False):
         """V2 的唯一语音出口：固定回执话术（单段）或表达轮生成器，走与
         legacy _agent_deliver_entry 完全相同的 _run_speech_pipeline。
-        三态 True/False/None 原样返回（§13 交付语义）。"""
+        三态 True/False/None 原样返回（§13 交付语义）。
+        delivery_protect=True（交付泵的 result 播报）：挂慢脑播报打断
+        保护——此间 barge-in 须持续 ~1s 才真正打断（独立阈值，见
+        _playback_bargein_deferred），且播报开口前积累的用户语音证据
+        清零（用户在播报开口前说的那声"好"不能白送满窗计数）。"""
         tts_client, tts_options = _tts_pair()
         # 回执让路（2026-11-06 湖人事故第 4 环）：路由慢时（13s）回执上口
         # 时上一个任务的播报还在浏览器里放——设计假设"回执紧跟用户说话"
@@ -1099,7 +1141,20 @@ def _make_agent_v2(session, client_id, mode=None):
         if current_stop_event.is_set():
             return None  # stopped before starting: nothing audible yet
         gen = iter([item]) if isinstance(item, str) else item
+        if not delivery_protect:
+            # 新一代语音真正上口（回执/闲聊/表达轮）：上一段慢脑播报的
+            # 保护失效。注意吸收轮不经过这里——交付播报照常放，保护
+            # 不被一句"嗯，好"的 commit 中断。
+            with session.lock:
+                session.delivery_speech_active = False
         gen_sn = _begin_generation(session)
+        if delivery_protect:
+            # 置位在 _begin_generation 之后；不在 finally 里清——保护要
+            # 覆盖 emission 之后的整个 playback（靠 _reply_in_flight 的
+            # playback_end 段），由新一代上口或话权空闲时懒清。
+            with session.lock:
+                session.delivery_speech_active = True
+                session.bargein_times.clear()
         try:
             return _run_speech_pipeline(
                 session, client_id, gen, current_stop_event,
@@ -1162,7 +1217,8 @@ def _make_agent_v2(session, client_id, mode=None):
         db_path=str(db_path),
         router_fn=_router_fn,
         runner=make_v2_runner(),
-        speak_fn=lambda env, text, stop_event: _speak(text, stop_event),
+        speak_fn=lambda env, text, stop_event: _speak(
+            text, stop_event, delivery_protect=True),
         can_deliver_fn=lambda sid: _agent_can_deliver(session),
         grace_gate=lambda sid: (
             _grace_s() <= 0
@@ -1531,6 +1587,9 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
             # normally already True from _begin_generation at commit; set
             # again for direct calls without one
             session.gen_in_progress = True
+            # 用户轮生成起点：上一段慢脑播报的打断保护失效（本段语音
+            # 即将上口替换它；V2 吸收轮不走到这里，播报保护不中断）
+            session.delivery_speech_active = False
         try:
             fully_spoken = _run_speech_pipeline(
                 session, client_id, llm_reply_gen, current_stop_event,
@@ -1908,6 +1967,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         session.bargein_times.popleft()
                     if (session.bargein_streak >= _BARGEIN_MIN_CHUNKS
                             and not _playback_bargein_deferred(session, now)):
+                        if session.delivery_speech_active:
+                            # 慢脑播报保护下放行的真打断：单独记一行，
+                            # 与普通 barge-in confirmed 区分开（查法：
+                            # grep "delivery barge-in"）
+                            logger.info(
+                                f"[{client_id}] delivery barge-in confirmed "
+                                f"after sustained voice "
+                                f"({len(session.bargein_times)} chunks, "
+                                f"{now - session.bargein_times[0]:.1f}s span)"
+                            )
                         # sustained voice: trusted evidence a human is
                         # talking — also opens the blip-filter's acceptance
                         # window (the turn text may arrive a few seconds

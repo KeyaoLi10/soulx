@@ -259,6 +259,12 @@ class AgentFrontendAdapter:
                          or self._panel_has_tasks())):
                 logger.info("[%s][v2] pure ack absorbed: %s",
                             self.session_id[:8], text)
+                # 吸收轮也必须释放 commit 时置位的 gen 标志（2026-11-07
+                # 实测事故：泄漏的 gen_in_progress 让交付泵 can_deliver
+                # 永假——T2 完成后 14.5s 无声，用户只能"怎么不说话了"
+                # 来解锁；同时 _reply_in_flight 恒真让 blip 过滤在完全
+                # 静止期吞掉真实短句——"拜拜"连说四遍全被丢弃）。
+                self._release_gen(gen_sn)
                 return
             if (prev is not None and prev.is_alive()
                     and not prev_turn.get("committed")):

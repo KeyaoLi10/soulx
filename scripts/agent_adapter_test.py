@@ -849,14 +849,20 @@ check("28 task created (panel non-empty)", ok)
 time.sleep(0.4)                          # 轮结束、无挂起、线程已退
 routes_before = st["router_calls"]
 chats_before = chitchat_starts["n"]
-ad.handle_utterance("啊，好吧。")
-ad.handle_utterance("嗯，好的好的。")
+ad.handle_utterance("啊，好吧。", gen_sn=501)
+ad.handle_utterance("嗯，好的好的。", gen_sn=502)
 time.sleep(0.4)
 check("28b acks with panel tasks absorbed (no route, no chitchat)",
       st["router_calls"] == routes_before
       and chitchat_starts["n"] == chats_before,
       f"routes={st['router_calls']}/{routes_before} "
       f"chats={chitchat_starts['n']}/{chats_before}")
+# 28c（2026-11-07 gen 泄漏事故）：吸收轮也必须释放 commit 时置位的 gen
+# 标志——泄漏的 gen_in_progress 让交付泵 can_deliver 永假（T2 完成后
+# 14.5s 无声），并让 blip 过滤在静止期吞掉"拜拜"×4。
+check("28c absorbed ack releases commit-time gen flag",
+      501 in st["gen_releases"] and 502 in st["gen_releases"],
+      str(st["gen_releases"]))
 
 # 29 单一出口（2026-11-07 复播事故根修）：闲聊路面板注入不含结果原文
 # （render_chitchat_context），结果首播/重播全走交付泵；get_task 对已
