@@ -170,6 +170,30 @@ _COVERAGE_NOTE = (
     "create_task），不能只停发言把其余要求丢掉。本轮用户原文是：{text}\n"
     "重新调用 route_turn。")
 
+# 取消目标修复提示（2026-11-07 晚实测事故：用户"你再重新数到十"——与
+# 任务毫无关系的琐碎请求——被路由成 cancel_tasks [T2 湖人比赛, T3 讲
+# 笑话]：运行中的查询被掐死；刚完成的 T3 落进 RC_ALREADY_COMPLETED
+# 分支被置 cancel_intent=1，交付泵永久拒播 → 14s 无声 + 闲聊路（单一
+# 出口纪律下无结果文本可说）无限"我给你讲个笑话听听？"死循环。温度 0
+# 下 few-shot 改口取消模板的先验压过"数数=direct"硬规则，须结构化校验）
+_CANCEL_NOTE = (
+    "上一轮计划要取消的任务（{ids}）在本轮用户原文里完全没有被提到——"
+    "取消只能针对用户本轮明确说到的任务（话题词要对得上），或者是"
+    "「算了/别查了/不用了/全部取消」这类不点名话题的明确取消话。"
+    "本轮用户原文是：{text}\n重新调用 route_turn；如果用户并没有要"
+    "取消什么，就用空 operations 配合适的 reply_mode。")
+
+# 取消意图词与纯取消话的剩余词：整句去掉这两类词后为空 = 用户在取消
+# 但没点名话题（如"算了""那个先取消""别查了"），此时允许取消任何目标；
+# 剩余里有话题词（如"别查天气了"）则走 label 重叠接地。
+_CANCEL_INTENT_RE = re.compile(
+    r"取消|算了|不用|不要|不查|别查|别看|别管|别弄|别用|别搞|别整|"
+    r"停下|停止|停掉|打住|撤销|撤掉|退掉|去掉")
+_CANCEL_RESIDUE_RE = re.compile(
+    r"那个|这个|刚才|之前|它们|他们|这些|那些|任务|后台|所有|全部|"
+    r"都|全|先|再|又|把|给|被|将|了|吧|呢|啊|呀|哦|噢|嗯|呃|哈|嘛|"
+    r"一下|掉|去|的|说|查|做|弄|看|搞|整|跑|讲")
+
 # 引用接地归一化：忽略空白与常见中英文标点（ASR 断句差异）
 _NORM_RE = re.compile(r"[\s，。？！,.?!、·\"'“”‘’…（）()【】\[\]]")
 
@@ -206,6 +230,51 @@ def _stop_only_leftover(plan: C.Plan, user_text: str):
     quote = _norm_text(getattr(plan.operations[0], "evidence", ""))
     leftover = len(_norm_text(user_text)) - len(quote)
     return leftover if leftover > _STOP_ONLY_LEFTOVER_CHARS else 0
+
+
+def _bigrams(s: str):
+    s = _norm_text(s)
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _cancel_targets_ungrounded(plan: C.Plan, snapshot: dict,
+                               user_text: str):
+    """返回未被本轮话语引用的取消目标 task_id 列表（空=全部接地）。
+
+    取消目标"被引用"= ① 话题词命中（label 的二元字组出现在归一化
+    原文里——label 是路由自己起的话题名，用户提任务必然带话题词），
+    或 ② 整句是纯取消话（含取消词且去掉取消词/指示词/语气词后无
+    剩余，如"算了""那个先取消""别查了"）。两者都不满足 = 这轮话跟
+    该任务无关，取消是错路由（破坏力最大：杀运行任务 + 毒化已完成
+    任务的播报），修复一轮仍不接地则终态拒绝。快照里没有的 task_id
+    交给 store 的 unknown_task 拒绝，不在此拦；scope=all_active 只
+    要求原文含取消词（提示词已要求明确作用域）。"""
+    refs = {}
+    for t in (snapshot or {}).get("tasks", []) \
+            + (snapshot or {}).get("recent_terminal", []):
+        tid = t.get("task_id")
+        if tid:
+            refs[tid] = (_norm_text(t.get("label") or "")
+                         or _norm_text(t.get("goal") or ""))[:40]
+    hay = _norm_text(user_text)
+    hay_bg = _bigrams(hay)
+    pure_cancel = bool(_CANCEL_INTENT_RE.search(hay)) and not \
+        _CANCEL_RESIDUE_RE.sub("", _CANCEL_INTENT_RE.sub("", hay))
+    bad = []
+    for o in plan.operations:
+        if o.op != "cancel_tasks":
+            continue
+        if getattr(o, "scope", "explicit_targets") == "all_active":
+            if not _CANCEL_INTENT_RE.search(hay):
+                bad.append("all_active")
+            continue
+        for tgt in o.targets:
+            label = refs.get(tgt.get("task_id"))
+            if label is None or pure_cancel:
+                continue
+            if not (_bigrams(label) & hay_bg):
+                bad.append(tgt.get("task_id"))
+    return bad
 
 
 @dataclass
@@ -301,27 +370,39 @@ class PlanRouter:
                         # 变成任务轮）
                         last_error = f"evidence quote not grounded: {stale}"
                     else:
-                        leftover = _stop_only_leftover(plan, user_text)
-                        if not leftover:
-                            return RouteResult(
-                                ok=True, plan=plan, plan_json=plan_json,
-                                attempts=attempts,
-                                finish_reason=res.finish_reason,
-                                text=res.text,
-                                latency_ms=int(
-                                    (time.monotonic() - started) * 1000),
-                                frames_meta={"tool_calls": n_calls})
-                        # stop_speech-only 吞句：修复一轮，仍吞则终态
-                        # 拒绝（无声 + 请求被丢比让用户重说一遍更糟）
-                        last_error = (
-                            f"stop_speech-only plan left {leftover} "
-                            "chars unhandled")
+                        bad_cancels = _cancel_targets_ungrounded(
+                            plan, snapshot, user_text)
+                        if bad_cancels:
+                            # 取消目标与本轮话语无关：修复一轮，仍不接
+                            # 地则终态拒绝（错取消会掐死运行任务+毒化
+                            # 已完成的播报，比让用户重说一遍更糟）
+                            last_error = ("cancel target not referenced: "
+                                          + ",".join(bad_cancels))
+                        else:
+                            leftover = _stop_only_leftover(plan, user_text)
+                            if not leftover:
+                                return RouteResult(
+                                    ok=True, plan=plan, plan_json=plan_json,
+                                    attempts=attempts,
+                                    finish_reason=res.finish_reason,
+                                    text=res.text,
+                                    latency_ms=int(
+                                        (time.monotonic() - started) * 1000),
+                                    frames_meta={"tool_calls": n_calls})
+                            # stop_speech-only 吞句：修复一轮，仍吞则终态
+                            # 拒绝（无声 + 请求被丢比让用户重说一遍更糟）
+                            last_error = (
+                                f"stop_speech-only plan left {leftover} "
+                                "chars unhandled")
                 except C.PlanError as e:
                     last_error = f"parse: {e}"
             if i < self.repair_attempts:
                 if last_error.startswith("evidence quote"):
                     note = _GROUNDING_NOTE.format(
                         quote=last_error.split(": ", 1)[1], text=user_text)
+                elif last_error.startswith("cancel target"):
+                    note = _CANCEL_NOTE.format(
+                        ids=last_error.split(": ", 1)[1], text=user_text)
                 elif last_error.startswith("stop_speech-only"):
                     note = _COVERAGE_NOTE.format(
                         quote=getattr(plan.operations[0], "evidence", ""),

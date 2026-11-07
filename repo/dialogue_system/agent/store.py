@@ -365,7 +365,8 @@ class AgentStore:
         已完整播出。供 adapter 的 UI 泵轮询——读侧专用，不进控制平面。"""
         with self._lock:
             tasks = self._conn.execute(
-                "SELECT t.task_id, t.label, t.execution_status, r.goal "
+                "SELECT t.task_id, t.label, t.execution_status, "
+                "t.cancel_intent, r.goal "
                 "FROM tasks t JOIN task_revisions r "
                 "ON r.session_id=t.session_id AND r.task_id=t.task_id "
                 "AND r.revision=t.current_revision "
@@ -393,6 +394,11 @@ class AgentStore:
             return [{
                 "task_id": t["task_id"], "goal": t["goal"] or t["label"],
                 "execution_status": t["execution_status"],
+                # 结果播报被取消（cancel_intent=1 的 completed 任务）：
+                # 闲聊路据此不再拿"结果待播报"吊着用户（2026-11-07 晚
+                # 实测：交付被抑制后面板仍显示待播报 → 闲聊路无限
+                # "我给你讲个笑话听听？"死循环）
+                "suppressed": bool(t["cancel_intent"]),
                 "progress": progress.get(t["task_id"], ""),
                 "result": result.get(t["task_id"], ""),
                 "delivered": delivered.get(t["task_id"], False),

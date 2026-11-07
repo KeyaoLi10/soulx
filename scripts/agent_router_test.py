@@ -397,6 +397,125 @@ check("B20 persistent stop-only swallow terminal",
       not rr.ok and "unhandled" in rr.error and rr.attempts == 2,
       rr.to_log())
 
+# B21 取消目标接地（2026-11-07 晚实测事故：用户"你再重新数到十"——与
+# 任务毫无关系的琐碎请求——被路由成 cancel_tasks [T2 湖人, T3 笑话]：
+# 运行中的查询被掐死 + 刚完成的笑话任务被毒化成 cancel_intent=1 永久
+# 拒播 → 14s 无声 + 闲聊路"我给你讲个笑话听听？"死循环）
+SNAP2 = {"snapshot_version": 9, "request_id": "R2", "user_text": "",
+         "focus_task_id": "T2", "pending_question": None,
+         "tasks": [{"task_id": "T2", "revision": 1, "label": "湖人比赛",
+                    "goal": "查询今天NBA湖人队的比赛情况",
+                    "constraints": {}, "execution_status": "running"}],
+         "recent_terminal": [{"task_id": "T3", "revision": 1,
+                              "label": "讲笑话",
+                              "goal": "讲一个适合聚会时讲的笑话",
+                              "execution_status": "completed"}],
+         "capabilities": ["web_search"], "timezone": "Asia/Shanghai"}
+BOGUS_CANCEL = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "cancel_tasks", "targets": [
+            {"task_id": "T2", "expected_revision": 1},
+            {"task_id": "T3", "expected_revision": 1}],
+         "evidence": {"quote": "你再重新数到十"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+COUNT_DIRECT = json.dumps({
+    "schema_version": 1, "operations": [], "reply_mode": "direct"},
+    ensure_ascii=False)
+tr, calls = _mk_transport([_tool_call_result(BOGUS_CANCEL),
+                           _tool_call_result(COUNT_DIRECT)])
+rr = PlanRouter(transport=tr).route(SNAP2, "呃，你再重新数到十。")
+check("B21 incident replay: bogus cancel repaired to direct",
+      rr.ok and rr.attempts == 2 and not rr.plan.operations, rr.to_log())
+note = calls[1]["messages"][-1]
+check("B21b cancel note carries targets and current utterance",
+      note["role"] == "user" and "T2" in note["content"]
+      and "T3" in note["content"]
+      and "你再重新数到十" in note["content"], note["content"][:80])
+
+# B22 持续不接地 → 终态拒绝（错取消掐死运行任务+毒化播报，比让用户
+# 重说一遍更糟）
+tr, calls = _mk_transport([_tool_call_result(BOGUS_CANCEL),
+                           _tool_call_result(BOGUS_CANCEL)])
+rr = PlanRouter(transport=tr).route(SNAP2, "呃，你再重新数到十。")
+check("B22 persistent ungrounded cancel terminal",
+      not rr.ok and "cancel target not referenced" in rr.error
+      and rr.attempts == 2, rr.to_log())
+
+# B23 话题点名取消不误伤：原文带任务话题词（湖人）→ 一次通过
+TOPIC_CANCEL = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "cancel_tasks", "targets": [
+            {"task_id": "T2", "expected_revision": 1}],
+         "evidence": {"quote": "湖人那个别查了"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+tr, calls = _mk_transport([_tool_call_result(TOPIC_CANCEL)])
+rr = PlanRouter(transport=tr).route(SNAP2, "湖人那个别查了。")
+check("B23 topic-named cancel passes without repair",
+      rr.ok and rr.attempts == 1, rr.to_log())
+
+# B24 纯取消话不误伤：整句只有取消词+指示词（"那个先取消"），不点名
+# 话题也允许取消
+PURE_CANCEL = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "cancel_tasks", "targets": [
+            {"task_id": "T2", "expected_revision": 1},
+            {"task_id": "T3", "expected_revision": 1}],
+         "evidence": {"quote": "那个先取消"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+tr, calls = _mk_transport([_tool_call_result(PURE_CANCEL)])
+rr = PlanRouter(transport=tr).route(SNAP2, "那个先取消。")
+check("B24 pure cancel phrase grounds all targets",
+      rr.ok and rr.attempts == 1, rr.to_log())
+
+# B25 few-shot #2 语义不回退：label（计算）话题词命中
+FS2_SNAP = {"snapshot_version": 5, "request_id": "R3", "user_text": "",
+            "focus_task_id": None, "pending_question": None,
+            "tasks": [{"task_id": "T2", "revision": 1, "label": "计算",
+                       "goal": "计算 128 乘 36", "constraints": {},
+                       "execution_status": "running"}],
+            "recent_terminal": [], "capabilities": ["web_search"],
+            "timezone": "Asia/Shanghai"}
+tr, calls = _mk_transport([_tool_call_result(json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "cancel_tasks", "targets": [
+            {"task_id": "T2", "expected_revision": 1}],
+         "evidence": {"quote": "那个计算先取消"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False))])
+rr = PlanRouter(transport=tr).route(FS2_SNAP, "那个计算先取消。")
+check("B25 few-shot #2 cancel still passes", rr.ok and rr.attempts == 1,
+      rr.to_log())
+
+# B26 all_active 作用域只要求原文含取消词；没有取消词的 all_active
+# （事故形态）修复
+tr, calls = _mk_transport([_tool_call_result(json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "cancel_tasks", "scope": "all_active",
+         "evidence": {"quote": "你再重新数到十"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)),
+    _tool_call_result(COUNT_DIRECT)])
+rr = PlanRouter(transport=tr).route(SNAP2, "呃，你再重新数到十。")
+check("B26 all_active without cancel word repaired",
+      rr.ok and rr.attempts == 2, rr.to_log())
+tr, calls = _mk_transport([_tool_call_result(json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "cancel_tasks", "scope": "all_active",
+         "evidence": {"quote": "算了都别查了"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False))])
+rr = PlanRouter(transport=tr).route(SNAP2, "算了，都别查了。")
+check("B26b all_active with cancel word passes",
+      rr.ok and rr.attempts == 1, rr.to_log())
+
+# B27 快照外的目标不在此拦（store 的 unknown_task 会拒）——不误伤
+tr, calls = _mk_transport([_tool_call_result(json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "cancel_tasks", "targets": [
+            {"task_id": "T9", "expected_revision": 1}],
+         "evidence": {"quote": "把那个取消"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False))])
+rr = PlanRouter(transport=tr).route(SNAP, "把那个取消。")
+check("B27 off-snapshot target not blocked here",
+      rr.ok and rr.attempts == 1, rr.to_log())
+
 # ==== C. context.build_router_snapshot ======================================
 
 tmp = tempfile.mkdtemp(prefix="agent_router_ctx_")

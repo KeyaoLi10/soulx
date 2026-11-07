@@ -563,6 +563,18 @@ check("19 task completed, result held in outbox", ok)
 ad.handle_utterance("不对，我要查的是湖人队")
 ok = wait(lambda: rt.store.task_row("s1", "T1")["cancel_intent"] == 1)
 check("19b cancel on completed marks retraction", ok)
+# 19b2（2026-11-07 晚死循环事故）：被毒化的任务在面板上必须暴露
+# suppressed 标记，闲聊路注入绝不再说"结果待播报"（泵永不播，闲聊路
+# 会无限"我给你讲个笑话听听？"吊着用户）
+import agent.context as _ctx
+row = [r for r in rt.store.task_panel_rows("s1")
+       if r["task_id"] == "T1"][0]
+check("19b2 panel row exposes suppression",
+      row["suppressed"] is True, str(row))
+ctx_txt = _ctx.render_chitchat_context(rt.store.task_panel_rows("s1"))
+check("19b3 chitchat context stops teasing suppressed delivery",
+      "，结果待播报" not in ctx_txt and "，结果已取消播报" in ctx_txt,
+      ctx_txt[:200])
 ok = wait(lambda: any("刚好已经完成了" in str(x) for x in st["speak_calls"]))
 check("19c cancel receipt speaks already-completed template", ok,
       str(st["speak_calls"]))
