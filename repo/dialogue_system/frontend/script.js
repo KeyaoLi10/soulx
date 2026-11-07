@@ -244,6 +244,10 @@ function onSocketMessage(event) {
     switch (eventName) {
       case 'connect_ack':
         console.log('Connection confirmed:', payload);
+        // 晚十一：连接即回带的生效设置（含持久化的前端默认值）恢复
+        // UI 控件——刷新/换浏览器不丢设置。直接赋 value 不触发事件，
+        // 不会被 debounce 回发。
+        applyServerSettings(payload.settings);
         break;
       case 'pong':
         // heartbeat reply; liveness already recorded above
@@ -802,6 +806,8 @@ const DEFAULT_PERSONA =
   "你是 Elva，一个温柔、自然的语音对话助手，正在通过语音和用户实时聊天。" +
   "请用简短、口语化的自然中文回答，就像真人说话一样；不要输出多余解释，不要用列表或 Markdown 格式。" +
   "用户表示同意、附和或只是简单回应时，顺着上文继续说即可。" +
+  "说话要像真人：应承、附和、告别这些高频话不要每次都用一模一样的句子，" +
+  "开口前看一眼自己刚才说过什么，刚用过的句式就换一个说法——重复的固定句式听起来非常机械。" +
   "用户让你停下时，就什么都不要说。" +
   "身份必须始终如一：你的名字是 Elva。被问到“你是谁”时，用一两句口语化的中文介绍自己是 Elva。" +
   "你不是小爱同学、不是 Siri、不是小度，也不是任何手机或其他公司自带的语音助手——" +
@@ -858,6 +864,10 @@ const settingsEls = {
   agentEnabled: document.getElementById('agentEnabled'),
   agentRuntimeMode: document.getElementById('agentRuntimeMode'),
   playbackGuard: document.getElementById('playbackGuard'),
+  deliveryBargeinChunks: document.getElementById('deliveryBargeinChunks'),
+  deliveryBargeinChunksVal: document.getElementById('deliveryBargeinChunksVal'),
+  deliveryBargeinSpanMs: document.getElementById('deliveryBargeinSpanMs'),
+  deliveryBargeinSpanMsVal: document.getElementById('deliveryBargeinSpanMsVal'),
   taskList: document.getElementById('taskList'),
   taskEmpty: document.getElementById('taskEmpty'),
   taskCount: document.getElementById('taskCount'),
@@ -881,6 +891,8 @@ function currentSettings() {
     agent_enabled: settingsEls.agentEnabled.checked,
     agent_runtime_mode: settingsEls.agentRuntimeMode.value,
     playback_guard: settingsEls.playbackGuard.checked,
+    delivery_bargein_chunks: parseInt(settingsEls.deliveryBargeinChunks.value, 10) || 5,
+    delivery_bargein_span_ms: parseInt(settingsEls.deliveryBargeinSpanMs.value, 10) || 1000,
     asr_correct: settingsEls.asrCorrect.checked,
     asr_correct_wait_ms: parseInt(settingsEls.asrCorrectWaitMs.value, 10) || 500,
   };
@@ -888,8 +900,48 @@ function currentSettings() {
 
 function sendConfig(partial) {
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ event: 'update_config', data: partial }));
+    // persist: true —— 晚十一：真实 UI 的设置跨会话持久化为后续默认值
+    // （测试脚本/未知客户端不带此标志，不写默认值文件）
+    socket.send(JSON.stringify({ event: 'update_config', data: partial, persist: true }));
   }
+}
+
+// --- server settings → UI (connect_ack carries the session's effective
+// settings, including the persisted frontend defaults) ---
+function applyServerSettings(s) {
+  if (!s || typeof s !== 'object') return;
+  const set = (el, v) => { if (el && v !== undefined && v !== null) el.value = v; };
+  if (s.system_prompt) settingsEls.persona.value = s.system_prompt;
+  set(settingsEls.ttsEngine, s.tts_engine);
+  set(settingsEls.turnEngine, s.turn_engine);
+  set(settingsEls.turnWaitMs, s.turn_wait_ms);
+  settingsEls.turnWaitMsVal.textContent = settingsEls.turnWaitMs.value + ' ms';
+  set(settingsEls.turnGraceMs, s.turn_grace_ms);
+  settingsEls.turnGraceMsVal.textContent = settingsEls.turnGraceMs.value + ' ms';
+  set(settingsEls.deliveryBargeinChunks, s.delivery_bargein_chunks);
+  settingsEls.deliveryBargeinChunksVal.textContent = settingsEls.deliveryBargeinChunks.value;
+  set(settingsEls.deliveryBargeinSpanMs, s.delivery_bargein_span_ms);
+  settingsEls.deliveryBargeinSpanMsVal.textContent = settingsEls.deliveryBargeinSpanMs.value + ' ms';
+  set(settingsEls.asrCorrectWaitMs, s.asr_correct_wait_ms);
+  settingsEls.asrCorrectWaitMsVal.textContent = settingsEls.asrCorrectWaitMs.value + ' ms';
+  set(settingsEls.ttsCfg, s.tts_cfg);
+  settingsEls.ttsCfgVal.textContent = parseFloat(settingsEls.ttsCfg.value).toFixed(1);
+  set(settingsEls.ttsSteps, s.tts_timesteps);
+  settingsEls.ttsStepsVal.textContent = settingsEls.ttsSteps.value;
+  set(settingsEls.maxHistory, s.max_history);
+  settingsEls.maxHistoryVal.textContent = settingsEls.maxHistory.value;
+  set(settingsEls.minSegLen, s.min_seg_len);
+  settingsEls.minSegLenVal.textContent = settingsEls.minSegLen.value;
+  set(settingsEls.pvadMode, s.pvad_mode);
+  set(settingsEls.pvadThreshold, s.pvad_threshold);
+  settingsEls.pvadThresholdVal.textContent = parseFloat(settingsEls.pvadThreshold.value).toFixed(2);
+  set(settingsEls.agentRuntimeMode, s.agent_runtime_mode);
+  if (s.playback_guard !== undefined) settingsEls.playbackGuard.checked = !!s.playback_guard;
+  if (s.asr_correct !== undefined) settingsEls.asrCorrect.checked = !!s.asr_correct;
+  if (s.pvad_stream_gate !== undefined) settingsEls.pvadStreamGate.checked = !!s.pvad_stream_gate;
+  if (s.speaker_sep !== undefined) settingsEls.speakerSep.checked = !!s.speaker_sep;
+  if (s.agent_enabled !== undefined) settingsEls.agentEnabled.checked = !!s.agent_enabled;
+  syncTurnTimingState();
 }
 
 function sendCurrentSettings() {
@@ -942,6 +994,8 @@ function debouncedSend() {
       agent_enabled: s.agent_enabled,
       agent_runtime_mode: s.agent_runtime_mode,
       playback_guard: s.playback_guard,
+      delivery_bargein_chunks: s.delivery_bargein_chunks,
+      delivery_bargein_span_ms: s.delivery_bargein_span_ms,
       asr_correct: s.asr_correct,
       asr_correct_wait_ms: s.asr_correct_wait_ms,
     });
@@ -954,6 +1008,7 @@ function debouncedSend() {
 function syncTurnTimingState() {
   const frc = settingsEls.turnEngine.value === 'frc';
   [settingsEls.turnWaitMs, settingsEls.turnGraceMs, settingsEls.playbackGuard,
+   settingsEls.deliveryBargeinChunks, settingsEls.deliveryBargeinSpanMs,
    settingsEls.asrCorrect, settingsEls.asrCorrectWaitMs].forEach((el) => {
     el.disabled = frc;
     el.closest('.field').classList.toggle('frc-off', frc);
@@ -974,6 +1029,14 @@ settingsEls.turnGraceMs.addEventListener('input', () => {
   debouncedSend();
 });
 settingsEls.asrCorrect.addEventListener('change', debouncedSend);
+settingsEls.deliveryBargeinChunks.addEventListener('input', () => {
+  settingsEls.deliveryBargeinChunksVal.textContent = settingsEls.deliveryBargeinChunks.value;
+  debouncedSend();
+});
+settingsEls.deliveryBargeinSpanMs.addEventListener('input', () => {
+  settingsEls.deliveryBargeinSpanMsVal.textContent = settingsEls.deliveryBargeinSpanMs.value + ' ms';
+  debouncedSend();
+});
 settingsEls.asrCorrectWaitMs.addEventListener('input', () => {
   settingsEls.asrCorrectWaitMsVal.textContent = settingsEls.asrCorrectWaitMs.value + ' ms';
   debouncedSend();

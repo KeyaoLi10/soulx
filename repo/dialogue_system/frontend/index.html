@@ -158,6 +158,16 @@
           <span class="block-hint">While the assistant is generating or speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo/blip phantom turns are dropped — speaker echo, AEC residue or breath noise then cannot chop the reply or hijack your sentence. Off = raw zero-hysteresis behavior (any single sound interrupts). SoulX engine only.</span>
         </div>
         <div class="field">
+          <label for="deliveryBargeinChunks">Result-report barge-in chunks <span id="deliveryBargeinChunksVal" class="val">5</span></label>
+          <input id="deliveryBargeinChunks" type="range" min="1" max="20" step="1" value="5">
+          <span class="block-hint">While the assistant is reporting a background task's result, a barge-in needs at least this many voice chunks (and the span below) before it may cut the report — a quick "嗯，好的" backchannel then rides along instead of chopping the result. 1 ≈ off. Applies to both the chunk-level barge-in and the turn-commit path. SoulX engine only.</span>
+        </div>
+        <div class="field">
+          <label for="deliveryBargeinSpanMs">Result-report barge-in span <span id="deliveryBargeinSpanMsVal" class="val">1000 ms</span></label>
+          <input id="deliveryBargeinSpanMs" type="range" min="0" max="5000" step="100" value="1000">
+          <span class="block-hint">The first voice chunk must be at least this old when the threshold above is reached — the user has to keep talking for this long to interrupt a result report. 0 = chunks alone decide. SoulX engine only.</span>
+        </div>
+        <div class="field">
           <label for="asrCorrect" class="toggle-row">
             <input id="asrCorrect" type="checkbox" checked>
             <span>Whole-turn ASR correction</span>

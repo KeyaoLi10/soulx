@@ -30,7 +30,8 @@ src = APP.read_text(encoding="utf-8")
 tree = ast.parse(src)
 
 WANT_FNS = ("_begin_generation", "_reply_in_flight",
-            "_playback_guard_active", "_playback_bargein_deferred")
+            "_playback_guard_active", "_playback_bargein_deferred",
+            "_delivery_hold_turn", "_delivery_bargein_thresholds")
 WANT_CONSTS = ("_PLAYBACK_BARGEIN_WINDOW_S", "_PLAYBACK_BARGEIN_NONIDLE",
                "_RESULT_DELIVERY_BARGEIN_NONIDLE",
                "_RESULT_DELIVERY_BARGEIN_SPAN_S")
@@ -60,6 +61,8 @@ for name in WANT_FNS:
 
 begin_generation = ns["_begin_generation"]
 deferred = ns["_playback_bargein_deferred"]
+hold_turn = ns["_delivery_hold_turn"]
+thresholds = ns["_delivery_bargein_thresholds"]
 
 CHUNK = 0.165          # 一个上游 chunk ≈ 165ms（收包循环实测节拍）
 
@@ -80,6 +83,7 @@ def mk_session(playing=True):
     s.gen_serial = 0
     s.delivery_speech_active = False
     s.bargein_times = collections.deque()
+    s.stop_event = threading.Event()
     s.settings = {"playback_guard": True, "pvad_mode": "off"}
     # playing=True：回放进行中（playback_end 在未来）→ _reply_in_flight 真
     s.playback_end = time.time() + 30.0 if playing else time.time() - 30.0
@@ -196,6 +200,71 @@ with s8.lock:
 now = feed(s8, 3, time.time())
 check("8 playback_guard 关闭：慢脑播报保护仍然生效",
       deferred(s8, now) is True)
+
+# ---------------------------------------------------------------------------
+# 晚十一：话轮 commit 路径补漏（fd106958 会话 22:05:01/22:07:41 两起
+# 同形事故——chunk 级迟滞全 suppress 了"嗯，好。"，但 turn commit 的
+# pipeline_worker 无条件 interrupt 把播报掐到 Ratio 0.38/0.36）。
+# _delivery_hold_turn 在 receive loop 清 bargein_times 之前判定。
+
+# 9. 事故重放：播报中 3 chunk "嗯，好的" 短应答 turn commit → hold=True
+#    （commit 不掐播报，等 _speak 真上口再替换）
+s9 = mk_session()
+begin_generation(s9)
+with s9.lock:
+    s9.delivery_speech_active = True
+    s9.bargein_times.clear()
+now9 = feed(s9, 3, time.time())
+check("9 晚十一事故重放：3 chunk 短应答的 turn commit 不再掐播报",
+      hold_turn(s9, now9) is True,
+      f"times={len(s9.bargein_times)}")
+
+# 10. 播报中持续插话 ~1.1s（7 chunk，≥1s span）的 turn commit → hold=False
+#     （"你先别说了"级真打断，commit 走正常 interrupt 路径）
+s10 = mk_session()
+begin_generation(s10)
+with s10.lock:
+    s10.delivery_speech_active = True
+    s10.bargein_times.clear()
+now10 = feed(s10, 7, time.time(), gap=0.17)
+check("10 播报中 7 chunk/1.0s 真插话的 turn commit 照常打断",
+      hold_turn(s10, now10) is False)
+
+# 11. barge-in 已 confirm（stop_event 置位）后的尾随 turn → hold=False：
+#     播报已死，不能把已置位的 stop_event 护在原地吞掉新话轮
+s11 = mk_session()
+begin_generation(s11)
+with s11.lock:
+    s11.delivery_speech_active = True
+    s11.bargein_times.clear()
+now11 = feed(s11, 3, time.time())
+s11.stop_event.set()
+check("11 已 confirm 的真打断后：尾随 turn 不再 hold",
+      hold_turn(s11, now11) is False)
+
+# 12. 非播报期（flag off）→ hold=False（普通话轮 commit 行为不变）
+s12 = mk_session()
+feed(s12, 3, time.time())
+check("12 非播报期 turn commit 行为不变",
+      hold_turn(s12) is False)
+
+# 13. 阈值前端可调：调松（2 chunk / 0 span）后 3 chunk 短应答也放行
+s13 = mk_session()
+s13.settings["delivery_bargein_chunks"] = 2
+s13.settings["delivery_bargein_span_ms"] = 0
+begin_generation(s13)
+with s13.lock:
+    s13.delivery_speech_active = True
+    s13.bargein_times.clear()
+now13 = feed(s13, 3, time.time())
+check("13 前端调松阈值（2/0ms）：3 chunk 短应答可打断",
+      hold_turn(s13, now13) is False and deferred(s13, now13) is False)
+
+# 14. 阈值兜底：无设置的会话回落模块常量（5 chunk / 1.0s）
+s14 = types.SimpleNamespace(settings={})
+check("14 无设置会话回落常量阈值 5/1000ms",
+      thresholds(s14) == (5, 1.0),
+      f"got={thresholds(s14)}")
 
 print()
 if all(results):

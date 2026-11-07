@@ -12,6 +12,7 @@ Applying a sanitized update to a session (and its side effects: turn-server
 push, FRC engine reset) stays in app.py — this module holds no session or
 service state.
 """
+import json
 import os
 
 from clients.llm_client import QwenLLM_stream
@@ -126,6 +127,13 @@ DEFAULT_SETTINGS = {
     # better on 37 real turns at 0.08-0.26s latency. SoulX engine only.
     "asr_correct": True,
     "asr_correct_wait_ms": 500,
+    # 慢脑结果播报的打断保护阈值（晚八引入、晚十一补 commit 路径漏洞
+    # 后前端可调）：播报期间 barge-in 须 ≥ delivery_bargein_chunks 个
+    # nonidle chunk 且首块距今 ≥ delivery_bargein_span_ms 才真正打断；
+    # 话轮 commit 证据不足同样暂缓打断（turn held）。1/0 = 退回普通
+    # 3-in-1.6s 规则的近似行为（任何单 chunk 即放行）。
+    "delivery_bargein_chunks": 5,
+    "delivery_bargein_span_ms": 1000,
 }
 
 # Validation for update_config: (key, type, lo, hi) — ints/floats clamped to
@@ -143,6 +151,9 @@ SETTING_RULES = {
     "turn_wait_ms": (int, 160, 3200),
     "turn_grace_ms": (int, 0, 3000),
     "asr_correct_wait_ms": (int, 0, 2000),
+    # 播报打断保护：chunk 数 1-20；跨度 0-5 s（0 = 不要求跨度）
+    "delivery_bargein_chunks": (int, 1, 20),
+    "delivery_bargein_span_ms": (int, 0, 5000),
 }
 TTS_ENGINES = ("voxcpm", "firered")
 PVAD_MODES = ("off", "shadow", "enforce")
@@ -192,3 +203,56 @@ def sanitize_updates(data) -> dict:
     if "speaker_sep" in data:
         clean["speaker_sep"] = bool(data["speaker_sep"])
     return clean
+
+
+# ==== 前端设置跨会话持久化（2026-11-07 晚十一） =========================
+# 用户在前端设置过的值自动成为后续会话的默认值：update_config 落地时
+# 把清洗后的键值合并进 checkpoints/ui_settings_default.json（gitignored
+# 运行产物），会话创建时叠加在 DEFAULT_SETTINGS 之上。环境变量钉死的
+# AGENT_RUNTIME_MODE 始终优先（部署拓扑约束不该被 UI 点击改写）。
+UI_DEFAULTS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "checkpoints", "ui_settings_default.json")
+
+# 进程内镜像：import 时读一次，之后由 save_ui_default_updates 维护，
+# 会话创建读它而不是每次开文件（写少读多）。
+UI_DEFAULT_OVERRIDES = {}
+
+
+def load_ui_default_overrides() -> dict:
+    """读取持久化的前端默认值（坏文件/缺文件 = 空覆盖，绝不拦启动）。"""
+    try:
+        with open(UI_DEFAULTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    clean = sanitize_updates(data)
+    env_mode = os.environ.get("AGENT_RUNTIME_MODE")
+    if env_mode in AGENT_RUNTIME_MODES:
+        clean["agent_runtime_mode"] = env_mode
+    return clean
+
+
+def save_ui_default_updates(clean: dict) -> None:
+    """把一次已清洗的设置更新合并进持久化默认值并落盘（原子替换）。"""
+    if not clean:
+        return
+    merged = dict(UI_DEFAULT_OVERRIDES)
+    merged.update(clean)
+    env_mode = os.environ.get("AGENT_RUNTIME_MODE")
+    if env_mode in AGENT_RUNTIME_MODES:
+        merged["agent_runtime_mode"] = env_mode
+    try:
+        os.makedirs(os.path.dirname(UI_DEFAULTS_FILE), exist_ok=True)
+        tmp = UI_DEFAULTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, UI_DEFAULTS_FILE)
+        UI_DEFAULT_OVERRIDES.clear()
+        UI_DEFAULT_OVERRIDES.update(merged)
+    except OSError:
+        # 磁盘问题不拦设置生效——只是丢了跨会话持久化
+        pass
+
+
+UI_DEFAULT_OVERRIDES.update(load_ui_default_overrides())

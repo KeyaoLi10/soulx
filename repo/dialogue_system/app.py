@@ -120,7 +120,8 @@ from pvad_gate import (
 # of the pvad path — the receive loop only reads a flag; the scorer
 # thread does the blocking ECAPA work.
 from pvad_stream import PvadStreamGate, stream_gate_active, stream_gate_filter
-from settings import Config, DEFAULT_SETTINGS, TTS_ENGINE, sanitize_updates
+from settings import (Config, DEFAULT_SETTINGS, TTS_ENGINE, sanitize_updates,
+                      save_ui_default_updates, UI_DEFAULT_OVERRIDES)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -165,8 +166,9 @@ class ChatSession:
         self.audio_mic = _SessionAudio(client_id, "mic", Config.SAMPLE_RATE)
         self.audio_tts = _SessionAudio(client_id, "tts", 24000)
 
-        # Live settings (web UI panel) — see DEFAULT_SETTINGS
-        self.settings = dict(DEFAULT_SETTINGS)
+        # Live settings (web UI panel) — see DEFAULT_SETTINGS. 前端设置过
+        # 的值持久化后叠加为后续会话默认（晚十一，settings.py）
+        self.settings = {**DEFAULT_SETTINGS, **UI_DEFAULT_OVERRIDES}
 
         # State for pending message commitment (handling interruption)
         self.pending_message = None
@@ -494,6 +496,19 @@ _PLAYBACK_BARGEIN_NONIDLE = 3      # nonidle chunks needed inside it
 # "好"不能白送满窗计数——18:09:41 事故正是这样 0.15s 掐断的）。
 _RESULT_DELIVERY_BARGEIN_NONIDLE = 5
 _RESULT_DELIVERY_BARGEIN_SPAN_S = 1.0
+
+
+def _delivery_bargein_thresholds(session):
+    """播报打断阈值（晚十一起前端可调：delivery_bargein_chunks /
+    delivery_bargein_span_ms，settings.py 有校验区间）。常量只是无设置
+    会话的兜底。"""
+    settings = getattr(session, "settings", None) or {}
+    chunks = settings.get(
+        "delivery_bargein_chunks", _RESULT_DELIVERY_BARGEIN_NONIDLE)
+    span_ms = settings.get(
+        "delivery_bargein_span_ms",
+        int(_RESULT_DELIVERY_BARGEIN_SPAN_S * 1000))
+    return int(chunks), span_ms / 1000.0
 # (bargein_audio's gap-tolerant retention lives in pvad_gate.py:
 #  _PVAD_BARGEIN_RETAIN_S — see the 2026-11-05 background-video report)
 
@@ -579,11 +594,38 @@ def _playback_bargein_deferred(session, now=None):
         return False
     if session.delivery_speech_active:
         times = session.bargein_times
-        return not (len(times) >= _RESULT_DELIVERY_BARGEIN_NONIDLE
-                    and now - times[0] >= _RESULT_DELIVERY_BARGEIN_SPAN_S)
+        n_chunks, span_s = _delivery_bargein_thresholds(session)
+        return not (len(times) >= n_chunks
+                    and now - times[0] >= span_s)
     if not _playback_guard_active(session):
         return False
     return len(session.bargein_times) < _PLAYBACK_BARGEIN_NONIDLE
+
+
+def _delivery_hold_turn(session, now=None):
+    """晚十一补漏：这条刚 commit 的话轮要不要暂缓打断慢脑结果播报？
+
+    chunk 级迟滞（_playback_bargein_deferred）只拦 barge-in 信号路径，
+    但话轮 commit 路径（pipeline_worker 的 interrupt）原本无条件掐播报
+    ——2026-11-07 实测两起同形事故：交付泵刚开口播湖人/崇礼天气，用户
+    一声"嗯，好。"（3 chunk/0.3s，全被 suppress）仍在 commit 瞬间把播报
+    掐到 Ratio 0.38/0.36。判定与 chunk 级同源：播报保护激活 + 当前
+    stop_event 未置（已 confirm 的真打断不拦正常 commit）+ 本话轮语音
+    证据未达播报打断阈值（≥N chunk 且首块距今 ≥SPAN）。held 的话轮照常
+    处理（ASR/吸收/路由），只是不打断播报——真要说话的新语音经 _speak
+    上口时自然替换（对话优先）。"""
+    now = now if now is not None else time.time()
+    if not session.delivery_speech_active:
+        return False
+    if session.stop_event.is_set():
+        # 播报管线已被真打断（barge-in confirmed / 手动停止），commit
+        # 走正常路径，别把一个已死的播报护在原地
+        return False
+    times = session.bargein_times
+    n_chunks, span_s = _delivery_bargein_thresholds(session)
+    sustained = (len(times) >= n_chunks
+                 and now - times[0] >= span_s)
+    return not sustained
 
 _CHUNK_MS = 160            # one upstream audio chunk (2560 samples @16k) —
                           # converts turn_wait_ms to max_wait_num chunks
@@ -1298,7 +1340,8 @@ def _legacy_runtime_idle(session) -> bool:
 
 
 def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
-                    gen_sn=None, commit_id=None):
+                    gen_sn=None, commit_id=None, delivery_hold=False,
+                    hold_chunks=0):
     """
     Main processing pipeline: ASR -> LLM -> TTS.
     Runs in a background thread for each detected utterance.
@@ -1310,6 +1353,14 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
 
     commit_id: the turn server's counter for this commit — pairs the
     async turn_final (two-pass ASR correction) with this turn.
+
+    delivery_hold/hold_chunks: 晚十一——receive loop 判定这条 turn 的
+    语音证据（hold_chunks 个 nonidle chunk）不足以打断慢脑结果播报
+    （见 _delivery_hold_turn）。此时本 worker 不 interrupt/reset：播报
+    管线继续握着当前 stop_event，本 turn 照常处理（吸收/路由），真要
+    上口的新语音由 _speak 在开口前自己换事件。V2 未接管的 legacy 生成
+    路径在 _speak 之外直接向浏览器发音频，必须在生成前补上推迟的打断
+    （见下方 fallback），否则双声道重叠。
     """
     session = session_manager.get_session(client_id)
     if not session:
@@ -1422,14 +1473,32 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         #     return
 
         # Process Pending Message from previous turn if any (before adding new user message)
-        # forensic cut first, while the pending state still names the
-        # reply whose playback this interrupt is about to stop
-        session.cut_pending_audio()
-        _commit_pending_message(session, client_id)
+        # 晚十一：held 的 turn 不打断慢脑播报。pending 照常提交（保持
+        # 历史顺序；播报发射中 pending 为空是 no-op，播报尾段提交的
+        # 是已完整发射的文本，与 played_confirmed 的发射侧估计一致），
+        # 但不 cut（播报还在放）也不 interrupt/reset（播报管线要继续
+        # 握着当前 stop_event，后续 interrupt 才够得着它）。
+        held = delivery_hold and not session.stop_event.is_set()
+        if held:
+            logger.info(
+                f"[{client_id}] turn held during result delivery "
+                f"({hold_chunks} chunk(s) evidence; "
+                f"turn: {asr_text[:24]!r})"
+            )
+            emit_to_room(
+                client_id, "delivery_hold",
+                {"chunks": hold_chunks, "text": asr_text[:40]},
+            )
+            _commit_pending_message(session, client_id)
+        else:
+            # forensic cut first, while the pending state still names the
+            # reply whose playback this interrupt is about to stop
+            session.cut_pending_audio()
+            _commit_pending_message(session, client_id)
 
-        # 3. Preparation for Response
-        session.interrupt()  # Signal previous threads to stop
-        session.reset_interrupt()  # Create a fresh event for this new thread
+            # 3. Preparation for Response
+            session.interrupt()  # Signal previous threads to stop
+            session.reset_interrupt()  # Create a fresh event for this new thread
 
         # Capture the specific stop_event for this execution cycle
         current_stop_event = session.stop_event
@@ -1523,6 +1592,19 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
                     "[%s] enforce deferred: legacy runtime still has "
                     "work; this turn stays on the legacy path",
                     client_id[:8])
+        if held:
+            # 晚十一 fallback：V2 没有接管本轮（enforce 关闭/初始化失败/
+            # legacy 还有活，或 shadow 只观察），下面的 legacy 生成不经
+            # _speak 直接向浏览器发音频——不先停掉播报会两条语音重叠。
+            # 补上被推迟的打断；cut+commit 兜住 held 判定后播报才完成
+            # 发射、pending 刚落地的竞态（否则会被本轮回复的 pending 覆
+            # 盖，播报文本从历史丢失）。
+            session.cut_pending_audio()
+            _commit_pending_message(session, client_id)
+            session.interrupt()
+            session.reset_interrupt()
+            current_stop_event = session.stop_event
+            held = False
         if agent_runtime:
             system_prompt = (
                 settings.get("system_prompt") or QwenLLM_stream.SYSTEM_PROMPT
@@ -1655,8 +1737,12 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
 # applies a sanitized update to the session and runs the side effects.
 
 
-def _merge_session_settings(session, data: dict) -> dict:
-    """Validate + merge a partial settings update into session.settings."""
+def _merge_session_settings(session, data: dict, persist: bool = False) -> dict:
+    """Validate + merge a partial settings update into session.settings.
+
+    persist=True（真实前端 update_config 带 persist 标志）：晚十一——
+    清洗后的键值同时落盘为后续会话默认值。测试脚本/未知客户端不带
+    标志，只改本会话，不污染持久化默认。"""
     clean = sanitize_updates(data)
 
     if clean.get("turn_engine") not in (None, session.settings.get("turn_engine")):
@@ -1675,6 +1761,12 @@ def _merge_session_settings(session, data: dict) -> dict:
 
     if "turn_wait_ms" in clean:
         _push_turn_wait_num(session)
+
+    # 晚十一：前端设置过的值自动成为后续会话的默认值（跨会话持久化，
+    # settings.save_ui_default_updates 原子落盘；env 钉死的
+    # agent_runtime_mode 不会被覆盖；仅真实前端 persist 标志触发）
+    if persist:
+        save_ui_default_updates(clean)
 
     return dict(session.settings)
 
@@ -1816,7 +1908,12 @@ async def websocket_endpoint(websocket: WebSocket):
         session.frc.start()
 
         # Now emission works via session_manager lookups
-        emit_to_room(client_id, "connect_ack", {"client_id": client_id})
+        emit_to_room(client_id, "connect_ack", {
+            "client_id": client_id,
+            # 晚十一：连接即回带当前生效设置（含持久化的前端默认值），
+            # 浏览器据此恢复 UI 控件状态——刷新/换设备不丢设置
+            "settings": dict(session.settings),
+        })
         emit_to_room(
             client_id,
             "vad_loading",
@@ -2007,6 +2104,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     run, session.voice_run = session.voice_run, 0
                     session.bargein_streak = 0
                     session.bargein_audio = []
+                    # 晚十一：话轮的语音证据马上就被清掉，先在此判定这
+                    # 条 turn 是否暂缓打断慢脑播报（"嗯，好的"级短话的
+                    # commit 不掐播报——判定见 _delivery_hold_turn），
+                    # 并把证据 chunk 数一并带走（worker 里 deque 已清空）
+                    delivery_hold = _delivery_hold_turn(session)
+                    hold_chunks = len(session.bargein_times)
                     # the committed utterance's nonidle evidence must not
                     # vouch for a LATER barge-in: without this clear, a
                     # blip arriving ~0.8 s after the user's last chunk
@@ -2123,7 +2226,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     threading.Thread(
                         target=pipeline_worker,
                         args=(client_id, segment, Config.SAMPLE_RATE,
-                              turn_trigger, gen_sn, commit_id),
+                              turn_trigger, gen_sn, commit_id,
+                              delivery_hold, hold_chunks),
                         daemon=True,
                     ).start()
 
@@ -2184,7 +2288,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         # pipeline. Echoes the merged settings back so the UI
                         # can confirm what actually landed.
                         data = payload.get("data", {})
-                        merged = _merge_session_settings(session, data)
+                        merged = _merge_session_settings(
+                            session, data,
+                            persist=bool(payload.get("persist")))
                         # Fast/slow brain toggle: starting/stopping the
                         # runtime cancels running tasks on switch-off
                         if session.agent_runtime:
