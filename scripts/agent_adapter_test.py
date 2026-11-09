@@ -1011,6 +1011,27 @@ check("29b2 interrupted delivery not rendered as pending",
 check("29b3 interrupted result text hidden (single outlet)",
       "国王赢了" not in ctx, ctx[:200])
 
+# 29c 系列（2026-11-09 渐进式披露重构）：打断只记录状态，绝不附带
+# 行为指令（"想听要用户再说一声"是永不关闭的开放环，事故里成了闲聊
+# 路每轮主动吊用户的钩子——同一句 NBA 邀请连播两遍逐字相同）；用户
+# 实际听到部分照实注入，其余结果文本仍隐藏；执行进度不再注入
+ctx = agent_context.render_chitchat_context([
+    {"task_id": "T4", "goal": "查NBA赛程",
+     "execution_status": "completed", "progress": "",
+     "result": "今天有8场比赛，湖人vs老鹰", "interrupted": True,
+     "heard": "今天有8场比赛，湖人"},
+    {"task_id": "T5", "goal": "查上海天气", "execution_status": "running",
+     "progress": "搜索：上海 天气", "result": ""},
+])
+check("29c interrupted renders heard portion (progressive disclosure)",
+      "用户听到了：今天有8场比赛，湖人" in ctx, ctx[:300])
+check("29c2 interrupted un-heard remainder still hidden",
+      "老鹰" not in ctx, ctx[:300])
+check("29c3 no re-ask bait on interrupted rows",
+      "再说一声" not in ctx and "想听" not in ctx, ctx[:300])
+check("29c4 execution progress not injected",
+      "搜索：" not in ctx, ctx[:300])
+
 rt, ad, st = make_env(
     tmp, [CREATE_PLAN, GET_PLAN], chitchat_impl=_std_chitchat,
     runner=lambda s, c, p: {"type": "completed",

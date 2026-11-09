@@ -81,10 +81,11 @@ check("A6 think start mode unaffected",
 # ==== B. _agent_gen_kwargs：v2 贪心默认，legacy 行为不变 ====================
 
 gk = srv._agent_gen_kwargs({}, thinking=False)
-check("B1 legacy default temp", gk["temperature"] == 0.8 and gk["do_sample"])
+check("B1 legacy default temp", gk["temperature"] == srv.TEMP
+      and gk["do_sample"])
 gk = srv._agent_gen_kwargs({"temperature": 0}, thinking=False)
 check("B2 legacy explicit 0 still swallowed (documented quirk, unchanged)",
-      gk["temperature"] == 0.8 and gk["do_sample"])
+      gk["temperature"] == srv.TEMP and gk["do_sample"])
 
 gk = srv._agent_gen_kwargs({}, thinking=False, v2=True)
 check("B3 v2 default greedy", gk["temperature"] == 0.0

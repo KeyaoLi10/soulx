@@ -378,6 +378,28 @@ db.set_delivery_state(dd3, C.DLV_SUPPRESSED)
 check("same-state delivery write is a no-op",
       db.delivery_row(dd3)["state"] == C.DLV_SUPPRESSED)
 
+# ---- delivery_heard（渐进式披露，2026-11-09）-------------------------------
+# 打断交付的"用户实际听到部分"由语音前端回写（delivery_heard 事件），
+# task_panel_rows 暴露给闲聊路面板——用户问"刚才说到哪"时凭事实回答
+db.record_delivery_heard(SID, "T1", "今天有8场比赛，湖人")
+rows = {r["task_id"]: r for r in db.task_panel_rows(SID)}
+check("heard exposed on panel row",
+      rows["T1"]["heard"].startswith("今天有8场比赛"), str(rows.get("T1")))
+# 最新一条覆盖旧值（按 seq 排序取每任务最新）
+db.record_delivery_heard(SID, "T1", "更新后的听到部分")
+rows = {r["task_id"]: r for r in db.task_panel_rows(SID)}
+check("latest delivery_heard wins",
+      rows["T1"]["heard"] == "更新后的听到部分", str(rows["T1"]))
+# 空文本不写事件
+n_heard = db._conn.execute(
+    "SELECT COUNT(*) c FROM events WHERE type='delivery_heard'"
+).fetchone()["c"]
+db.record_delivery_heard(SID, "T1", "   ")
+check("empty heard text ignored",
+      db._conn.execute(
+          "SELECT COUNT(*) c FROM events WHERE type='delivery_heard'"
+      ).fetchone()["c"] == n_heard)
+
 # ---- route log --------------------------------------------------------------
 db.log_route(SID5, ro, "shadow", snapshot={"tasks": 2}, plan_json=None,
              parse_ok=False, error="timeout", latency_ms=42)

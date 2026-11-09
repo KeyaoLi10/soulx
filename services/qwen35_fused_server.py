@@ -40,7 +40,9 @@ TTS_URL = os.environ.get("FIRERED_TTS_URL", "http://127.0.0.1:8081/v1/audio/spee
 TTS_VOICE = os.environ.get("FIRERED_TTS_VOICE", "f531")
 
 # generation params mirror dialogue_system/modules/qwen_llm/config.yaml
-TEMP = 0.8
+# 2026-11-09 0.8→0.9：复读事故实测逐字相同输出发生在 0.8 之下（上下文
+# 吸引子），微升帮助打断吸引子；路由路 /agent_chat_v2 仍钉死 greedy 0
+TEMP = 0.9
 TOP_P = 0.95
 MAX_NEW_TOKENS = 512
 

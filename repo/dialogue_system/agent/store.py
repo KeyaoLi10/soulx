@@ -374,6 +374,21 @@ class AgentStore:
                 "task_id=? AND revision=?",
                 (session_id, task_id, revision)).fetchone()
 
+    def record_delivery_heard(self, session_id, task_id, heard_text):
+        """记录被打断交付"用户实际听到的部分"（渐进式披露，2026-11-09）。
+
+        打断是终态、泵不自动重播，但闲聊路面板要能凭摘要回答"刚才说
+        到哪/我听到了什么"——heard 在交付播报被打断（rc=False）后由
+        语音前端回写。纯事实记录：不改变交付状态机，最新一条覆盖旧
+        值（task_panel_rows 按 seq 取每任务最新）。"""
+        heard = str(heard_text or "").strip()
+        if not heard:
+            return
+        with self._tx():
+            self._append_event(session_id, "delivery_heard",
+                               task_id=task_id,
+                               payload={"heard": heard[:400]})
+
     def task_panel_rows(self, session_id):
         """前端任务面板只读视图（V2）：任务 + 最近进度/结果 + 结果是否
         已完整播出。供 adapter 的 UI 泵轮询——读侧专用，不进控制平面。"""
@@ -386,11 +401,12 @@ class AgentStore:
                 "AND r.revision=t.current_revision "
                 "WHERE t.session_id=? ORDER BY t.created_at DESC",
                 (session_id,)).fetchall()
-            progress, result, delivered = {}, {}, {}
+            progress, result, heard = {}, {}, {}
             for e in self._conn.execute(
                     "SELECT task_id, type, payload_json FROM events WHERE "
                     "session_id=? AND task_id IS NOT NULL AND type IN "
-                    "('progress','completed','failed') ORDER BY seq",
+                    "('progress','completed','failed','delivery_heard') "
+                    "ORDER BY seq",
                     (session_id,)).fetchall():
                 try:
                     p = json.loads(e["payload_json"])
@@ -398,6 +414,8 @@ class AgentStore:
                     p = {}
                 if e["type"] == "progress":
                     progress[e["task_id"]] = str(p.get("desc", ""))[:120]
+                elif e["type"] == "delivery_heard":
+                    heard[e["task_id"]] = str(p.get("heard", ""))[:400]
                 else:
                     result[e["task_id"]] = str(p.get("summary", ""))[:400]
             dstate = {}
@@ -428,6 +446,9 @@ class AgentStore:
                 "result": result.get(t["task_id"], ""),
                 "delivered": delivered.get(t["task_id"], False),
                 "interrupted": interrupted.get(t["task_id"], False),
+                # 被打断交付的"用户实际听到部分"（delivery_heard 事件，
+                # 渐进式披露）：只有 interrupted 行会渲染它
+                "heard": heard.get(t["task_id"], ""),
             } for t in tasks]
 
     # -------------------------------------------------------------- 事件

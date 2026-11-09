@@ -984,6 +984,12 @@ def _run_speech_pipeline(session, client_id, llm_reply_gen, current_stop_event,
             session.pending_audio_duration = 0.0
             session.pending_start_time = None
             session.interruption_time = None
+            # 渐进式披露（2026-11-09）：截断后的"用户实际听到部分"留给
+            # 调用方读取（交付泵桥接回写 store 的 delivery_heard 事件）。
+            # 带线程标识——闲聊路与交付泵并发打断时各自的 partial 不会
+            # 串门（读侧校验同线程才采信）。
+            session.last_partial_spoken = (
+                threading.get_ident(), message_to_add)
 
     else:
         # Pipeline finished successfully, but user might interrupt later while audio is playing.
@@ -1236,6 +1242,29 @@ def _make_agent_v2(session, client_id, mode=None):
             min_seg_len=settings.get("min_seg_len"),
             extra_context=extra_context)
 
+    def _delivery_speak(env, text, stop_event):
+        """交付泵的 speak_fn 桥（delivery_protect 恒 True）。播报被打断
+        （rc=False）时把"用户实际听到部分"回写 store（delivery_heard
+        事件）——闲聊路面板据此渐进式披露，用户问"刚才说到哪"时凭
+        事实直接回答，不再依赖承诺话术（2026-11-09 重构）。"""
+        rc = _speak(text, stop_event, delivery_protect=True)
+        if rc is False and getattr(env, "task_id", None):
+            with session.lock:
+                partial = getattr(session, "last_partial_spoken", None)
+            heard = ""
+            if (isinstance(partial, tuple)
+                    and partial[0] == threading.get_ident()):
+                heard = str(partial[1] or "")
+            if heard:
+                try:
+                    runtime.store.record_delivery_heard(
+                        client_id, env.task_id, heard)
+                except Exception:  # noqa: BLE001 — 记录失败不拦交付状态机
+                    logger.exception(
+                        "[%s][v2] record delivery heard failed",
+                        client_id[:8])
+        return rc
+
     plan_router = PlanRouter()
 
     def _router_fn(sid, text, snap, stop_event=None):
@@ -1264,8 +1293,7 @@ def _make_agent_v2(session, client_id, mode=None):
         db_path=str(db_path),
         router_fn=_router_fn,
         runner=make_v2_runner(),
-        speak_fn=lambda env, text, stop_event: _speak(
-            text, stop_event, delivery_protect=True),
+        speak_fn=_delivery_speak,
         can_deliver_fn=lambda sid: _agent_can_deliver(session),
         grace_gate=lambda sid: (
             _grace_s() <= 0

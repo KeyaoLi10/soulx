@@ -57,6 +57,9 @@ events = []            # websocket emits
 
 ns = {
     "time": time,
+    # _run_speech_pipeline 打断分支带线程标识暂存"用户实际听到部分"
+    # （渐进式披露，2026-11-09）——抽取执行需要 threading 在命名空间里
+    "threading": __import__("threading"),
     "logger": _Logger(),
     "emit_to_room": lambda cid, ev, data=None: events.append((ev, data)),
     "llm": types.SimpleNamespace(
