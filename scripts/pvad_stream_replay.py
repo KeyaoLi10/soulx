@@ -85,6 +85,7 @@ def mk_session(settings=None, pvad=None, ring_s=30.0):
     s.pvad_turn_cos = None
     s.pvad_speech_bank = None
     s.pvad_stream_gate = None
+    s.voxlock_isolator = None
     s.bargein_audio = []
     return s
 
@@ -412,52 +413,55 @@ def part_d():
           f"video pause, by design fail-open)")
 
 
-# ============================================== E. speaker_sep shadow hook
+# ============================================== E. voxlock shadow hook
 def part_e():
-    print("\n=== E. speaker-separation shadow hook (task 2) ===")
-    import speaker_sep
+    print("\n=== E. VoxLock isolation shadow hook (2026-11-10) ===")
+    import voxlock_isolate
 
     wav = np.ones(19200, dtype=np.float32) * 0.05
 
-    # E1: switch off (default) -> no separation, no extra pvad calls
+    class FakeIso:
+        def __init__(self, tail=None):
+            self._tail = tail
+
+        def isolated_tail(self, seconds):
+            return self._tail
+
+    # E1: switch off (default) / no isolator -> no isolated scoring
     s = mk_session()
     check("E1 speaker_sep off -> shadow returns None",
-          not speaker_sep.sep_enabled(s)
-          and speaker_sep.sep_shadow_round(s, wav) is None)
+          not voxlock_isolate.voxlock_enabled(s)
+          and voxlock_isolate.sep_shadow_round(s, wav) is None)
 
-    # E2: switch on + stubbed sidecar -> reports the better stream,
-    # consuming exactly two pvad scores (s1, s2)
+    # E2: switch on + isolator with ring -> scores what ASR heard
+    # (the isolated tail), exactly one pvad call
     s = mk_session(settings={"speaker_sep": True},
-                   pvad=FakePvad(scores=[0.2, 0.6]))
-    speaker_sep.separate = lambda w: (w, w)
-    out = speaker_sep.sep_shadow_round(s, wav)
-    check("E2 shadow reports max-cos stream",
-          out == {"sep_cos": 0.6, "sep_stream": 2} and s.pvad.calls == 2,
-          f"({out})")
+                   pvad=FakePvad(scores=[0.6]))
+    s.voxlock_isolator = FakeIso(tail=wav)
+    out = voxlock_isolate.sep_shadow_round(s, wav)
+    check("E2 shadow scores the isolated tail",
+          out == {"sep_cos": 0.6} and s.pvad.calls == 1, f"({out})")
 
-    # E3: sidecar down -> None, and the gate state machine is unaffected
-    speaker_sep.deps_broken = True
-    speaker_sep.separate = lambda w: None
-    out = speaker_sep.sep_shadow_round(s, wav)
-    s2 = mk_session(pvad=FakePvad(scores=[0.10, 0.10, 0.10, 0.10]))
-    g = PvadStreamGate(s2, start_thread=False)
-    ring_speak(s2, 100.0, 3.0)
+    # E3: empty ring / pvad blind -> None, gate state machine unaffected
+    s3 = mk_session(pvad=FakePvad(scores=[0.10, 0.10, 0.10, 0.10]))
+    s3.voxlock_isolator = FakeIso(tail=None)
+    out = voxlock_isolate.sep_shadow_round(s3, wav)
+    g = PvadStreamGate(s3, start_thread=False)
+    ring_speak(s3, 100.0, 3.0)
     g._evaluate(); g._evaluate()
-    check("E3 sidecar failure -> shadow None, gate still suppresses",
+    check("E3 no isolated audio -> shadow None, gate still suppresses",
           out is None and g.suppressing())
 
     # E4: gate round with sep on reports sep_cos but decides on raw cos
-    # (scores: raw 0.10, s1 0.05, s2 0.90 | raw 0.10, s1 0.05, s2 0.90)
-    s3 = mk_session(settings={"speaker_sep": True},
-                    pvad=FakePvad(scores=[0.10, 0.05, 0.90,
-                                          0.10, 0.05, 0.90]))
-    speaker_sep.separate = lambda w: (w, w)
-    g3 = PvadStreamGate(s3, start_thread=False)
-    ring_speak(s3, 100.0, 3.0)
-    g3._evaluate(); g3._evaluate()
+    # (scores per round: raw 0.10, isolated 0.90)
+    s4 = mk_session(settings={"speaker_sep": True},
+                    pvad=FakePvad(scores=[0.10, 0.90, 0.10, 0.90]))
+    s4.voxlock_isolator = FakeIso(tail=wav)
+    g4 = PvadStreamGate(s4, start_thread=False)
+    ring_speak(s4, 100.0, 3.0)
+    g4._evaluate(); g4._evaluate()
     check("E4 gate suppresses on raw cos despite high sep cos",
-          g3.suppressing() and g3.sep_status() == {"sep_cos": 0.9,
-                                                   "sep_stream": 2})
+          g4.suppressing() and g4.sep_status() == {"sep_cos": 0.9})
 
 
 if __name__ == "__main__":

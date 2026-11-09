@@ -115,6 +115,11 @@ from pvad_gate import (
 # of the pvad path — the receive loop only reads a flag; the scorer
 # thread does the blocking ECAPA work.
 from pvad_stream import PvadStreamGate, stream_gate_active, stream_gate_filter
+from voxlock_isolate import (
+    ensure_isolator,
+    voxlock_asr_filter,
+    voxlock_enabled,
+)
 from settings import (Config, DEFAULT_SETTINGS, sanitize_updates,
                       save_ui_default_updates, UI_DEFAULT_OVERRIDES,
                       pin_env_runtime_mode)
@@ -208,6 +213,10 @@ class ChatSession:
         # Pre-ASR stream gate (pvad_stream.PvadStreamGate), created lazily
         # by the receive loop only while pvad is enabled. None = inert.
         self.pvad_stream_gate = None
+        # VoxLock caller isolator (voxlock_isolate.VoxLockIsolator),
+        # created lazily by the receive loop only while speaker_sep is
+        # on. None = inert. Replaces the MossFormer2 sidecar (2026-11-10).
+        self.voxlock_isolator = None
         # Gate-decision audio dumps written for this session (forensics
         # cap; see pvad_gate._pvad_dump_forensics)
         self.pvad_forensics_n = 0
@@ -2024,6 +2033,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_chunk = stream_gate_filter(session, audio_chunk)
                     pvad_emit_status(session)
 
+                # VoxLock caller isolation (speaker_sep switch, default
+                # off — replaces the MossFormer2 sidecar, 2026-11-10):
+                # the turn server is the ONLY consumer whose audio
+                # changes; everything above (recording, pvad ring /
+                # sidecar, barge-in evidence) has already seen the
+                # original mic. Off = two cheap checks; every failure
+                # mode fails open (voxlock_isolate.py).
+                if (session.voxlock_isolator is None
+                        and voxlock_enabled(session)):
+                    ensure_isolator(session)
+                audio_chunk = voxlock_asr_filter(session, audio_chunk)
+
                 t_proc = time.time()
                 with session.lock:
                     segment = session.vad.process(audio_chunk)
@@ -2360,6 +2381,9 @@ async def websocket_endpoint(websocket: WebSocket):
             session.pvad.stop()
             if session.pvad_stream_gate is not None:
                 session.pvad_stream_gate.stop()
+            if session.voxlock_isolator is not None:
+                session.voxlock_isolator.stop()
+                session.voxlock_isolator = None
             # playback ended the moment the client vanished — cut any
             # pending reply's unplayed tail before closing the recorder
             session.cut_pending_audio(time.time())

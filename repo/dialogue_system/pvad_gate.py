@@ -712,6 +712,19 @@ def pvad_try_enroll(session, reason: str) -> None:
                 f"[{session.client_id}] pvad enrolled ({reason}, "
                 f"{total_s:.1f}s audio)"
             )
+            # The same verified audio seeds the VoxLock isolator (2026-11-10
+            # speaker-separation replacement): live()-auto-lock could latch
+            # onto a background voice; a seeded stream isolates the
+            # enrolled caller from its first chunk. One-way (re-enrollments
+            # of the same speaker don't restart the LSTM mid-call).
+            iso = getattr(session, "voxlock_isolator", None)
+            if iso is not None:
+                try:
+                    iso.seed(wav)
+                except Exception:  # noqa: BLE001 — seeding is best-effort
+                    logger.exception(
+                        "[%s] voxlock seed from enrollment failed",
+                        session.client_id[:8])
         else:
             session.pvad_enroll_pending = True
 

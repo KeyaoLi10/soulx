@@ -149,10 +149,12 @@ class PvadStreamGate:
             if cos is None:
                 self._set_state(False, None, "service-blind")  # fail-open
                 return
-            # shadow-only separation observation (speaker_sep switch,
-            # default off): reports sep_cos alongside the raw cos, never
-            # changes the suppress/release decision (see speaker_sep.py)
-            from speaker_sep import sep_shadow_round
+            # shadow-only isolation observation (speaker_sep switch,
+            # default off): ECAPA-scores what the turn server actually
+            # heard (the VoxLock-isolated ring tail) against the
+            # enrolled reference, reported alongside the raw cos — never
+            # changes the suppress/release decision (see voxlock_isolate.py)
+            from voxlock_isolate import sep_shadow_round
             self._last_sep = sep_shadow_round(session, wav)
             t_low = threshold - _STREAM_MARGIN
             if cos >= threshold:
@@ -188,8 +190,7 @@ class PvadStreamGate:
                 f"[{self.session.client_id}] pvad stream gate "
                 f"{'SUPPRESSING' if suppressed else 'releasing'} mic->ASR "
                 f"(why={why}, cos={None if cos is None else round(cos, 3)}"
-                + (f", sep_cos={sep['sep_cos']}@s{sep['sep_stream']}"
-                   if sep else "") + ")"
+                + (f", sep_cos={sep['sep_cos']}" if sep else "") + ")"
             )
 
     def sep_status(self) -> dict | None:

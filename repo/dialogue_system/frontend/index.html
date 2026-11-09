@@ -216,9 +216,9 @@
         <div class="field">
           <label for="speakerSep" class="toggle-row">
             <input id="speakerSep" type="checkbox">
-            <span>Speaker separation (experimental)</span>
+            <span>Voice isolation — VoxLock (experimental)</span>
           </label>
-          <span class="block-hint">Runs each speaker-gate scoring window through a MossFormer2 separation sidecar and reports the separated-stream similarity (shadow only — it never changes muting decisions, and offline validation found no gate improvement; it is an observability surface for evaluating better separation models). Requires the tse sidecar (:8087) to be running; off by default and free when off.</span>
+          <span class="block-hint">With Voice Isolation on, the audio the transcription/turn engine hears is run through VoxLock, a target-speaker extractor that removes every voice but yours (background video, other people in the room) before ASR. Pass-through until it locks onto your voice — automatically within the first seconds of your speech, or immediately when the speaker gate is enrolled. Your recording and the speaker gate always hear the raw mic. Fails open (raw audio) on any hiccup; the speaker gate additionally reports the isolated-voice similarity (sep_cos, shadow only). Off by default and free when off.</span>
         </div>
         <div class="gate-row">
           <button id="pvadEnrollBtn" class="btn btn-ghost btn-sm">Re-enroll speaker</button>

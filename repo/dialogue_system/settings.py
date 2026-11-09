@@ -65,12 +65,15 @@ DEFAULT_SETTINGS = {
     # unscoreable always pass (fail-open). Only active with pvad_mode
     # != off, so the default-off pvad path is untouched.
     "pvad_stream_gate": True,
-    # Speaker separation (task 2, 2026-11-06) — EXPERIMENTAL, default off.
-    # When on, the pvad stream gate additionally runs its scoring window
-    # through the MossFormer2_SS_16K sidecar (:8087, services/tse_server.py)
-    # and reports the separated-stream cos (pvad_status.sep_cos, shadow
-    # only — never changes any decision; see speaker_sep.py and
-    # docs/说话人分离验证报告-20261106.md for why it's shadow-only).
+    # Speaker separation (replaced 2026-11-10 with VoxLock, in-process):
+    # when on, the mic audio the TURN SERVER hears goes through a VoxLock
+    # target-speaker extractor that removes every voice but the caller's
+    # (pass-through until locked — auto-lock, or seeded from the pvad
+    # enrollment when the speaker gate is enrolled). Recording, the pvad
+    # ring/sidecar and barge-in evidence always see the original mic.
+    # The stream gate additionally reports the isolated-stream cos
+    # (pvad_status.sep_cos, shadow only — never changes any decision;
+    # see voxlock_isolate.py).
     "speaker_sep": False,
     # Fast/slow brain agent (delegate_task → background slow brain on
     # :6008, results delivered at the next quiet gap)
