@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SoulX 系统回顾与问题总结</title>
+<style>
+/* ============ 设计令牌（与 系统流图-20261106.html 同族，保持 docs/ 视觉一致） ============ */
+:root{
+  --bg:#f6f5f1; --surface:#ffffff; --surface2:#efede7;
+  --ink:#20242c; --muted:#5d6673; --line:#dcd8cf; --line2:#c2bcae;
+  --audio:#b45309; --flow:#1c5fd0; --ctrl:#067a55; --v2:#7434d3; --warn:#b4231f;
+  --code-bg:#eceae3;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14161b; --surface:#1e2128; --surface2:#181b20;
+    --ink:#e9e6df; --muted:#98a1af; --line:#333845; --line2:#4a5265;
+    --audio:#f0a848; --flow:#6fa5ff; --ctrl:#46d68a; --v2:#b497f5; --warn:#f0756f;
+    --code-bg:#181b20;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14161b; --surface:#1e2128; --surface2:#181b20;
+  --ink:#e9e6df; --muted:#98a1af; --line:#333845; --line2:#4a5265;
+  --audio:#f0a848; --flow:#6fa5ff; --ctrl:#46d68a; --v2:#b497f5; --warn:#f0756f;
+  --code-bg:#181b20;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink);
+  font:15px/1.75 -apple-system,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  padding:28px 24px 72px;
+}
+.wrap{max-width:1080px;margin:0 auto}
+header.masthead{border-bottom:2px solid var(--line2);padding-bottom:18px;margin-bottom:6px}
+.masthead h1{font-size:27px;margin:0 0 8px;letter-spacing:.5px}
+.masthead .sub{color:var(--muted);font-size:13.5px;line-height:1.7}
+.masthead .sub b{color:var(--ink);font-weight:600}
+h2{font-size:21px;margin:56px 0 8px;padding-top:14px;border-top:1px solid var(--line)}
+h2:first-of-type{margin-top:28px}
+h2 .no{color:var(--muted);font-weight:600;margin-right:10px;font-size:14px;letter-spacing:2px}
+h3{font-size:16.5px;margin:32px 0 6px}
+h4{font-size:15px;margin:24px 0 4px}
+p{margin:8px 0}
+.lead{font-size:15.5px}
+ul,ol{padding-left:1.6em;margin:8px 0}
+li{margin:4px 0}
+code,.mono{font-family:"SF Mono","JetBrains Mono",ui-monospace,Consolas,Menlo,monospace;font-size:.86em;
+  background:var(--code-bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+em{font-style:normal;color:var(--muted)}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px}
+th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top;line-height:1.6}
+th{background:var(--surface2);font-weight:600;white-space:nowrap}
+.toc{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 22px;margin:22px 0;columns:2;column-gap:36px}
+.toc a{color:var(--flow);text-decoration:none;display:block;padding:2px 0;font-size:14px;break-inside:avoid}
+.toc a:hover{text-decoration:underline}
+.toc .toc-title{column-span:all;font-weight:600;font-size:15px;margin-bottom:6px;color:var(--muted);letter-spacing:1px}
+.note{background:var(--surface);border-left:4px solid var(--v2);border-radius:0 8px 8px 0;padding:12px 16px;margin:16px 0;font-size:14px}
+.note.warn{border-left-color:var(--warn)}
+.note.good{border-left-color:var(--ctrl)}
+.note.flow{border-left-color:var(--flow)}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:14px 0}
+.kv .cell{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:13.5px}
+.kv .cell b{display:block;font-size:15px;margin-bottom:4px}
+.kv .cell .tag{font-size:12px;color:var(--muted);letter-spacing:.5px}
+/* ============ 阶段时间线 ============ */
+.stages{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:18px 0}
+.stage{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--flow);border-radius:8px;padding:14px 16px;font-size:13.5px}
+.stage.s0{border-top-color:var(--audio)}
+.stage.s1{border-top-color:var(--flow)}
+.stage.s2{border-top-color:var(--v2)}
+.stage.s3{border-top-color:var(--ctrl)}
+.stage .ph{font-size:12px;color:var(--muted);letter-spacing:1.5px}
+.stage b{display:block;font-size:15.5px;margin:2px 0 4px}
+.stage .win{font-size:12.5px;color:var(--muted);display:block;margin-bottom:6px}
+.stage ul{margin:0;padding-left:1.3em;font-size:13px;line-height:1.6}
+.stage li{margin:2px 0}
+/* ============ 问题→方案 卡片行 ============ */
+.fixflow{margin:10px 0 4px;padding-left:0;list-style:none}
+.fixflow li{margin:8px 0;padding-left:0;display:grid;grid-template-columns:minmax(150px,max-content) 26px 1fr;gap:0 6px;align-items:start}
+.fixflow .sym{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font-size:13px;line-height:1.55}
+.fixflow .sym .why{display:block;color:var(--muted);font-size:12.5px;margin-top:2px}
+.fixflow .arrow{color:var(--muted);text-align:center;padding-top:7px;font-weight:600}
+.fixflow .rx{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--ctrl);border-radius:0 6px 6px 0;padding:6px 10px;font-size:13px;line-height:1.55}
+@media (max-width:640px){
+  .fixflow li{grid-template-columns:1fr}
+  .fixflow .arrow{display:none}
+  .toc{columns:1}
+}
+.invariant{counter-reset:inv}
+.invariant li{list-style:none;position:relative;padding-left:34px;margin:7px 0}
+.invariant li::before{
+  counter-increment:inv;content:counter(inv,decimal-leading-zero);
+  position:absolute;left:0;top:2px;font-family:"SF Mono",ui-monospace,Consolas,monospace;
+  font-size:11.5px;color:var(--muted);border:1px solid var(--line2);border-radius:4px;padding:0 4px;
+}
+@media print{
+  body{background:#fff;padding:0}
+  .toc{columns:2}
+  h2{page-break-after:avoid}
+  table,.stage,.note{page-break-inside:avoid}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <h1>SoulX 系统回顾与问题总结</h1>
+  <div class="sub">
+    截至 <b>2026-11-09</b>（dev@<span class="mono">827c583</span>）。回顾系统从 2026-10-26 首次故障修复到当前"基本可用"的全部演进，
+    总结当前设计与技术选择、主要问题与解决方案思路，并给出当前与今后两个层次的改进方向。<br>
+    配套文档：<span class="mono">docs/系统流图-20261106.html</span>（当前架构全景）· <span class="mono">docs/修改日志.md</span>（每轮迭代的完整事故链与查法）。
+    同内容 Markdown 版：<span class="mono">docs/系统回顾与问题总结-20261109.md</span>。
+  </div>
+</header>
+
+<nav class="toc">
+  <div class="toc-title">目录</div>
+  <a href="#s1">一、系统一句话与演进时间线</a>
+  <a href="#s2">二、当前系统设计与技术选择</a>
+  <a href="#s3">三、主要问题与解决方案（按层归类）</a>
+  <a href="#s4">四、方法论沉淀</a>
+  <a href="#s5">五、当前残留风险</a>
+  <a href="#s6">六、改进方向（当前可做 / 以后尝试）</a>
+  <a href="#s7">附：排查速查表</a>
+</nav>
+
+<!-- ================================================================ 一 -->
+<h2 id="s1"><span class="no">§1</span>系统一句话与演进时间线</h2>
+
+<p class="lead"><b>一个 0.6B 流式语义轮次预测模型（SoulX-Duplug）挂在 Qwen3.5-9B 快慢脑三实例 + VoxCPM2 流式 TTS
+级联前端上，外加 pre-ASR 主说话人迟滞门控、五层话轮边界防御，以及 Agent Runtime 控制平面
+（快脑语义路由 + 五道守卫 · 双路并行 · SQLite 持久化任务协议 · 三态交付 + 单一出口 + 重播重入），
+构成全双工中文语音对话系统。</b></p>
+
+<p>十五天的演进可分四个阶段：</p>
+
+<div class="stages">
+  <div class="stage s0">
+    <span class="ph">阶段 0</span>
+    <b>基础设施</b>
+    <span class="win">10-26 ~ 10-29 · 服务能跑起来</span>
+    <ul>
+      <li>FireRedTTS SYNCH_LOCK 死锁</li>
+      <li>WS 断线重连</li>
+      <li>端口迁移 55556→8090</li>
+      <li>内网 https 非安全上下文</li>
+      <li>TTS 换 VoxCPM2（流式）</li>
+      <li>Web UI 两次重设计</li>
+    </ul>
+  </div>
+  <div class="stage s1">
+    <span class="ph">阶段 1</span>
+    <b>语音前端攻坚</b>
+    <span class="win">10-30 ~ 11-05 · 听感与时序正确</span>
+    <ul>
+      <li>主说话人门控（PVAD→ECAPA 迟滞）</li>
+      <li>音色漂移（锚定 + LoRA）</li>
+      <li>幻影打断三连根修</li>
+      <li>毛刺话轮五道门</li>
+      <li>能量守卫 / 回声防御 / 打断截断</li>
+      <li>双轨录音取证工具</li>
+    </ul>
+  </div>
+  <div class="stage s2">
+    <span class="ph">阶段 2</span>
+    <b>快慢脑 Agent</b>
+    <span class="win">10-30 ~ 11-05 · 任务委派可用</span>
+    <ul>
+      <li>快慢脑架构上线</li>
+      <li>委派语域吞句</li>
+      <li>霰弹枪工具调用（logits 级禁 token）</li>
+      <li>快脑调工具三定律</li>
+      <li>抢话宽限窗</li>
+    </ul>
+  </div>
+  <div class="stage s3">
+    <span class="ph">阶段 3</span>
+    <b>Agent Runtime V2</b>
+    <span class="win">11-06 ~ 11-09 · 协议化与实机化</span>
+    <ul>
+      <li>手册 P0–P5 实施</li>
+      <li>enforce 六事故</li>
+      <li>路由提速三件套</li>
+      <li>双路并行</li>
+      <li>晚五~晚十二十二轮根修</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ================================================================ 二 -->
+<h2 id="s2"><span class="no">§2</span>当前系统设计与技术选择</h2>
+
+<h3>2.1 分层架构</h3>
+<table>
+  <tr><th>层</th><th>组件</th><th>职责</th></tr>
+  <tr><td>接入层</td><td>浏览器（WebRTC AEC/NS/AGC）</td><td>回声消除与降噪；16 kHz mono 上行 WS；24 kHz PCM 分块下行</td></tr>
+  <tr><td>门控层</td><td>pvad 流门控 <span class="mono">:8086</span>（+ tse 影子 <span class="mono">:8087</span>，默认关）</td><td>pre-ASR 迟滞门控：非主说话人音频压制为全零块，不进 ASR / 轮次判别</td></tr>
+  <tr><td>轮次层</td><td>SoulX turn server <span class="mono">:8000</span>（GPU5）</td><td>0.6B 状态机逐 chunk 判 idle/nonidle/speak；五道毛刺门；流式转写 + commit 后整句重识别</td></tr>
+  <tr><td>应用层</td><td>Web app <span class="mono">:8090</span></td><td>会话管理、接收循环、话轮管线、宽限窗、能量守卫、回声防御、统一语音出口、双轨录音取证</td></tr>
+  <tr><td>Agent 层</td><td>Agent Runtime（进程内 <span class="mono">agent/</span>）</td><td>双路并行仲裁、路由 + 五道守卫、受控回执、SQLite 持久化、run 围栏调度、三态交付</td></tr>
+  <tr><td>模型层</td><td><span class="mono">:6009</span> 路由（GPU6，greedy 0）· <span class="mono">:6007</span> 闲聊/表达（GPU3，TEMP 0.9）· <span class="mono">:6008</span> 慢脑（GPU1）</td><td>同一 Qwen3.5-9B 三实例各司其职</td></tr>
+  <tr><td>语音层</td><td>VoxCPM2 <span class="mono">:8085</span>（GPU7）</td><td>文本分句流式合成；自训 LoRA + 锚定音色 + 服务端正则化</td></tr>
+</table>
+
+<h3>2.2 关键技术选择及理由</h3>
+<ol>
+  <li><b>级联而非端到端。</b>moshi 类端到端全双工模型当时不可控、不可取证——级联每一级可独立观测
+    （双轨录音、turn.log STATE 行、route_log），事故可定位到 chunk 级。代价是延迟与跨层时序竞态，见 §3。</li>
+  <li><b>0.6B 语义轮次模型做话轮边界</b>，而非纯 VAD / 纯静音阈值。语音前端全部时序参数
+    （turn_wait / grace / bargein）以它的状态机为第一公民。</li>
+  <li><b>双路并行（2026-11-06）。</b>路由脑出计划要 3.5–4.3 s，用户等不起——闲聊路过 grace 门就开始口播
+    （应承 / 寒暄 / 按面板答），路由路后台做任务机器。仲裁规则保证永不双声道。这是全部"提速"与"吞句"根修的来源。</li>
+  <li><b>SQLite 作为唯一交接面。</b>请求 / 任务 / 事件 / 交付 / outbox 全部落库，operation_id 幂等、
+    run lease 围栏、事件只放已发生的事实。崩溃可恢复，离线可重放（全部离线回归测试就建在它上面）。</li>
+  <li><b>结果播报单一出口（交付泵）。</b>闲聊路上下文永不注入结果原文（渐进式披露：只见状态摘要 +
+    用户实际听到部分），"再讲一遍"只能由泵兑现。代播记账（窄版 voiced-by-lane）只处理
+    "创建轮闲聊路已亲口说过 + 零工具自产内容"这一种。</li>
+  <li><b>守卫而非 prompt 补丁。</b>路由层五道守卫（格式 / 接地 / 吞句 / 取消目标 / get_task 目标）+
+    修复轮 ≤1。温度 0 下 few-shot 先验与硬规则的张力靠守卫在出口兜底——先验改不动，守卫清单随事故生长。</li>
+  <li><b>负结果也落库。</b>声源分离（MossFormer2 拉不开 ECAPA 分数带）验证为负结果后仅影子集成上报
+    sep_cos，不参与决策；PVAD 背景视频失效调查记录了分数带完全重叠的定量事实。</li>
+</ol>
+
+<h3>2.3 设计不变量（从事故中提炼，详见流图 §13）</h3>
+<ul class="invariant">
+  <li>语音前端第一公民——全部时序参数以其状态机为基准，上层适配它，不让它迁就上层。</li>
+  <li>结构不合法绝不能执行——路由计划整批提交或整批丢弃，没有"部分执行"。</li>
+  <li>幂等——operation_id 重放去重，同一操作重复提交不产生双重效果。</li>
+  <li>引用封闭——quote 必须是本轮用户原话的子串，锚不到就不锚。</li>
+  <li>传输故障 = 终态，没有修复资格。</li>
+  <li>事件只放已发生的事实——计划是意图，不进事件库。</li>
+  <li>一个会话一次只有一个声音——发言 owner 按 session 串行。</li>
+  <li>开口前核验信封（SpeechEnvelope）——改口 / 取消 / 旧修订的结果不播。</li>
+  <li>speak_fn 三态（True / False / None）与语音前端逐条对齐。</li>
+  <li>吸收轮也要释放 gen——任何早退路径走 finally。</li>
+  <li>取消不是失败——被取代话轮静默退场，绝不说"任务执行失败"。</li>
+  <li><b>面板不吊人</b>——suppressed / interrupted / voiced_by_lane 都不渲染"结果待播报"式的永不兑现承诺；
+    闲聊路拿死承诺会无限复读。</li>
+</ul>
+
+<!-- ================================================================ 三 -->
+<h2 id="s3"><span class="no">§3</span>主要问题与解决方案（按层归类）</h2>
+
+<h3>3.1 服务可用性（阶段 0）</h3>
+<ul class="fixflow">
+  <li><div class="sym">几轮后整体沉默<span class="why">FireRedTTS SYNCH_LOCK 锁横跨 yield，全服务锁死</span></div><div class="arrow">→</div>
+      <div class="rx">根修锁作用域；排查口诀"服务沉默先 curl <span class="mono">:8081/health</span>"</div></li>
+  <li><div class="sym">几轮后不再转写<span class="why">浏览器 WS 掉线后前端无重连</span></div><div class="arrow">→</div>
+      <div class="rx">前端重连 + 常驻重连按钮（后又修过一次缓存击穿）</div></li>
+  <li><div class="sym">内网麦克风报错<span class="why">非安全上下文</span></div><div class="arrow">→</div>
+      <div class="rx">放弃自签 https，改浏览器 flag 方案</div></li>
+  <li><div class="sym">TTS 延迟 / 音色<span class="why">FireRedTTS 非流式</span></div><div class="arrow">→</div>
+      <div class="rx">换 VoxCPM2 流式分句合成（后续为此修了一整族问题，见 3.4）</div></li>
+</ul>
+<div class="note flow"><b>思路</b>：可用性问题先建可观测（健康检查、/logs.html、/sessions.html 时间线 + 双轨录音），
+再谈修复——后面所有时序类根修都依赖这套取证基建。</div>
+
+<h3>3.2 语音前端时序（阶段 1，密度最高）</h3>
+<ul class="fixflow">
+  <li><div class="sym">安静环境"幻听"（凭空转写出话）<span class="why">呼吸 / 轻笑进状态机</span></div><div class="arrow">→</div>
+      <div class="rx">turn server 侧五道结构性毛刺门（预 latch 概率 / RMS 门 / 无文本降级武装 wait / 空 commit 守卫 / 种子裁剪）；文本旁路 latch 移除</div></li>
+  <li><div class="sym">播放期幻影打断（自己打断自己）<span class="why">回声进转写 + 判别</span></div><div class="arrow">→</div>
+      <div class="rx">三层回声防御（滑窗 / 假 turn 丢弃 / 自说自话过滤：回声物理窗口 + 形态两门）</div></li>
+  <li><div class="sym">生成期幻影打断（首句被吞成"是。"）<span class="why">假 turn 被当成打断</span></div><div class="arrow">→</div>
+      <div class="rx">生成器生命周期与假 turn 判定解耦</div></li>
+  <li><div class="sym">抢话（用户刚停就抢答）<span class="why">complete 触发即开口</span></div><div class="arrow">→</div>
+      <div class="rx">宽限窗（grace）+ wait 提交必先经 incomplete + complete 高能量挂起（RMS≥0.06）+ wait 计数 RMS 否决</div></li>
+  <li><div class="sym">打断后音频尾巴没切干净<span class="why">run 戳在首写晚于 first_emit，epoch 比较是死代码</span></div><div class="arrow">→</div>
+      <div class="rx">run 身份制：run_break(since) 记 first_emit + cut_pending_audio 铺五咽喉点</div></li>
+  <li><div class="sym">"你说 / 你是"类 partial 闪现<span class="why">partial 同音瞬态</span></div><div class="arrow">→</div>
+      <div class="rx">前端前缀确认稳定性门</div></li>
+  <li><div class="sym">打断交付"已听到部分"丢失<span class="why">结果 note 已进历史但音频被切</span></div><div class="arrow">→</div>
+      <div class="rx">delivery_heard 回写 + 闲聊路渐进式披露（≤120 字）</div></li>
+</ul>
+<div class="note flow"><b>思路</b>：所有时序 bug 的修法收敛为一个模式——<b>给每个异步参与者一个可验证的身份 / 时间戳
+（run 身份、播放时钟锚定、线程标识防串门），把"猜时序"变成"对账"</b>。取证靠双轨录音回放
+（TTS 旁路 run 索引锚播放时钟，RTF≈0.36）与 turn.log STATE/TURN 常开行。</div>
+
+<h3>3.3 声学门控：谁在说话（阶段 1，两个负结果）</h3>
+<ul class="fixflow">
+  <li><div class="sym">旁人 / 背景视频也会触发对话<span class="why">浏览器同人 ECAPA 分 0.15–0.57 &lt; 阈值 0.5，区分不了</span></div><div class="arrow">→</div>
+      <div class="rx">默认直连不门控，代码保留</div></li>
+  <li><div class="sym">背景视频话轮漏入<span class="why">分离带与主说话人分数带完全重叠，无阈值可切；参考漂移（混音轮污染 enroll）</span></div><div class="arrow">→</div>
+      <div class="rx">pre-ASR 独立通道迟滞门控（用户语音 0% 误压 / 视频 95% 压制）；声源分离立项验证后<b>主动止损</b>，仅影子集成</div></li>
+  <li><div class="sym">MossFormer2 分离<span class="why">说话人内方差 &gt; 说话人间差，拉不开 ECAPA 分数带</span></div><div class="arrow">→</div>
+      <div class="rx">负结果记录在案，不参与决策</div></li>
+</ul>
+<div class="note flow"><b>思路</b>：门控问题先做<b>分数带定量分析</b>再谈阈值；分数带重叠就承认现有信号不够，
+宁可负结果止损也不上误杀用户的门。</div>
+
+<h3>3.4 TTS 质量（阶段 1~2）</h3>
+<ul class="fixflow">
+  <li><div class="sym">跨段音色漂移<span class="why">无锚定参考</span></div><div class="arrow">→</div>
+      <div class="rx">参考克隆锚定 + 自训 LoRA</div></li>
+  <li><div class="sym">数数音色崩<span class="why">LoRA checkpoint 枚举不稳</span></div><div class="arrow">→</div>
+      <div class="rx">A/B 定量协议定位到 step_0000400，回退 500；换 checkpoint 须 anchor 一致</div></li>
+  <li><div class="sym">小数被切碎<span class="why">文本正则化缺陷</span></div><div class="arrow">→</div>
+      <div class="rx">服务端正则化修复</div></li>
+  <li><div class="sym">TTS 念出 "assistant"<span class="why">标签泄漏进合成</span></div><div class="arrow">→</div>
+      <div class="rx">文本清洗</div></li>
+</ul>
+<div class="note flow"><b>思路</b>：音色问题必须 <b>A/B 定量</b>（同 seed 同 anchor 对比），不接受"听着好像好点了"；
+换权重 / 参数必须留回退路径。</div>
+
+<h3>3.5 Agent 语义层（阶段 2~3，当前主战场）</h3>
+<p>这是最重的一族，十二轮"晚 N"根修全部在这里。按问题模式分四类：</p>
+
+<h4>(a) 路由判错 — 该建任务的不建 / 不该建的建了</h4>
+<ul class="fixflow">
+  <li><div class="sym">委派语域吞句<span class="why">讲笑话 / 数数被推迟到任务</span></div><div class="arrow">→</div>
+      <div class="rx">快脑 addon 硬规则 + auto_delegate 兜底；后又发现尾部注入 note 反而压低触发率（模型口头确认即停笔），移除</div></li>
+  <li><div class="sym">讲笑话建成任务<span class="why">路由吃共享 LLM 历史最近 6 条（含 assistant 应承 + 结果 note 全文），任务形先验压过硬规则</span></div><div class="arrow">→</div>
+      <div class="rx"><b>路由 user 侧历史瘦身</b>：只留 role=="user" 且非系统提示前缀</div></li>
+  <li><div class="sym">错取消（"重新数到十"错杀 T2 毒化 T3）</div><div class="arrow">→</div>
+      <div class="rx">取消目标接地守卫（label 二元组命中或纯取消话，否则修复 + 终态拒）</div></li>
+  <li><div class="sym">错锚定（"你刚刚数到几了"被 get_task 锚到 interrupted 任务）</div><div class="arrow">→</div>
+      <div class="rx">get_task 目标接地守卫 + interrupted 补全（本轮清账）</div></li>
+</ul>
+<p><b>共性根因</b>：温度 0 贪心解码下，few-shot 先验与硬规则的张力。<b>共性修法</b>：出口守卫（结构化、可测试），不做 prompt 场景补丁。</p>
+
+<h4>(b) 交付时序 — 结果什么时候说、谁说、说几遍</h4>
+<ul class="fixflow">
+  <li><div class="sym">湖人幻觉 + 循环播报<span class="why">闲聊路拿不到事实却被迫播结果</span></div><div class="arrow">→</div>
+      <div class="rx"><b>单一出口</b>：结果播报收归交付泵，闲聊路只说桥接短语</div></li>
+  <li><div class="sym">复读（"我去查一下"×4）<span class="why">路由延迟 &gt; 用户开口间隔，请求永远 registered</span></div><div class="arrow">→</div>
+      <div class="rx">长间隔落地 land_pending + 8s 续说合并窗口 + 在途路由有界等待 ≤5s</div></li>
+  <li><div class="sym">重复交付崩溃循环<span class="why">交付行终态后重复 deliver 项再渲染</span></div><div class="arrow">→</div>
+      <div class="rx">_DLV_ALREADY_HANDLED 直接收尾 + record_delivery 身份去重</div></li>
+  <li><div class="sym">短应答掐死播报（"嗯，好的"杀掉 NBA 播报）</div><div class="arrow">→</div>
+      <div class="rx"><b>hold 语义</b>：播报期间 held 话轮不 cut/interrupt/reset，真上口由 _speak 自己替换</div></li>
+  <li><div class="sym">笑话挂"待播报" 1 分 54 秒<span class="why">创建轮闲聊路已讲过，任务零工具结果仍排队等泵</span></div><div class="arrow">→</div>
+      <div class="rx"><b>窄版 voiced-by-lane</b>：创建轮已亲口说过 + 零工具自产 + 首 run → 泵不入队（判别器是零工具——查询类必带工具照走泵；数据源是 slow_brain 的 tool_call 事件，因为 tool_calls 表是无写入方的预留 schema）</div></li>
+</ul>
+<p><b>共性根因</b>：双路并行后"谁有资格说话"不再自明。<b>共性修法</b>：单一出口 + 开口前核验信封 + 面板不吊人。</p>
+
+<h4>(c) 生命周期泄漏 — 资源 / 请求 / 任务悬空</h4>
+<ul class="fixflow">
+  <li><div class="sym">纯应答吸收泄漏 gen 标志<span class="why">14.5s 无声事故</span></div><div class="arrow">→</div>
+      <div class="rx">所有早退路径走 finally</div></li>
+  <li><div class="sym">空流误报成功<span class="why">投递根本没发生却报 True</span></div><div class="arrow">→</div>
+      <div class="rx">三态返回（True / False / None：没听过谈不上拒绝）</div></li>
+  <li><div class="sym">取消竞态<span class="why">取消落在"结果正在播"窗口里，整段听完已取消内容</span></div><div class="arrow">→</div>
+      <div class="rx">同态幂等 + 取消掐在途播音（stop_speaking_for_task 跨线程置 stop_event）</div></li>
+  <li><div class="sym">查询蒸发<span class="why">路由结果被新话轮作废，查询从未发起</span></div><div class="arrow">→</div>
+      <div class="rx">land_wait_prev + stale 复查 + user_stop 伴生断流</div></li>
+</ul>
+
+<h4>(d) 快脑工具行为</h4>
+<ul class="fixflow">
+  <li><div class="sym">霰弹枪工具调用（83s / 30 调用 + 幻觉结果作答）<span class="why">解码飘出对话标签</span></div><div class="arrow">→</div>
+      <div class="rx">logits 级禁 <span class="mono">&lt;|im_start|&gt;</span> token 根修</div></li>
+  <li><div class="sym">搜索慢</div><div class="arrow">→</div>
+      <div class="rx">DDG 回落 + Tavily + 工具轮数上限 3</div></li>
+</ul>
+
+<h3>3.6 工程纪律（人的因素）</h3>
+<ul>
+  <li>重启 web 必须内联两个 env（丢了 <span class="mono">AGENT_CONTROL_ENDPOINT</span> 会静默回退 :6007 还能跑但不提速；
+    丢了 MODE 会被前端回推翻回 legacy）——已把模式钉死（env 恒优先 + settingsSyncedByAck 拦截）。</li>
+  <li>测试脚本不得污染持久化设置（persist:true 才落盘）。</li>
+  <li>仓库统一（内层仓 subtree 并入外层，单一仓库）。</li>
+  <li>重启 turn server 必须内联 <span class="mono">CUDA_VISIBLE_DEVICES=5</span>（裸启落 GPU 0）。</li>
+</ul>
+
+<!-- ================================================================ 四 -->
+<h2 id="s4"><span class="no">§4</span>方法论沉淀（怎么修出来的）</h2>
+<div class="kv">
+  <div class="cell"><b>取证先行</b><span class="tag">每轮事故</span>
+    先纯取证（sqlite 事件库 + 双轨录音 + turn.log/web.log 锚点行 + headless 浏览器重放），
+    向用户交付根因链并讨论修法后才动手。复盘文档全部落 docs/。</div>
+  <div class="cell"><b>泛化优先</b><span class="tag">长期约束</span>
+    拒绝 task-specific few-shot 补丁，事故先找守卫 / 状态机 / 渲染收敛修法；产品取舍留用户。</div>
+  <div class="cell"><b>离线回归先行</b><span class="tag">修完即测</span>
+    九套件 + 语音回放四件（selftalk / empty_stream / smoke / pvad_stream）+ 前端假 WS 重放；
+    事故修完先补回归再部署。AST 抽取真函数源码执行保证测试打的是真代码。</div>
+  <div class="cell"><b>A/B 定量</b><span class="tag">音色 / 温度 / checkpoint</span>
+    同条件对比，不接受"听着好像好点了"；"数数音色崩""温度事实"都是 A/B 或查证纠正的。</div>
+  <div class="cell"><b>保守方向失败</b><span class="tag">判别信号不干净时</span>
+    宁可放行也不误杀（空 run_id 判 False 走泵；门控分数带重叠就不上门控）。</div>
+  <div class="cell"><b>承认负结果</b><span class="tag">声源分离 / 背景视频 / 尾部注入</span>
+    验证为有害 / 无效就下线，记录在案，不为沉没成本续命。</div>
+</div>
+
+<!-- ================================================================ 五 -->
+<h2 id="s5"><span class="no">§5</span>当前残留风险（已知未修）</h2>
+<ol>
+  <li><b>交付泵单线程</b>：speak_fn 占住期间，排队路径的 stop_speech 要等本轮播完
+    （跨线程 stop_speaking_for_task 已接，队列路径仍串行）。</li>
+  <li><b>GPU6 / GPU3 是公共卡</b>：邻居回驻则路由延迟回升（历史上发生过一次，挪卡解决）。</li>
+  <li><b>路由先验张力</b>：温度 0 下 few-shot 先验与硬规则的张力仍靠守卫在出口兜底——
+    守卫清单随事故生长，每类新错法都要再补一道（本次三修就是补了错锚定与代播记账两道）。</li>
+  <li><b>门控层默认直连</b>：旁人语音与用户语音在浏览器 AEC 后不可区分，多人场景不可用。</li>
+  <li><b>工具调用延迟仍偶发</b>：霰弹枪虽根修，慢脑单轮 gen≈max_tokens÷25 tok/s。</li>
+</ol>
+
+<!-- ================================================================ 六 -->
+<h2 id="s6"><span class="no">§6</span>改进方向</h2>
+
+<h3>6.1 当前可做（工程项）</h3>
+<ul>
+  <li><b>路由提速的下一步</b>：3.5–4.3 s 仍是体验瓶颈。候选：快照渲染缓存与增量更新
+    （历史瘦身后 user 侧历史可预拼）、few-shot 再裁剪、或蒸馏 / 换更小的路由专用模型
+    （路由是分类问题，不需要 9B 的生成能力上限）。</li>
+  <li><b>交付泵优先级队列</b>：按话轮状态（用户在说 → 暂缓；静默期 → 立即）调度排队的 deliver 项，
+    消除残留风险 1。</li>
+  <li><b>守卫覆盖率统计</b>：route_log 已有全部修复 / 拒绝原因——做一张守卫触发率面板，
+    先验张力（残留风险 3）从"随事故生长"变成"有数据指导什么时候该上微调"。</li>
+  <li><b>GPU 专用化</b>：把 :6009 / :6007 挪到独占卡（或向集群申请），消除邻居回驻的延迟回升。</li>
+  <li><b>会话健康看板</b>：把排查速查表（症状 → 先看什么）做成 /sessions.html 的自动诊断列
+    （requests registered 堆积、gen 卡 True、delivery 终态分布），实测时先看面板再 grep。</li>
+</ul>
+
+<h3>6.2 以后可进一步尝试（研究项）</h3>
+<ul>
+  <li><b>带参考的目标说话人提取（target-speaker extraction）</b>：声源分离负结果的正确续集——
+    不做无参考分离，用用户 enroll 声纹做引导，或从声学模型中间层取特征替代 ECAPA 分数。
+    做成可 A/B 的独立立项（当前影子集成 sep_cos 的管道可以直接复用）。</li>
+  <li><b>端到端全双工模型对照</b>：工作区的 eot / FDB 基建（moshiko / PersonaPlex、FDB v1.0 评测）
+    可以给 SoulX 的级联前端做对照打分——量化"级联 vs 端到端"在打断延迟 / 回声鲁棒性上的真实差距，
+    为下一代架构决策提供数据。</li>
+  <li><b>路由器微调</b>：当守卫触发率数据证明先验张力是主要误差源后，用 route_log 里
+    "守卫修复前后"的计划对做 SFT 数据（守卫已给出正确标签），把规则内化进路由模型。</li>
+  <li><b>话轮模型与 Agent 协议的联合训练</b>：SoulX-Duplug 目前只看声学 / 转写，不看任务状态；
+    delivery hold 语义是外部补丁——长期可以让轮次预测吃任务面板状态（输入是结构化状态而非文本注入）。</li>
+  <li><b>长记忆与个性化</b>：SQLite 事件库已经把全部会话结构化，为跨会话记忆
+    （用户偏好 / 未完结任务的隔日追问）提供了现成底座。</li>
+  <li><b>多人场景</b>：依赖第一项（带参考的说话人提取）打通"谁在说话"，之后才是多说话人轮次仲裁。</li>
+</ul>
+
+<!-- ================================================================ 附 -->
+<h2 id="s7"><span class="no">附</span>排查速查（症状 → 先看什么）</h2>
+<table>
+  <tr><th>症状</th><th>先看什么</th></tr>
+  <tr><td>任务没发起 / V2 像没跑</td><td>web 窗口有无 <span class="mono">[v2] route ok</span>；requests 表 registered 堆积 = 路由被反复作废</td></tr>
+  <tr><td>路由慢</td><td>grep soulx:11 窗口 <span class="mono">gen:</span> 三行——queue_wait 是排队（邻居抢卡 / GEN_LOCK），gen_s 是生成本身</td></tr>
+  <tr><td>整轮无声</td><td>route_log 的 plan_json（receipts 且零回执？）；gen 卡 True + 静止期 <span class="mono">in-flight blip dropped</span></td></tr>
+  <tr><td>结果没播 / 重复播</td><td>events 表 delivery_suppressed / delivery_heard 时间 vs deliveries 行状态；grep <span class="mono">illegal delivery</span></td></tr>
+  <tr><td>短应答掐死播报</td><td>grep <span class="mono">turn held during result delivery</span>（hold 生效）/ <span class="mono">delivery barge-in confirmed</span>（真打断）</td></tr>
+  <tr><td>代播抑制是否生效</td><td>grep web.log <span class="mono">result voiced by lane</span></td></tr>
+  <tr><td>错取消 / 错锚定</td><td>grep route_log <span class="mono">cancel target not referenced</span> / <span class="mono">get_task target not referenced</span></td></tr>
+  <tr><td>服务沉默</td><td>curl <span class="mono">:8081/health</span>（TTS）→ 各端口健康检查</td></tr>
+</table>
+
+<p style="margin-top:40px;color:var(--muted);font-size:12.5px;border-top:1px dashed var(--line);padding-top:12px">
+SoulX · 系统回顾与问题总结 · 2026-11-09 · dev@827c583 · 与 <span class="mono">系统流图-20261106.html</span> / <span class="mono">修改日志.md</span> 配套阅读
+</p>
+
+</div>
+</body>
+</html>
