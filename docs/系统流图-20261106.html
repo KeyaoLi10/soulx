@@ -118,10 +118,10 @@ td s{color:var(--muted)}
 <header class="masthead">
   <h1>SoulX 全双工语音对话系统 · 全链路流图</h1>
   <div class="sub">
-    截至 <b>2026-11-06（修订 v2）</b> · 分支 <b>dev</b>（<span class="mono">d16f313</span>，含 Agent Runtime 实机部署与三起实测事故修复）·
+    截至 <b>2026-11-09（修订 v3）</b> · 分支 <b>dev</b>（<span class="mono">34cb8f4</span>，含双路并行 / 路由提速 / 单一交付出口 / 渐进式披露等 19 轮实机迭代）·
     范围：<b>主线语音路径 + 新版 Agent Runtime</b>（可替换的轮次引擎备选路径不在本文范围）<br>
     本文覆盖：上行音频链路（含 pvad 流门控 / 影子分离）→ 轮次判别与五层防御 → 话轮管线与统一语音出口 →
-    <b>Agent Runtime 控制平面</b>（全景 / 时序 / 路由守卫 / 任务与交付状态机 / 持久层）→ 服务矩阵与关键参数。
+    <b>Agent Runtime 控制平面</b>（双路并行仲裁 / 全景 / 时序 / 五道守卫 / 任务与交付状态机 / 持久层）→ 服务矩阵与关键参数。
     单文件、零外部资源，可直接离线打开或打印。
   </div>
 </header>
@@ -133,15 +133,16 @@ td s{color:var(--muted)}
   <a href="#s2">2 · 上行链路：麦克风 → 轮次提交</a>
   <a href="#s3">3 · 话轮边界五层防御级联</a>
   <a href="#s4">4 · 话轮管线与统一语音出口（生成 → 播放）</a>
-  <a href="#s5">5 · Agent Runtime：控制平面全景</a>
-  <a href="#s6">6 · 一次话轮的完整时序（接管 → 路由 → 回执 → 交付）</a>
-  <a href="#s7">7 · 路由器与三道守卫 + 回执话术模板</a>
-  <a href="#s8">8 · 任务与交付生命周期（状态机 + 重播重入）</a>
-  <a href="#s9">9 · 模块树与 SQLite 持久层</a>
-  <a href="#s10">10 · 服务矩阵与部署</a>
-  <a href="#s11">11 · 关键参数速查</a>
-  <a href="#s12">12 · 设计不变量</a>
-  <a href="#s13">13 · 验证状态与实测记录</a>
+  <a href="#s5">5 · 双路并行：闲聊路与路由路的仲裁</a>
+  <a href="#s6">6 · Agent Runtime：控制平面全景</a>
+  <a href="#s7">7 · 一次话轮的完整时序（接管 → 双路 → 回执 → 交付）</a>
+  <a href="#s8">8 · 路由器与五道守卫 + 回执话术模板</a>
+  <a href="#s9">9 · 任务与交付生命周期（状态机 + 重播重入 + 抑制）</a>
+  <a href="#s10">10 · 模块树与 SQLite 持久层</a>
+  <a href="#s11">11 · 服务矩阵与部署</a>
+  <a href="#s12">12 · 关键参数速查</a>
+  <a href="#s13">13 · 设计不变量</a>
+  <a href="#s14">14 · 验证状态与实测记录</a>
 </nav>
 
 <div class="legend">
@@ -158,7 +159,8 @@ td s{color:var(--muted)}
 <p class="lead">
 一个 <b>0.6B 流式语义轮次预测模型</b>（SoulX-Duplug）挂在 <b>Qwen3.5-9B 快慢脑双实例 + VoxCPM2 流式 TTS</b> 级联前端上，
 外加 <b>pre-ASR 主说话人迟滞门控</b>（pvad 流门控 + 影子声源分离）、<b>五层话轮边界防御</b>，
-以及 <b>Agent Runtime 控制平面</b>（快脑语义路由 + 三道守卫 · SQLite 持久化任务协议 · run 围栏调度 · 三态交付 + 重播重入），
+以及 <b>Agent Runtime 控制平面</b>（快脑语义路由 + 五道守卫 · 双路并行：闲聊路口播 / 路由路任务 · SQLite 持久化任务协议 ·
+run 围栏调度 · 三态交付 + 单一出口 + 重播重入），
 构成全双工中文语音对话系统。
 </p>
 <table>
@@ -168,8 +170,8 @@ td s{color:var(--muted)}
 <tr><td>门控层</td><td>tse 影子分离（:8087，可选）</td><td>MossFormer2 分离 + 逐窗挑流，仅影子上报 <code>sep_cos</code>，不参与任何决策（负结果保留）</td></tr>
 <tr><td>轮次层</td><td>SoulX turn server <code>:8000</code>（GPU5）</td><td>0.6B 状态机逐 chunk 判 idle/nonidle/speak；五道毛刺门；流式 paraformer 转写 + commit 后整句重识别（turn_final）</td></tr>
 <tr><td>应用层</td><td>Web app <code>:8090</code>（FastAPI + WS）</td><td>会话管理、接收循环、话轮管线、宽限窗、能量守卫、回声防御、统一语音出口、双轨录音取证</td></tr>
-<tr><td>Agent 层</td><td>Agent Runtime（进程内，<code>agent/</code>）</td><td>控制平面：快脑路由 + 三道守卫、受控回执模板、SQLite 持久化、run 围栏调度、三态交付 + 重播重入、任务面板 UI 泵</td></tr>
-<tr><td>模型层</td><td>快脑 <code>:6007</code>（GPU6）/ 慢脑 <code>:6008</code>（GPU1）</td><td>同一 Qwen3.5-9B 双实例：路由与表达轮（/chat · /agent_chat_v2）/ 后台任务工具循环（make_v2_runner）</td></tr>
+<tr><td>Agent 层</td><td>Agent Runtime（进程内，<code>agent/</code>）</td><td>控制平面：双路并行仲裁（闲聊路口播 / 路由路任务）、快脑路由 + 五道守卫、受控回执模板、SQLite 持久化、run 围栏调度、三态交付 + 单一出口 + 重播重入、任务面板 UI 泵</td></tr>
+<tr><td>模型层</td><td>闲聊/表达脑 <code>:6007</code>（GPU3）· 路由脑 <code>:6009</code>（GPU6）· 慢脑 <code>:6008</code>（GPU1）</td><td>同一 Qwen3.5-9B 三实例：闲聊路与表达轮（/chat 流式 · TEMP 0.9）/ 路由（/agent_chat_v2 NDJSON · greedy 0）/ 后台任务工具循环（make_v2_runner）</td></tr>
 <tr><td>语音层</td><td>VoxCPM2 <code>:8085</code>（GPU7）</td><td>文本分句流式合成；自训 LoRA + 锚定音色 + 服务端文本正则化</td></tr>
 </table>
 
@@ -178,8 +180,9 @@ td s{color:var(--muted)}
 <p>
 下图是整个系统的一次完整环流：<b>上行</b>（琥珀色）从麦克风经 WebRTC 处理、WS 二进制帧进入 web app 接收循环，
 旁路喂 pvad 打分 / tse 影子分离，过流门控后进 turn server 状态机；<b>轮次提交</b>（绿色）携带整句转写回到话轮管线；
-<b>生成</b>（蓝色）在快脑流式分段，经统一语音出口送 TTS 合成、<b>下行</b>回浏览器；
-<b>Agent Runtime 控制面</b>（紫色）承接每一句话轮：路由 → 操作落库 → 回执上口 → 慢脑执行 → 空闲交付，全部复用同一条语音出口。
+<b>生成</b>（蓝色）在闲聊/表达脑流式分段，经统一语音出口送 TTS 合成、<b>下行</b>回浏览器；
+<b>Agent Runtime 控制面</b>（紫色）承接每一句话轮时<b>同开两路</b>：闲聊路过 grace 门即生成口播（本轮应承 / 寒暄 / 反问），
+路由路在后台出任务计划 → 操作落库 → 回执仲裁 → 慢脑执行；结果播报只走交付泵<b>单一出口</b>，全部复用同一条语音出口。
 </p>
 
 <figure>
@@ -228,12 +231,12 @@ td s{color:var(--muted)}
   <!-- F Agent Runtime -->
   <rect class="bx-v2" x="320" y="610" width="180" height="150" rx="7"/>
   <text class="bt" x="332" y="632" fill="var(--v2)">Agent Runtime</text>
-  <text class="bs" x="332" y="652">Adapter + RuntimeV2</text>
-  <text class="bs" x="332" y="669">· 路由 · grace 提交门</text>
-  <text class="bs" x="332" y="686">· 模板回执 · 表达轮 · 澄清</text>
-  <text class="bs" x="332" y="703">· 调度 · 三态交付 · outbox</text>
-  <text class="bs" x="332" y="720">· UI 泵 → task_update 面板</text>
-  <text class="bs" x="332" y="737">· SQLite 持久化（§9 图 10）</text>
+  <text class="bs" x="332" y="652">Adapter 双路仲裁</text>
+  <text class="bs" x="332" y="669">· 闲聊路 ∥ 路由路（§5）</text>
+  <text class="bs" x="332" y="686">· 应答吸收 · 续说合并 / land</text>
+  <text class="bs" x="332" y="703">· 模板回执（静音仲裁）</text>
+  <text class="bs" x="332" y="720">· 调度 · 单一出口交付</text>
+  <text class="bs" x="332" y="737">· UI 泵 → task_update</text>
 
   <!-- C 语音出口 -->
   <rect class="bx" x="520" y="610" width="170" height="150" rx="7"/>
@@ -270,21 +273,28 @@ td s{color:var(--muted)}
   <text class="bt2" x="1042" y="344">tse :8087（影子）</text>
   <text class="bs" x="1042" y="360">MossFormer2 分离</text>
 
-  <!-- 快脑 / 慢脑 -->
-  <rect class="bx" x="790" y="414" width="200" height="150" rx="7"/>
-  <text class="bt" x="802" y="436">快脑 :6007 · GPU6</text>
-  <text class="bs" x="802" y="456">Qwen3.5-9B · thinking off</text>
-  <text class="bs" x="802" y="472">· /chat 人设流式（表达轮）</text>
-  <text class="bs" x="802" y="488">· /agent_chat_v2 路由 NDJSON</text>
-  <text class="bs" x="802" y="504">· GEN_LOCK 串行化生成</text>
-  <text class="bs" x="802" y="520">· route_turn 单工具调用</text>
-  <rect class="bx" x="1030" y="414" width="150" height="150" rx="7"/>
-  <text class="bt" x="1042" y="436">慢脑 :6008 · GPU1</text>
-  <text class="bs" x="1042" y="456">Qwen3.5-9B 第二实例</text>
-  <text class="bs" x="1042" y="472">· make_v2_runner</text>
-  <text class="bs" x="1042" y="488">· web_search · fetch_page</text>
-  <text class="bs" x="1042" y="504">· get_datetime · calculate</text>
-  <text class="bs" x="1042" y="520">· 事件信封 · MAX_STEPS=4</text>
+  <!-- 闲聊/表达脑 / 路由脑 / 慢脑（三实例） -->
+  <rect class="bx" x="760" y="414" width="150" height="150" rx="7"/>
+  <text class="bt2" x="772" y="436">闲聊/表达脑 :6007</text>
+  <text class="bs" x="772" y="456">GPU3 · TEMP 0.9</text>
+  <text class="bs" x="772" y="474">· /chat 人设流式</text>
+  <text class="bs" x="772" y="492">　（闲聊路 + 表达轮）</text>
+  <text class="bs" x="772" y="510">· GEN_LOCK 串行化</text>
+  <text class="bs" x="772" y="528">· 面板渐进式披露注入</text>
+  <rect class="bx" x="925" y="414" width="125" height="150" rx="7"/>
+  <text class="bt2" x="937" y="436">路由脑 :6009</text>
+  <text class="bs" x="937" y="456">GPU6 · greedy 0</text>
+  <text class="bs" x="937" y="474">· /agent_chat_v2</text>
+  <text class="bs" x="937" y="492">　NDJSON 路由</text>
+  <text class="bs" x="937" y="510">· route_turn 单工具</text>
+  <text class="bs" x="937" y="528">· 8 few-shot</text>
+  <rect class="bx" x="1065" y="414" width="115" height="150" rx="7"/>
+  <text class="bt2" x="1077" y="436">慢脑 :6008</text>
+  <text class="bs" x="1077" y="456">GPU1</text>
+  <text class="bs" x="1077" y="474">· make_v2_runner</text>
+  <text class="bs" x="1077" y="492">· web_search 等</text>
+  <text class="bs" x="1077" y="510">· sports_games</text>
+  <text class="bs" x="1077" y="528">· MAX_STEPS=4</text>
 
   <!-- TTS -->
   <rect class="bx" x="790" y="610" width="200" height="76" rx="7"/>
@@ -293,10 +303,11 @@ td s{color:var(--muted)}
   <text class="bs" x="802" y="669">流式合成 · 首块 ~80 ms（RTF≈0.32）</text>
 
   <!-- 互联网 -->
-  <rect class="bx" x="1030" y="790" width="150" height="64" rx="7"/>
+  <rect class="bx" x="1030" y="790" width="150" height="78" rx="7"/>
   <text class="bt2" x="1042" y="810">互联网</text>
   <text class="bs" x="1042" y="828">DDG / 目标网页</text>
-  <text class="bs" x="1042" y="844">web_search · fetch_page</text>
+  <text class="bs" x="1042" y="845">web_search · fetch_page</text>
+  <text class="bs" x="1042" y="861">balldontlie 比分</text>
 
   <!-- ============ 箭头 ============ -->
   <!-- 浏览器 -> 接收循环 -->
@@ -317,20 +328,20 @@ td s{color:var(--muted)}
   <!-- A -> B spawn -->
   <path class="ar ar-c" d="M120,382 V414" marker-end="url(#d1c)"/>
   <text class="lab-c" x="128" y="402">spawn</text>
-  <!-- B <-> 快脑 -->
-  <path class="ar ar-t" d="M260,470 H790" marker-start="url(#d1t)" marker-end="url(#d1t)"/>
-  <text class="lab-t" x="430" y="462" text-anchor="middle">表达轮 /chat（流式分段 ⇄）</text>
+  <!-- B <-> 闲聊/表达脑 -->
+  <path class="ar ar-t" d="M260,470 H760" marker-start="url(#d1t)" marker-end="url(#d1t)"/>
+  <text class="lab-t" x="500" y="462" text-anchor="middle">闲聊路 / 表达轮 /chat（流式 ⇄）</text>
   <!-- B -> C -->
   <path class="ar ar-t" d="M120,564 V582 H595 V610" marker-end="url(#d1t)"/>
   <text class="lab-t" x="300" y="576" text-anchor="middle">分段生成器</text>
   <!-- B -> F（Agent Runtime 接管点） -->
   <path class="ar ar-v" d="M260,540 H510 V620 H500" marker-end="url(#d1v)"/>
   <text class="lab-v" x="330" y="532" text-anchor="middle">handle_utterance + gen_sn 移交</text>
-  <!-- F -> 快脑 -->
-  <path class="ar ar-v" d="M410,610 V598 H870 V564" marker-end="url(#d1v)"/>
-  <text class="lab-v" x="740" y="612" text-anchor="middle">路由 /agent_chat_v2</text>
+  <!-- F -> 路由脑 -->
+  <path class="ar ar-v" d="M410,610 V598 H987 V564" marker-end="url(#d1v)"/>
+  <text class="lab-v" x="700" y="590" text-anchor="middle">路由 /agent_chat_v2（:6009 路由专用实例）</text>
   <!-- F -> 慢脑 -->
-  <path class="ar ar-v" d="M460,760 V780 H1085 V564" marker-end="url(#d1v)"/>
+  <path class="ar ar-v" d="M460,760 V780 H1122 V564" marker-end="url(#d1v)"/>
   <text class="lab-v" x="770" y="772" text-anchor="middle">lease_run（工具循环）</text>
   <!-- F -> G -->
   <path class="ar ar-v" d="M410,760 V796" marker-end="url(#d1v)"/>
@@ -349,8 +360,9 @@ td s{color:var(--muted)}
 </svg>
 <figcaption>
 <b>图 1 · 全局架构。</b>读图要点：① 所有语音能力（轮次判别 / 门控 / grace / TTS / 播放）集中在左侧竖列——话轮管线与统一语音出口是全系统<b>唯一</b>的上话路径，
-Agent Runtime 的回执、澄清、表达轮与后台结果交付都复用同一条 <code>_run_speech_pipeline</code>，不存在第二出口；② 快脑 :6007 的 <code>GEN_LOCK</code>
-把 /chat 与 /agent_chat_v2 的生成串行化——路由控制轮与表达轮互相排队，不会并发抢同一块 GPU；③ turn server 同时承担转写（流式 paraformer）与轮次判别，commit 与 turn_final 都从它发出；
+闲聊路口播、回执、澄清与后台结果交付都复用同一条 <code>_run_speech_pipeline</code>，不存在第二出口；② Qwen3.5-9B 拆成<b>三个实例</b>——
+闲聊/表达脑 :6007（/chat，GPU3）、路由脑 :6009（/agent_chat_v2，GPU6，路由专用、不与口播抢生成）、慢脑 :6008（工具循环，GPU1）；
+③ turn server 同时承担转写（流式 paraformer）与轮次判别，commit 与 turn_final 都从它发出；
 ④ 紫色 Agent Runtime 框的持久层是 SQLite（每连接一库），任务状态、run 围栏与交付记录的唯一事实源。
 </figcaption>
 </figure>
@@ -362,9 +374,11 @@ Agent Runtime 的回执、澄清、表达轮与后台结果交付都复用同一
 再过 <code>stream_gate_filter</code>——主动门控 + 已注册 + 压制生效时把 chunk 替换为全零块；tse :8087 仅影子观测 <code>sep_cos</code>。</li>
 <li><b>轮次判别</b>：chunk 进 turn server 状态机（0.6B 逐 chunk），五道门滤掉毛刺；<code>wait</code>（连续静音 max_wait_num 块）或 <code>complete</code>（&lt;|user_complete|&gt; 即触发）提交话轮，携带整句转写 + trigger + commit_id。</li>
 <li><b>两遍式 ASR</b>：turn server commit 后立刻整句重识别并异步推 <code>turn_final</code>；话轮管线在后台线程 hold ≤500 ms 等它，拿到更准的整句文本再继续（超时回落 live 文本）。</li>
-<li><b>管线</b>：自说自话过滤 → 主说话人门 → 提交上一轮 pending → interrupt/reset → 历史 → Agent Runtime 接管（详见 §4–§7）。</li>
-<li><b>生成与播放</b>：快脑流式分段 → 统一语音出口：宽限保持（complete 触发时）→ <code>text_response</code> → TTS 流式 → <code>audio_chunk</code> 下行 + 双轨录音；播完挂 pending_message，下一轮话轮提交时才写进历史。</li>
-<li><b>打断</b>：播放期用户复语 → pvad barge-in（间隙容忍累积证据）→ <code>cut_pending_audio</code> + interrupt → 三态返回。</li>
+<li><b>管线</b>：自说自话过滤 → 主说话人门 → 提交上一轮 pending → interrupt/reset（慢脑播报中不满足持续插话阈值 → hold 让路，见 §4）→ 历史 → Agent Runtime 接管（详见 §4–§8）。</li>
+<li><b>双路并行</b>：接管后同开两路——<b>闲聊路</b>过 grace 门即流式生成上口（本轮应承 / 寒暄 / 反问归它，首句 ~1 s）；<b>路由路</b>在后台出任务计划（§5）。</li>
+<li><b>生成与播放</b>：闲聊/表达脑流式分段 → 统一语音出口：宽限保持（complete 触发时）→ <code>text_response</code> → TTS 流式 → <code>audio_chunk</code> 下行 + 双轨录音；播完挂 pending_message，下一轮话轮提交时才写进历史。</li>
+<li><b>打断</b>：播放期用户复语 → pvad barge-in（间隙容忍累积证据）→ <code>cut_pending_audio</code> + interrupt → 三态返回；慢脑结果播报有独立加强阈值（§4）。</li>
+<li><b>后台交付</b>：慢脑结果落 outbox → 交付泵等空闲（≥1.2 s 静音 ∧ 无生成 ∧ 无播放）经同一出口播出——闲聊路从信息层面拿不到结果原文（单一出口，§9）。</li>
 </ol>
 
 <!-- ================================================================ 2 -->
@@ -645,10 +659,11 @@ Agent Runtime 的回执、澄清、表达轮与后台结果交付都复用同一
   <rect class="bx-warn" x="850" y="352" width="240" height="40" rx="7"/>
   <text class="bs" x="862" y="377">pvad_reject 事件</text>
 
-  <rect class="bx" x="360" y="420" width="400" height="64" rx="7"/>
+  <rect class="bx" x="360" y="420" width="400" height="80" rx="7"/>
   <text class="bt" x="376" y="442">收尾：提交上一轮 pending</text>
   <text class="bs" x="376" y="462">cut_pending_audio（取证切刀）→ _commit_pending_message</text>
   <text class="bs" x="376" y="477">→ interrupt / reset（新 stop_event 代际）</text>
+  <text class="bs" x="376" y="492">慢脑播报中且非持续插话 → hold：跳过 cut/interrupt/reset，播报活完</text>
 
   <rect class="bx" x="360" y="504" width="400" height="64" rx="7"/>
   <text class="bt" x="376" y="526">历史与 UI</text>
@@ -658,14 +673,14 @@ Agent Runtime 的回执、澄清、表达轮与后台结果交付都复用同一
   <rect class="bx-v2" x="360" y="588" width="400" height="76" rx="7"/>
   <text class="bt" x="376" y="610" fill="var(--v2)">Agent Runtime 接管（gen_sn 移交）</text>
   <text class="bs" x="376" y="630" fill="var(--v2)">agent_v2.handle_utterance(text, commit_id, gen_sn) → return</text>
-  <text class="bs" x="376" y="647" fill="var(--v2)">本 worker 结束；全流程见 §5–§6（路由 → 回执 → 表达轮）</text>
-  <text class="bs" x="376" y="664" fill="var(--v2)">worker 在 finally 里释放 gen 标志（无声轮 / 被取代轮兜底）</text>
+  <text class="bs" x="376" y="647" fill="var(--v2)">本 worker 结束；双路仲裁全流程见 §5–§8</text>
+  <text class="bs" x="376" y="664" fill="var(--v2)">worker 在 finally 里释放 gen 标志（无声轮 / 吸收轮 / 被取代轮兜底）</text>
 
   <rect class="bx" x="360" y="688" width="400" height="76" rx="7"/>
-  <text class="bt" x="376" y="710">表达轮生成（reply_mode = direct / mixed）</text>
+  <text class="bt" x="376" y="710">表达轮生成（闲聊路失败 / 缺席时兜底）</text>
   <text class="bs" x="376" y="730">adapter generate_fn → /chat 人设流式（min_seg_len 控制首音频时延）</text>
-  <text class="bs" x="376" y="747">receipts / clarify 不走生成：回执与澄清话术直接上口；</text>
-  <text class="bs" x="376" y="764">mixed = 回执 + 表达轮都播（不能因有控制操作就吞掉同句问题）</text>
+  <text class="bs" x="376" y="747">闲聊路活着时 direct/mixed 表达轮不走（本轮口播归闲聊路）；</text>
+  <text class="bs" x="376" y="764">回执静音仲裁见 §5——受理类已被过滤，只剩纠错/失败类照播</text>
 
   <rect class="bx" x="360" y="788" width="400" height="100" rx="7"/>
   <text class="bt" x="376" y="810">统一语音出口 · 宽限保持</text>
@@ -695,10 +710,10 @@ Agent Runtime 的回执、澄清、表达轮与后台结果交付都复用同一
   <text class="bs" x="72" y="689">上口轮由 _speak 自己的 begin/</text>
   <text class="bs" x="72" y="706">finally 清理；无声轮 / 被取代轮由</text>
   <text class="bs" x="72" y="723">worker finally 兜底释放。</text>
-  <text class="bs" x="72" y="746">四处早退（空文本 / selftalk /</text>
-  <text class="bs" x="72" y="763">pvad 拒 / stop_event）与外层</text>
-  <text class="bs" x="72" y="780">except 同样释放——漏放会永久</text>
-  <text class="bs" x="72" y="797">堵死交付（listening 卡死事故）。</text>
+  <text class="bs" x="72" y="746">各处早退（空文本 / selftalk /</text>
+  <text class="bs" x="72" y="763">pvad 拒 / 纯应答吸收 / stop_event）</text>
+  <text class="bs" x="72" y="780">与外层 except 同样释放——漏放会</text>
+  <text class="bs" x="72" y="797">永久堵死交付（listening 卡死事故）。</text>
 
   <rect class="st" x="80" y="1036" width="300" height="90" rx="7"/>
   <text class="bt" x="96" y="1062">True · 完整播出</text>
@@ -721,7 +736,7 @@ Agent Runtime 的回执、澄清、表达轮与后台结果交付都复用同一
   <path class="ar ar-c" d="M560,322 V346" marker-end="url(#d5c)"/>
   <path class="ar ar-w" d="M760,372 H850" marker-end="url(#d5w)"/><text class="lab-w" x="805" y="364" text-anchor="middle">拒</text>
   <path class="ar ar-c" d="M560,398 V420" marker-end="url(#d5c)"/>
-  <path class="ar ar-c" d="M560,484 V504" marker-end="url(#d5c)"/>
+  <path class="ar ar-c" d="M560,500 V504" marker-end="url(#d5c)"/>
   <path class="ar ar-c" d="M560,568 V588" marker-end="url(#d5c)"/>
   <path class="ar ar-v" d="M560,664 V688" marker-end="url(#d5v)"/>
   <path class="ar ar-t" d="M560,764 V788" marker-end="url(#d5t)"/>
@@ -734,6 +749,9 @@ Agent Runtime 的回执、澄清、表达轮与后台结果交付都复用同一
 <b>图 5 · 话轮管线与统一语音出口。</b>三态语义（2026-11-05 投递三连修）是全系统交付协议的基石：
 "没听过谈不上拒绝"——None 不占用拒绝终态，走独立静默预算；听到后打断 = 终态不重试；
 空流判别量精确到"掐死在首分句前"（生成器零 yield 也算 interrupted，不算成功）。
+慢脑结果播报另有两层独立保护（2026-11-07）：<b>信号路</b>——播报期间 barge-in 须 ≥5 个 nonidle 块且首块距今 ≥1 s 才放行
+（普通 3 块 / 1.6 s 不变，阈值前端可调）；<b>commit 路</b>——话轮提交时若播报仍在进行且用户不是持续插话，hold 本轮
+（照常 ASR / 吸收 / 路由，但不 cut / interrupt / reset），纯应答「嗯，好的」不再掐死播报。
 </figcaption>
 </figure>
 
@@ -745,14 +763,155 @@ TTS 发射快于实时（RTF ≈0.36），浏览器在打断瞬间丢弃缓冲�
 把录音切在可听播放真正结束处。pvad barge-in、话轮提交、交付入口、duplex_stop、连接关闭六个入口都先切刀再 interrupt。
 </p>
 
+
 <!-- ================================================================ 5 -->
-<h2 id="s5"><span class="no">§5</span>Agent Runtime：控制平面全景</h2>
+<h2 id="s5"><span class="no">§5</span>双路并行：闲聊路与路由路的仲裁</h2>
 <p>
-Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了什么</b>（路由器 + 三道守卫）、
+接管每一句话轮后，Agent Runtime <b>同开两路</b>（2026-11-06 双路并行改造，全部提速与吞句根修的来源）：
+路由脑出一份计划要 3.5–4.3 s（attempts=2 翻倍），用户等不起——所以<b>闲聊路（voice lane）</b>过 grace 门就开始
+<code>/chat</code> 流式生成并上口，负责本轮<b>全部常规口播</b>（应承「我去查」/ 寒暄 / 没说清时反问 / 任务情况按面板答）；
+<b>路由路（agent lane）</b>只在后台做任务机器。两路共用同一个 grace 门阈值、同一个任务面板快照，
+仲裁规则保证它们<b>永不双声道</b>。
+</p>
+<table>
+<tr><th style="width:110px"></th><th>闲聊路 voice lane</th><th>路由路 agent lane</th></tr>
+<tr><td>驱动</td><td>闲聊路线程（chitchat_fn → :6007 /chat，TEMP 0.9）</td><td>话轮线程（submit_request → :6009 /agent_chat_v2，greedy 0）</td></tr>
+<tr><td>开口时机</td><td>grace 门开后首句 ~1 s 流式进 TTS</td><td>不直接开口——回执按仲裁规则上口或静音</td></tr>
+<tr><td>职责</td><td>本轮口播：应承 / 寒暄 / 反问 / 按面板答任务情况</td><td>计划：create / amend / cancel / get_task … → 落库 → 慢脑</td></tr>
+<tr><td>信息面</td><td><b>拿不到结果原文</b>——只见状态摘要 + 用户实际听到部分（渐进式披露）</td><td>全量：快照 + 慢脑结果 + 交付记录（SQLite）</td></tr>
+<tr><td>失败</td><td>chitchat_failed → 全套回退旧路径（回执照播 / clarify 上口 / 表达轮）</td><td>传输故障 → 终态；被取代 → route_stop 断流（取消不是失败）</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 1180 1130" role="img" aria-label="双路并行仲裁：话轮移交后先判纯应答吸收与上一话轮处置，然后闲聊路过 grace 门生成上口、路由路后台出计划提交，commit 时按闲聊路死活仲裁回执静音或照播">
+  <defs>
+    <marker id="d6c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-c"/></marker>
+    <marker id="d6v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
+    <marker id="d6w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+  </defs>
+
+  <rect class="bx" x="350" y="16" width="480" height="52" rx="7"/>
+  <text class="bt" x="590" y="38" text-anchor="middle">handle_utterance（text, trigger, commit_id, gen_sn）</text>
+  <text class="bs" x="590" y="58" text-anchor="middle">话轮管线移交后即返回；编排进后台话轮线程（turn dict 自持全部状态）</text>
+
+  <polygon class="bx2" points="590,96 745,152 590,208 435,152"/>
+  <text class="bi" x="590" y="140" text-anchor="middle">整句只有应答词（_ACK_RE）</text>
+  <text class="bs" x="590" y="158" text-anchor="middle">且 上轮活着 ∨ 挂起计划 ∨ 面板有任务？</text>
+
+  <rect class="bx-warn" x="805" y="118" width="345" height="72" rx="7"/>
+  <text class="lab-w" x="817" y="140">纯应答吸收：释放 gen_sn 即返回</text>
+  <text class="bs" x="817" y="158">不作废挂起计划 · 不重路由 · 不另起闲聊路</text>
+  <text class="bs" x="817" y="175">（「停」绝不在应答词表内；吸收轮也必须释放 gen）</text>
+
+  <rect class="bx" x="350" y="240" width="480" height="128" rx="7"/>
+  <text class="bt" x="366" y="262">上一话轮处置（话轮年龄 = max(上句开口, 挂起计划创建)）</text>
+  <text class="bs" x="366" y="284">· 窗口内 ≤8 s（碎片续说）：abandoned + route_stop 断流 + 文本合并重路由</text>
+  <text class="bs" x="366" y="302">· 窗口外（独立话轮）：land_pending 强制落地挂起计划（跳 grace，create 同主题去重）</text>
+  <text class="bs" x="366" y="320">· 旧路由还在途：新 worker 有界等待 ≤5 s 等它返回即落地——绝不两头落空</text>
+  <text class="bs" x="366" y="338">· 窗口外不合并文本、不杀在途路由：任务不能因用户一直说话而永远建不出来</text>
+
+  <rect class="grp" x="60" y="420" width="440" height="470" rx="9"/>
+  <text class="bi" x="72" y="444">闲聊路 voice lane —— 本轮口播职责</text>
+
+  <rect class="bx" x="80" y="458" width="400" height="64" rx="7"/>
+  <text class="bt" x="92" y="480">grace 门（与路由路同一份 turn_grace_ms）</text>
+  <text class="bs" x="92" y="500">静音 ≥ 阈值才开口；续说窗口内绝不开口</text>
+
+  <rect class="bx" x="80" y="534" width="400" height="124" rx="7"/>
+  <text class="bt" x="92" y="556">chitchat_fn → :6007 /chat 流式生成</text>
+  <text class="bs" x="92" y="578">· generate_with_history + extra_context =</text>
+  <text class="bs" x="92" y="595">　任务面板渐进式披露（状态摘要 + heard ≤120 字）</text>
+  <text class="bs" x="92" y="612">· TEMP 0.9 · 首句 ~1 s 流式进 TTS</text>
+  <text class="bs" x="92" y="629">· 三不变量：无实时信息只应承不报值 /</text>
+  <text class="bs" x="92" y="646">　结果归后台问起按面板答 / 像朋友聊天别复读句式</text>
+
+  <rect class="bx" x="80" y="670" width="400" height="64" rx="7"/>
+  <text class="bt" x="92" y="692">speak_fn 流式上口（统一语音出口）</text>
+  <text class="bs" x="92" y="712">rc 三态：True=播完 · False=被打断 · None=未出声</text>
+
+  <rect class="bx2" x="80" y="746" width="400" height="64" rx="7"/>
+  <text class="bt2" x="92" y="768">异常 → chitchat_failed：全套回退旧路径</text>
+  <text class="bs" x="92" y="788">回执照播 · clarify 上口 · 表达轮兜底（方案 C）</text>
+
+  <rect class="grp" x="690" y="420" width="430" height="470" rx="9"/>
+  <text class="bi" x="702" y="444">路由路 agent lane —— 任务机器</text>
+
+  <rect class="bx" x="710" y="458" width="390" height="64" rx="7"/>
+  <text class="bt" x="722" y="480">submit_request → :6009 /agent_chat_v2</text>
+  <text class="bs" x="722" y="500">route_stop 置位 = 断流取消（取消不是失败）</text>
+
+  <rect class="bx" x="710" y="534" width="390" height="64" rx="7"/>
+  <text class="bt" x="722" y="556">五道守卫（§8 图 9）→ Plan 挂起</text>
+  <text class="bs" x="722" y="576">request_seq 单调：晚到的旧路由结果 stale 丢弃</text>
+
+  <rect class="bx" x="710" y="610" width="390" height="64" rx="7"/>
+  <text class="bt" x="722" y="632">grace 门（同一阈值；门又关上 → 挂起交下一轮）</text>
+  <text class="bs" x="722" y="652">stale / abandoned 复查：不把别人的挂起计划当自己的提交</text>
+
+  <rect class="bx" x="710" y="686" width="390" height="88" rx="7"/>
+  <text class="bt" x="722" y="708">commit_pending（受理落库）</text>
+  <text class="bs" x="722" y="730">· 回执按仲裁规则上口 / 静音（见下）</text>
+  <text class="bs" x="722" y="747">· stop-only → 掐闲聊生成器（chitchat_stop）</text>
+  <text class="bs" x="722" y="764">· 取消回执 → 掐在途播报（stop_speaking_for_task）</text>
+
+  <rect class="bx" x="710" y="786" width="390" height="80" rx="7"/>
+  <text class="bt" x="722" y="808">后台：慢脑 lease_run → outbox → 交付泵</text>
+  <text class="bs" x="722" y="828">单一出口（§9 图 10）· 等空闲 ≥1.2 s · 租约 300 s</text>
+  <text class="bs" x="722" y="845">播报独立打断保护 + hold 语义（§4 图 5）</text>
+
+  <rect class="bx2" x="60" y="920" width="1060" height="130" rx="7"/>
+  <text class="bi" x="72" y="944">commit 时回执仲裁——闲聊路活着（已启动未失败，或已开口）时：</text>
+  <text class="bs" x="72" y="968">· 受理 / 状态类 8 种回执静音（accepted · updated · cancel_requested · canceled · already_completed · delivery_suppressed · answered · info）——面板上都有，闲聊路自然会说</text>
+  <text class="bs" x="72" y="988">· REJECTED 绝不静音（闲聊路不知道拒绝原因，必须照播）；clarify 由闲聊路按「没说清要反问」纪律自己问</text>
+  <text class="bs" x="72" y="1008">· direct / mixed 表达轮、路由失败话术、无声兜底「好的。」——都只在闲聊路失败 / 缺席时兜底</text>
+  <text class="bs" x="72" y="1032">· 吸收轮不说话 → 不清慢脑播报的打断保护（护身符不摘）；新语音真上口由 _speak 开口前自己 interrupt</text>
+
+  <rect class="bx2" x="60" y="1070" width="1060" height="44" rx="7"/>
+  <text class="bs" x="72" y="1097">user_stop（手动停止）：掐闲聊路 + abandoned + route_stop（含 land_wait_prev 的旧在途路由）+ discard_pending + 停调度 / 交付泵；不动 store，下一话轮幂等重启。</text>
+
+  <path class="ar ar-c" d="M590,68 V96" marker-end="url(#d6c)"/>
+  <path class="ar ar-w" d="M745,152 H805" marker-end="url(#d6w)"/>
+  <text class="lab-w" x="770" y="144" text-anchor="middle">是</text>
+  <path class="ar ar-c" d="M590,208 V240" marker-end="url(#d6c)"/>
+  <text class="lab-c" x="600" y="230">否</text>
+  <path class="ar ar-c" d="M490,368 V394 H280 V420" marker-end="url(#d6c)"/>
+  <path class="ar ar-c" d="M690,368 V394 H905 V420" marker-end="url(#d6c)"/>
+  <path class="ar ar-v" d="M280,522 V534" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M280,658 V670" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M280,734 V746" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M905,522 V534" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M905,598 V610" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M905,674 V686" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M905,774 V786" marker-end="url(#d6v)"/>
+  <path class="ar ar-c" d="M480,690 H710" marker-end="url(#d6c)"/>
+  <text class="lab-c" x="595" y="682" text-anchor="middle">_chitchat_alive</text>
+  <path class="ar ar-c" d="M710,730 H480" marker-end="url(#d6c)"/>
+  <text class="lab-c" x="595" y="750" text-anchor="middle">chitchat_stop</text>
+</svg>
+<figcaption>
+<b>图 6 · 双路并行仲裁。</b>设计来源是一串实机事故：路由串行等 5–10 s（GEN_LOCK 排队）→ 用户每句话都被复读应承；
+「停一下 + 查 X」被路由成只出 stop_speech → 21 s 无声。双路让<b>停发言归路由、查询应承归闲聊</b>各司其职，
+吞句事故结构性消灭。三个关键不变量：① 闲聊路与路由路<b>同一个 grace 门</b>（不复制第二套计时阈值，续说窗口内绝不开口）；
+② 闲聊路<b>拿不到结果原文</b>（单一出口，§9）——机制上不存在第二路复述；③ 仲裁只看 <code>_chitchat_alive</code> 一个布尔，
+回执静音类别是白名单（QUIET_IF_VOICED_OUTCOMES），REJECTED 永不在列。
+</figcaption>
+</figure>
+
+<p>
+两个容易踩坑的细节（均实测事故根修）：<b>吸收轮也必须释放 gen 标志</b>——纯应答「嗯，好的」被吸收后直接 return，
+commit 时置位的 gen_in_progress 无人清理，后台交付被永久拒绝（T2 完成后 14.5 s 无声），且 <code>_reply_in_flight</code> 恒真
+让 blip 过滤在完全静止期吞掉真实短句；<b>长间隔独立话轮绝不杀在途路由</b>——route_stop 只能作废"还没返回的路由"，
+land_pending 只能救"已返回挂起的计划"，先杀后判窗口会两头落空（C罗查询 11 s 永远 registered，用户每次追问都精确杀掉在途路由）。
+</p>
+
+<!-- ================================================================ 6 -->
+<h2 id="s6"><span class="no">§6</span>Agent Runtime：控制平面全景</h2>
+<p>
+Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了什么</b>（路由器 + 五道守卫）、
 <b>系统承诺了什么</b>（操作落库 + 受控回执）、<b>承诺执行得怎么样</b>（慢脑 run 围栏 + 事件信封）、
-<b>结果什么时候说、怎么说</b>（交付管理器 + 统一语音出口三态）。分工原则一以贯之：
-<b>确定性逻辑放 Runtime</b>（守卫、回执模板、状态机、lease 围栏、重播重入），<b>概率性逻辑放模型</b>
-（路由 LLM、表达轮生成、慢脑工具循环）——SQLite 是两者之间唯一的交接面。
+<b>结果什么时候说、怎么说</b>（交付管理器 + 统一语音出口三态，闲聊路拿不到结果原文）。
+分工原则一以贯之：<b>确定性逻辑放 Runtime</b>（守卫、回执模板、状态机、lease 围栏、重播重入、双路仲裁），
+<b>概率性逻辑放模型</b>（路由 LLM、闲聊路与表达轮生成、慢脑工具循环）——SQLite 是两者之间唯一的交接面。
 </p>
 <p>
 对语音前端的接入是<b>只读注入</b>：grace 阈值取同一份 <code>turn_grace_ms</code>（不另起计时器）、
@@ -761,11 +920,11 @@ Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了
 </p>
 
 <figure>
-<svg viewBox="0 0 1180 860" role="img" aria-label="Agent Runtime 控制平面全景：左侧话轮管线与前端适配层，中央 RuntimeV2，右侧路由器与快慢脑，底行统一语音出口与浏览器面板，最右 SQLite 唯一事实源">
+<svg viewBox="0 0 1180 860" role="img" aria-label="Agent Runtime 控制平面全景：左侧话轮管线与前端适配层，中央 RuntimeV2，右侧路由器与三实例快慢脑，底行统一语音出口与浏览器面板，最右 SQLite 唯一事实源">
   <defs>
-    <marker id="d6v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
-    <marker id="d6t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
-    <marker id="d6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-a"/></marker>
+    <marker id="d7v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
+    <marker id="d7t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+    <marker id="d7a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-a"/></marker>
   </defs>
 
   <rect class="bx" x="40" y="60" width="190" height="80" rx="7"/>
@@ -775,11 +934,11 @@ Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了
 
   <rect class="bx-v2" x="40" y="200" width="190" height="230" rx="7"/>
   <text class="bt" x="52" y="224" fill="var(--v2)">FrontendAdapter（窄接入层）</text>
-  <text class="bs" x="52" y="248" fill="var(--v2)">· handle_utterance / observe</text>
-  <text class="bs" x="52" y="268" fill="var(--v2)">· grace 门轮询 0.05 s</text>
-  <text class="bs" x="52" y="288" fill="var(--v2)">· _speak_safe 固定话术上口</text>
-  <text class="bs" x="52" y="308" fill="var(--v2)">· 表达轮 generate_fn（/chat）</text>
-  <text class="bs" x="52" y="328" fill="var(--v2)">· 无声兜底「好的。」</text>
+  <text class="bs" x="52" y="248" fill="var(--v2)">· handle_utterance 双路 worker</text>
+  <text class="bs" x="52" y="268" fill="var(--v2)">· 纯应答吸收 · 续说合并 / land</text>
+  <text class="bs" x="52" y="288" fill="var(--v2)">· 闲聊路线程 + 回执仲裁</text>
+  <text class="bs" x="52" y="308" fill="var(--v2)">· _speak_safe 固定话术上口</text>
+  <text class="bs" x="52" y="328" fill="var(--v2)">· 表达轮兜底（/chat）</text>
   <text class="bs" x="52" y="348" fill="var(--v2)">· UI 泵：1 s 轮询 diff</text>
   <text class="bs" x="52" y="368" fill="var(--v2)">　→ task_update 面板</text>
   <text class="bs" x="52" y="388" fill="var(--v2)">· finally 释放 gen 标志</text>
@@ -787,25 +946,30 @@ Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了
 
   <rect class="bx" x="290" y="60" width="250" height="140" rx="7"/>
   <text class="bt" x="302" y="84">路由器 router.py</text>
-  <text class="bs" x="302" y="106">· route_turn 单工具 · 16 few-shot</text>
-  <text class="bs" x="302" y="126">· 三道守卫：格式 / 接地 / 吞句（§7）</text>
-  <text class="bs" x="302" y="146">· 传输故障 = 终态，不重试</text>
-  <text class="bs" x="302" y="166">· 修复轮 ≤1（携纠错提示）</text>
+  <text class="bs" x="302" y="106">· route_turn 单工具 · 8 few-shot</text>
+  <text class="bs" x="302" y="126">· 五道守卫：格式 / 接地 / 吞句 /</text>
+  <text class="bs" x="302" y="146">　取消目标 / get_task 目标（§8）</text>
+  <text class="bs" x="302" y="166">· 传输故障 = 终态，不重试</text>
+  <text class="bs" x="302" y="186">· 修复轮 ≤1（携纠错提示）</text>
 
-  <rect class="bx" x="590" y="60" width="170" height="140" rx="7"/>
-  <text class="bt2" x="602" y="84">快脑 :6007 · GPU6</text>
-  <text class="bs" x="602" y="106">· /agent_chat_v2 NDJSON</text>
-  <text class="bs" x="602" y="126">· thinking off · 温度 0</text>
-  <text class="bs" x="602" y="146">· GEN_LOCK 串行化生成</text>
+  <rect class="bx" x="590" y="60" width="170" height="80" rx="7"/>
+  <text class="bt2" x="602" y="82">路由脑 :6009 · GPU6</text>
+  <text class="bs" x="602" y="102">· /agent_chat_v2 NDJSON</text>
+  <text class="bs" x="602" y="122">· greedy 0 · GEN_LOCK</text>
+
+  <rect class="bx" x="590" y="155" width="170" height="80" rx="7"/>
+  <text class="bt2" x="602" y="177">闲聊脑 :6007 · GPU3</text>
+  <text class="bs" x="602" y="197">· /chat 人设流式</text>
+  <text class="bs" x="602" y="217">· TEMP 0.9（闲聊 + 表达轮）</text>
 
   <rect class="bx-v2" x="290" y="250" width="250" height="180" rx="7"/>
   <text class="bt" x="302" y="274" fill="var(--v2)">AgentRuntimeV2（runtime.py）</text>
   <text class="bs" x="302" y="298" fill="var(--v2)">· submit_request / commit_pending</text>
-  <text class="bs" x="302" y="318" fill="var(--v2)">· 快照 context.py（§7.1）</text>
+  <text class="bs" x="302" y="318" fill="var(--v2)">· 快照 context.py（§8.1）</text>
   <text class="bs" x="302" y="338" fill="var(--v2)">· scheduler：run lease 围栏</text>
-  <text class="bs" x="302" y="358" fill="var(--v2)">· delivery：三态 · outbox 至少一次</text>
-  <text class="bs" x="302" y="378" fill="var(--v2)">· 僵尸 run 可接管不双跑</text>
-  <text class="bs" x="302" y="398" fill="var(--v2)">· get_task → 重播重入（§8）</text>
+  <text class="bs" x="302" y="358" fill="var(--v2)">· delivery：三态 · 单一出口</text>
+  <text class="bs" x="302" y="378" fill="var(--v2)">· outbox 至少一次 · 租约 300 s</text>
+  <text class="bs" x="302" y="398" fill="var(--v2)">· 取消掐在途播报 · get_task 重播重入</text>
 
   <rect class="bx" x="590" y="250" width="170" height="180" rx="7"/>
   <text class="bt2" x="602" y="274">慢脑 :6008 · GPU1</text>
@@ -813,26 +977,26 @@ Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了
   <text class="bs" x="602" y="316">· MAX_STEPS=4</text>
   <text class="bs" x="602" y="336">· 空结果 → failed(empty)</text>
   <text class="bs" x="602" y="356">· needs_input 绑 question_id</text>
-  <text class="bs" x="602" y="376">· 工具观察进二轮上下文</text>
-  <text class="bs" x="602" y="396">· sources 归集</text>
+  <text class="bs" x="602" y="376">· web_search · sports_games</text>
+  <text class="bs" x="602" y="396">· 工具观察进二轮上下文</text>
 
   <rect class="bx" x="590" y="470" width="170" height="70" rx="7"/>
   <text class="bt2" x="602" y="494">互联网</text>
-  <text class="bs" x="602" y="514">DDG / 目标网页</text>
+  <text class="bs" x="602" y="514">DDG / 目标网页 / 比分 API</text>
 
   <rect class="bx" x="40" y="470" width="190" height="140" rx="7"/>
   <text class="bt" x="52" y="494">统一语音出口</text>
   <text class="bs" x="52" y="516">_run_speech_pipeline</text>
   <text class="bs" x="52" y="536">（复用，不复制）</text>
-  <text class="bs" x="52" y="556">· 回执 / 澄清 / 表达轮 / 结果</text>
+  <text class="bs" x="52" y="556">· 闲聊路 / 回执 / 表达轮 / 结果</text>
   <text class="bs" x="52" y="576">· 三态返回原样透传</text>
 
   <rect class="bx" x="290" y="470" width="250" height="140" rx="7"/>
   <text class="bt" x="302" y="494">浏览器 Background Tasks 面板</text>
   <text class="bs" x="302" y="516">· task_update（UI 泵 diff 推送，</text>
   <text class="bs" x="302" y="536">　与前端同一消息契约）</text>
-  <text class="bs" x="302" y="556">· completed + 已播出 → delivered</text>
-  <text class="bs" x="302" y="576">· waiting_input 等新状态透传</text>
+  <text class="bs" x="302" y="556">· interrupted（cut short 琥珀色）·</text>
+  <text class="bs" x="302" y="576">　suppressed「结果已取消播报」等新态</text>
 
   <rect class="bx-v2" x="940" y="60" width="200" height="550" rx="7"/>
   <text class="bt" x="952" y="84" fill="var(--v2)">Store · SQLite</text>
@@ -841,135 +1005,141 @@ Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了
   <text class="bs2" x="952" y="138" fill="var(--v2)">{sha1(client_id)[:16]}.sqlite3</text>
   <text class="bs2" x="952" y="154" fill="var(--v2)">每连接一库 · 全新无迁移</text>
   <text class="bi" x="952" y="184" fill="var(--v2)">—— 会话域 ——</text>
-  <text class="bs" x="952" y="204" fill="var(--v2)">requests（幂等）</text>
+  <text class="bs" x="952" y="204" fill="var(--v2)">requests（幂等 · request_seq）</text>
   <text class="bs" x="952" y="222" fill="var(--v2)">operations（操作流水）</text>
   <text class="bi" x="952" y="252" fill="var(--v2)">—— 任务域 ——</text>
   <text class="bs" x="952" y="272" fill="var(--v2)">tasks · task_revisions</text>
   <text class="bs" x="952" y="290" fill="var(--v2)">runs（lease）· events</text>
-  <text class="bi" x="952" y="320" fill="var(--v2)">—— 执行域 ——</text>
-  <text class="bs" x="952" y="340" fill="var(--v2)">tool_calls</text>
-  <text class="bi" x="952" y="370" fill="var(--v2)">—— 交付域 ——</text>
-  <text class="bs" x="952" y="390" fill="var(--v2)">deliveries · outbox</text>
-  <text class="bi" x="952" y="420" fill="var(--v2)">—— 观测 ——</text>
-  <text class="bs" x="952" y="440" fill="var(--v2)">route_log · meta</text>
-  <text class="bs" x="952" y="464" fill="var(--v2)">task_panel_rows</text>
-  <text class="bs" x="952" y="482" fill="var(--v2)">（面板只读视图）</text>
-  <text class="bs" x="952" y="512" fill="var(--v2)">不删任何历史证据</text>
-  <text class="bs" x="952" y="532" fill="var(--v2)">（失败 / 拒绝也留痕）</text>
+  <text class="bs" x="952" y="308" fill="var(--v2)">　（含 delivery_heard 事件）</text>
+  <text class="bi" x="952" y="338" fill="var(--v2)">—— 执行域 ——</text>
+  <text class="bs" x="952" y="358" fill="var(--v2)">tool_calls</text>
+  <text class="bi" x="952" y="388" fill="var(--v2)">—— 交付域 ——</text>
+  <text class="bs" x="952" y="408" fill="var(--v2)">deliveries · outbox</text>
+  <text class="bs" x="952" y="426" fill="var(--v2)">　cancel_intent 抑制标记</text>
+  <text class="bi" x="952" y="456" fill="var(--v2)">—— 观测 ——</text>
+  <text class="bs" x="952" y="476" fill="var(--v2)">route_log · meta</text>
+  <text class="bs" x="952" y="500" fill="var(--v2)">task_panel_rows（只读视图）</text>
+  <text class="bs" x="952" y="518" fill="var(--v2)">　heard / interrupted / suppressed</text>
+  <text class="bs" x="952" y="542" fill="var(--v2)">不删任何历史证据</text>
+  <text class="bs" x="952" y="562" fill="var(--v2)">（失败 / 拒绝也留痕）</text>
 
   <rect class="bx2" x="40" y="660" width="800" height="70" rx="7"/>
-  <text class="bi" x="52" y="684">分工原则：确定性逻辑在左列与中央（守卫 / 模板 / 状态机 / 围栏 / 重入），概率性逻辑在右（路由 LLM / 表达轮 / 慢脑工具）。</text>
+  <text class="bi" x="52" y="684">分工原则：确定性逻辑在左列与中央（守卫 / 模板 / 状态机 / 围栏 / 重入 / 双路仲裁），概率性逻辑在右（路由 LLM / 闲聊与表达 / 慢脑工具）。</text>
   <text class="bs" x="52" y="706">SQLite 是两者之间唯一的交接面——模型每次决策的输入（快照）与输出（Plan / 回执）都经它落库，崩溃重启后可完整追溯。</text>
 
-  <path class="ar ar-v" d="M135,140 V200" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M135,140 V200" marker-end="url(#d7v)"/>
   <text class="lab-v" x="145" y="176">handle_utterance(gen_sn)</text>
-  <path class="ar ar-v" d="M230,214 H415 V250" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M230,214 H415 V250" marker-end="url(#d7v)"/>
   <text class="lab-v" x="340" y="208" text-anchor="middle">submit_request（幂等落库，内含路由）</text>
-  <path class="ar ar-v" d="M380,250 V232 H230" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M380,250 V232 H230" marker-end="url(#d7v)"/>
   <text class="lab-v" x="330" y="226" text-anchor="middle">回执 / 表达轮文本</text>
-  <path class="ar ar-v" d="M470,250 V200" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M470,250 V200" marker-end="url(#d7v)"/>
   <text class="lab-v" x="480" y="232">route_turn（快照）</text>
-  <path class="ar ar-t" d="M540,100 H590" marker-end="url(#d6t)"/>
-  <text class="lab-t" x="565" y="92" text-anchor="middle">NDJSON</text>
-  <path class="ar ar-t" d="M590,140 H540" marker-end="url(#d6t)"/>
-  <text class="lab-t" x="565" y="162" text-anchor="middle">plan_json</text>
-  <path class="ar ar-v" d="M540,300 H590" marker-end="url(#d6v)"/>
+  <path class="ar ar-t" d="M540,95 H590" marker-end="url(#d7t)"/>
+  <text class="lab-t" x="565" y="87" text-anchor="middle">NDJSON</text>
+  <path class="ar ar-t" d="M590,125 H540" marker-end="url(#d7t)"/>
+  <text class="lab-t" x="565" y="147" text-anchor="middle">plan_json</text>
+  <path class="ar ar-v" d="M230,230 H560 V195 H590" marker-end="url(#d7v)"/>
+  <text class="lab-v" x="400" y="240" text-anchor="middle">闲聊路 /chat（chitchat_fn）</text>
+  <path class="ar ar-v" d="M540,300 H590" marker-end="url(#d7v)"/>
   <text class="lab-v" x="565" y="292" text-anchor="middle">lease_run</text>
-  <path class="ar ar-t" d="M590,390 H540" marker-end="url(#d6t)"/>
+  <path class="ar ar-t" d="M590,390 H540" marker-end="url(#d7t)"/>
   <text class="lab-t" x="565" y="412" text-anchor="middle">结果 / 状态</text>
-  <path class="ar ar-t" d="M675,430 V470" marker-end="url(#d6t)"/>
+  <path class="ar ar-t" d="M675,430 V470" marker-end="url(#d7t)"/>
   <text class="lab-t" x="683" y="456">工具调用</text>
-  <path class="ar ar-v" d="M135,430 V470" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M135,430 V470" marker-end="url(#d7v)"/>
   <text class="lab-v" x="145" y="456">speak 桥（复用管线）</text>
-  <path class="ar ar-v dash" d="M230,420 V445 H415 V470" marker-end="url(#d6v)"/>
+  <path class="ar ar-v dash" d="M230,420 V445 H415 V470" marker-end="url(#d7v)"/>
   <text class="lab-v" x="330" y="440" text-anchor="middle">task_update（UI 泵 1 s diff）</text>
-  <path class="ar ar-a" d="M230,540 H290" marker-end="url(#d6a)"/>
+  <path class="ar ar-a" d="M230,540 H290" marker-end="url(#d7a)"/>
   <text class="lab-a" x="260" y="532" text-anchor="middle">下行事件</text>
-  <path class="ar ar-v" d="M520,250 V230 H940" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M520,250 V230 H940" marker-end="url(#d7v)"/>
   <text class="lab-v" x="700" y="224" text-anchor="middle">控制面读写（事务）</text>
-  <path class="ar ar-v" d="M760,340 H940" marker-end="url(#d6v)"/>
+  <path class="ar ar-v" d="M760,340 H940" marker-end="url(#d7v)"/>
   <text class="lab-v" x="850" y="332" text-anchor="middle">tool_calls / events 落库</text>
 </svg>
 <figcaption>
-<b>图 6 · Agent Runtime 控制平面全景。</b>读图要点：① 话轮管线把话轮连 gen_sn 一起移交后即返回，真正的编排发生在
-Adapter 与 RuntimeV2；② 路由器是唯一调用快脑的入口（/agent_chat_v2），表达轮则走 /chat——两者都被 GEN_LOCK 串行化，
-不存在并发抢生成；③ 右侧竖条是 SQLite 唯一事实源，所有控制面读写都过它；④ 底行是两条出口：语音（统一出口）与
+<b>图 7 · Agent Runtime 控制平面全景。</b>读图要点：① 话轮管线把话轮连 gen_sn 一起移交后即返回，真正的编排发生在
+Adapter 与 RuntimeV2；② Qwen3.5-9B 三实例各司其职——路由脑 :6009 只跑 /agent_chat_v2（路由不再与口播抢 GEN_LOCK），
+闲聊脑 :6007 跑 /chat，慢脑 :6008 跑工具循环；③ 右侧竖条是 SQLite 唯一事实源，所有控制面读写都过它——
+events 里的 delivery_heard 记录"用户实际听到部分"，cancel_intent 标记改口抑制；④ 底行是两条出口：语音（统一出口）与
 UI（task_update 面板），互不替代。
 </figcaption>
 </figure>
 
-<!-- ================================================================ 6 -->
-<h2 id="s6"><span class="no">§6</span>一次话轮的完整时序（接管 → 路由 → 回执 → 交付）</h2>
+<!-- ================================================================ 7 -->
+<h2 id="s7"><span class="no">§7</span>一次话轮的完整时序（接管 → 双路 → 回执 → 交付）</h2>
 <p>
 下图是一次典型话轮的端到端时序：<b>用户说"帮我查一下湖人最近的比赛"</b>。
-覆盖 gen 标志移交、grace 提交门、受控回执上口、表达轮、慢脑执行与空闲交付；打断与三态语义在 §4 已述，此处不重复。
+覆盖 gen 标志移交、双路并行启动、闲聊路首句上口、路由提交、回执仲裁、慢脑执行与空闲交付；
+打断 / 三态 / hold 语义在 §4 已述，此处不重复。
 </p>
 
 <figure>
-<svg viewBox="0 0 1180 1060" role="img" aria-label="Agent Runtime 话轮时序图：话轮管线经 FrontendAdapter 进入 RuntimeV2，路由器驱动快脑出 Plan，grace 门后提交，回执上口，慢脑工具循环，交付等空闲后经统一语音出口三态播出">
+<svg viewBox="0 0 1180 960" role="img" aria-label="Agent Runtime 双路话轮时序图：话轮管线经 FrontendAdapter 双路接管，闲聊路 :6007 生成上口，路由脑 :6009 出计划，RuntimeV2 提交仲裁回执，慢脑执行，交付泵等空闲后经统一语音出口三态播出">
   <defs>
-    <marker id="d7v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
-    <marker id="d7t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+    <marker id="d8v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
+    <marker id="d8t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
   </defs>
 
-  <rect class="bx" x="10" y="16" width="140" height="52" rx="7"/><text class="bt2" x="80" y="38" text-anchor="middle">话轮管线</text><text class="bs" x="80" y="56" text-anchor="middle">pipeline_worker</text>
-  <rect class="bx" x="165" y="16" width="140" height="52" rx="7"/><text class="bt2" x="235" y="38" text-anchor="middle">FrontendAdapter</text><text class="bs" x="235" y="56" text-anchor="middle">窄接入层（只读注入）</text>
-  <rect class="bx" x="325" y="16" width="140" height="52" rx="7"/><text class="bt2" x="395" y="38" text-anchor="middle">路由器</text><text class="bs" x="395" y="56" text-anchor="middle">router.py · 三道守卫</text>
-  <rect class="bx" x="495" y="16" width="140" height="52" rx="7"/><text class="bt2" x="565" y="38" text-anchor="middle">快脑 :6007</text><text class="bs" x="565" y="56" text-anchor="middle">/agent_chat_v2 · /chat</text>
-  <rect class="bx-v2" x="665" y="16" width="140" height="52" rx="7"/><text class="bt2" x="735" y="38" text-anchor="middle" fill="var(--v2)">RuntimeV2</text><text class="bs" x="735" y="56" text-anchor="middle" fill="var(--v2)">Store · 调度 · 交付</text>
-  <rect class="bx" x="835" y="16" width="140" height="52" rx="7"/><text class="bt2" x="905" y="38" text-anchor="middle">慢脑 :6008</text><text class="bs" x="905" y="56" text-anchor="middle">make_v2_runner</text>
-  <rect class="bx" x="995" y="16" width="140" height="52" rx="7"/><text class="bt2" x="1065" y="38" text-anchor="middle">统一语音出口</text><text class="bs" x="1065" y="56" text-anchor="middle">_run_speech_pipeline</text>
+  <rect class="bx" x="10" y="16" width="130" height="52" rx="7"/><text class="bt2" x="75" y="38" text-anchor="middle">话轮管线</text><text class="bs" x="75" y="56" text-anchor="middle">pipeline_worker</text>
+  <rect class="bx" x="175" y="16" width="130" height="52" rx="7"/><text class="bt2" x="240" y="38" text-anchor="middle">FrontendAdapter</text><text class="bs" x="240" y="56" text-anchor="middle">双路 worker</text>
+  <rect class="bx" x="390" y="16" width="130" height="52" rx="7"/><text class="bt2" x="455" y="38" text-anchor="middle">闲聊路 → :6007</text><text class="bs" x="455" y="56" text-anchor="middle">/chat · TEMP 0.9</text>
+  <rect class="bx" x="595" y="16" width="130" height="52" rx="7"/><text class="bt2" x="660" y="38" text-anchor="middle">路由脑 :6009</text><text class="bs" x="660" y="56" text-anchor="middle">五道守卫</text>
+  <rect class="bx-v2" x="785" y="16" width="130" height="52" rx="7"/><text class="bt2" x="850" y="38" text-anchor="middle" fill="var(--v2)">RuntimeV2</text><text class="bs" x="850" y="56" text-anchor="middle" fill="var(--v2)">Store · 调度 · 交付</text>
+  <rect class="bx" x="940" y="16" width="120" height="52" rx="7"/><text class="bt2" x="1000" y="38" text-anchor="middle">慢脑 :6008</text><text class="bs" x="1000" y="56" text-anchor="middle">make_v2_runner</text>
+  <rect class="bx" x="1055" y="16" width="125" height="52" rx="7"/><text class="bt2" x="1117" y="38" text-anchor="middle">统一语音出口</text><text class="bs" x="1117" y="56" text-anchor="middle">三态</text>
 
-  <line class="life" x1="80" y1="68" x2="80" y2="1030"/>
-  <line class="life" x1="235" y1="68" x2="235" y2="1030"/>
-  <line class="life" x1="395" y1="68" x2="395" y2="1030"/>
-  <line class="life" x1="565" y1="68" x2="565" y2="1030"/>
-  <line class="life" x1="735" y1="68" x2="735" y2="1030"/>
-  <line class="life" x1="905" y1="68" x2="905" y2="1030"/>
-  <line class="life" x1="1065" y1="68" x2="1065" y2="1030"/>
+  <line class="life" x1="75" y1="68" x2="75" y2="920"/>
+  <line class="life" x1="240" y1="68" x2="240" y2="920"/>
+  <line class="life" x1="455" y1="68" x2="455" y2="920"/>
+  <line class="life" x1="660" y1="68" x2="660" y2="920"/>
+  <line class="life" x1="850" y1="68" x2="850" y2="920"/>
+  <line class="life" x1="1000" y1="68" x2="1000" y2="920"/>
+  <line class="life" x1="1117" y1="68" x2="1117" y2="920"/>
 
-  <path class="ar ar-v" d="M80,110 H235" marker-end="url(#d7v)"/><text class="lab-v" x="157" y="102" text-anchor="middle">handle_utterance(text, commit_id, gen_sn)</text>
-  <path class="ar ar-v dash" d="M235,152 H80" marker-end="url(#d7v)"/><text class="lab-v" x="157" y="144" text-anchor="middle">return —— worker 结束（gen_sn 已移交，finally 兜底释放）</text>
-  <path class="ar ar-v" d="M235,200 H735" marker-end="url(#d7v)"/><text class="lab-v" x="485" y="192" text-anchor="middle">话轮线程 submit_request（request 幂等落库；内含下面 4 条路由消息）</text>
-  <path class="ar ar-v" d="M735,248 H395" marker-end="url(#d7v)"/><text class="lab-v" x="565" y="240" text-anchor="middle">route_turn（§7.1 快照：历史 + 任务 + 视角，snapshot_version 单调）</text>
-  <path class="ar ar-t" d="M395,292 H565" marker-end="url(#d7t)"/><text class="lab-t" x="480" y="284" text-anchor="middle">/agent_chat_v2 NDJSON 流</text><text class="bs" x="480" y="303" text-anchor="middle">帧 {"v":2,"seq":n} · GEN_LOCK 排队</text>
-  <path class="ar ar-t" d="M565,338 H395" marker-end="url(#d7t)"/><text class="lab-t" x="480" y="330" text-anchor="middle">plan_json</text><text class="bs" x="480" y="349" text-anchor="middle">done.finish_reason=stop 才可提交</text>
-  <path class="ar ar-v" d="M395,384 H735" marker-end="url(#d7v)"/><text class="lab-v" x="565" y="376" text-anchor="middle">Plan（三道守卫通过，图 8）</text><text class="bs" x="565" y="395" text-anchor="middle">失败 → 终态 + ROUTER_FAIL_TEXT，不上任务</text>
-  <path class="ar ar-v thin" d="M235,424 h-20 q-16,5 -16,13 q0,8 16,13 h20" marker-end="url(#d7v)"/><text class="bs" x="260" y="438">grace 门轮询 0.05 s：静默 ≥ turn_grace_ms 才提交；</text><text class="bs" x="260" y="453">abandoned = 续说作废；deadline = grace+5 s</text>
-  <path class="ar ar-v" d="M235,496 H735" marker-end="url(#d7v)"/><text class="lab-v" x="485" y="488" text-anchor="middle">commit_pending（门又关上 → 计划仍挂起，交由下一轮处理）</text>
-  <path class="ar ar-v" d="M735,544 H235" marker-end="url(#d7v)"/><text class="lab-v" x="485" y="536" text-anchor="middle">out.texts（receipt_text 受控回执）+ plan.reply_mode</text>
-  <path class="ar ar-v" d="M235,592 H1065" marker-end="url(#d7v)"/><text class="lab-v" x="650" y="584" text-anchor="middle">speak 桥：回执逐条上口（打断即终态，本轮剩余回执不再上口）</text>
-  <path class="ar ar-v thin" d="M235,632 h-20 q-16,5 -16,13 q0,8 16,13 h20" marker-end="url(#d7v)"/><text class="bs" x="260" y="646">clarify → 澄清话术上口；零回执且非 stop_speech → 「好的。」</text>
-  <path class="ar ar-t" d="M235,684 H565" marker-end="url(#d7t)"/><text class="lab-t" x="400" y="676" text-anchor="middle">表达轮（direct / mixed）：generate_fn → /chat 人设流式</text>
-  <path class="ar ar-t" d="M565,728 H235" marker-end="url(#d7t)"/><text class="lab-t" x="400" y="720" text-anchor="middle">流式分段</text>
-  <path class="ar ar-v" d="M235,768 H1065" marker-end="url(#d7v)"/><text class="lab-v" x="650" y="760" text-anchor="middle">表达轮播出（同一条语音出口）</text>
-  <path class="ar ar-v" d="M735,816 H905" marker-end="url(#d7v)"/><text class="lab-v" x="820" y="808" text-anchor="middle">lease_run（run 围栏）</text><text class="bs" x="820" y="827" text-anchor="middle">僵尸 run 可接管不双跑</text>
-  <path class="ar ar-t thin" d="M905,856 h-20 q-16,5 -16,13 q0,8 16,13 h20" marker-end="url(#d7t)"/><text class="bs" x="870" y="870" text-anchor="end">工具循环：web_search / fetch_page /</text><text class="bs" x="870" y="885" text-anchor="end">get_datetime / calculate（MAX_STEPS=4）</text>
-  <path class="ar ar-t" d="M905,912 H735" marker-end="url(#d7t)"/><text class="lab-t" x="820" y="904" text-anchor="middle">completed / failed / needs_input</text><text class="bs" x="820" y="923" text-anchor="middle">空结果 → failed(outcome=empty)，绝不 completed</text>
-  <path class="ar ar-v thin" d="M735,952 h20 q16,5 16,13 q0,8 -16,13 h-20" marker-end="url(#d7v)"/><text class="bs" x="782" y="966">outbox（至少一次）→ 交付等空闲：</text><text class="bs" x="782" y="984">无生成 ∧ 无播放 ∧ 静默 ≥1.2 s（同一 _agent_can_deliver）</text>
-  <path class="ar ar-v dash thin" d="M235,986 h-20 q-16,5 -16,13 q0,8 16,13 h20" marker-end="url(#d7v)"/><text class="bs" x="260" y="1000">UI 泵（常驻）：1 s 轮询 store.task_panel_rows，diff → task_update</text>
-  <path class="ar ar-v" d="M735,1020 H235" marker-end="url(#d7v)"/><text class="lab-v" x="485" y="1012" text-anchor="middle">结果 / 追问文本（needs_input 绑 question_id）</text>
+  <path class="ar ar-v" d="M75,110 H240" marker-end="url(#d8v)"/><text class="lab-v" x="157" y="102" text-anchor="middle">handle_utterance(text, commit_id, gen_sn)</text>
+  <path class="ar ar-v dash" d="M240,150 H75" marker-end="url(#d8v)"/><text class="lab-v" x="157" y="142" text-anchor="middle">return —— worker 后台接管（finally 兜底释放 gen）</text>
+  <path class="ar ar-v thin" d="M240,178 h-18 q-14,5 -14,12 q0,7 14,12 h18" marker-end="url(#d8v)"/><text class="bs" x="262" y="192">上一话轮处置：窗口内 ≤8 s 合并重路由；窗口外 land 落地（≤5 s 有界等待在途路由）</text>
+  <path class="ar ar-v" d="M240,235 H455" marker-end="url(#d8v)"/><text class="lab-v" x="347" y="227" text-anchor="middle">闲聊路线程启动（grace 门后 chitchat_fn）</text>
+  <path class="ar ar-t thin" d="M455,263 h18 q14,5 14,12 q0,7 -14,12 h-18" marker-end="url(#d8t)"/><text class="bs" x="480" y="277">/chat 流式生成（面板渐进式披露注入）</text>
+  <path class="ar ar-t" d="M455,325 H1117" marker-end="url(#d8t)"/><text class="lab-t" x="780" y="317" text-anchor="middle">首句 ~1 s 流式上口「好嘞，我去查一下」（三态 rc）</text>
+  <path class="ar ar-v" d="M240,375 H660" marker-end="url(#d8v)"/><text class="lab-v" x="450" y="367" text-anchor="middle">submit_request → route_turn（快照 · request_seq 单调）</text>
+  <path class="ar ar-v thin" d="M660,403 h-18 q-14,5 -14,12 q0,7 14,12 h18" marker-end="url(#d8v)"/><text class="bs" x="685" y="417">/agent_chat_v2 · 五道守卫（实测 3.5–4.3 s）</text>
+  <path class="ar ar-v" d="M660,460 H850" marker-end="url(#d8v)"/><text class="lab-v" x="755" y="452" text-anchor="middle">Plan 挂起</text><text class="bs" x="755" y="471" text-anchor="middle">stale 丢弃 · route_stop 断流取消</text>
+  <path class="ar ar-v thin" d="M850,499 h18 q14,5 14,12 q0,7 -14,12 h-18" marker-end="url(#d8v)"/><text class="bs" x="875" y="513">grace 门（同一阈值；门关上 → 挂起交下一轮）</text>
+  <path class="ar ar-v" d="M240,550 H850" marker-end="url(#d8v)"/><text class="lab-v" x="545" y="542" text-anchor="middle">commit_pending(chitchat_spoke)——回执静音仲裁在这里发生</text>
+  <path class="ar ar-v" d="M850,595 H240" marker-end="url(#d8v)"/><text class="lab-v" x="545" y="587" text-anchor="middle">回执文本（受理 / 状态类已静音）；stop-only → chitchat_stop 掐闲聊</text>
+  <path class="ar ar-t" d="M240,640 H1117" marker-end="url(#d8t)"/><text class="lab-t" x="670" y="632" text-anchor="middle">REJECTED / 纠错失败类照播（打断即终态，本轮剩余不再上口）</text>
+  <path class="ar ar-v" d="M850,685 H1000" marker-end="url(#d8v)"/><text class="lab-v" x="925" y="677" text-anchor="middle">lease_run（run 围栏）</text>
+  <path class="ar ar-t thin" d="M1000,713 h-18 q-14,5 -14,12 q0,7 14,12 h18" marker-end="url(#d8t)"/><text class="bs" x="1022" y="727">工具循环：web_search / sports_games / calculate</text>
+  <path class="ar ar-t" d="M1000,770 H850" marker-end="url(#d8t)"/><text class="lab-t" x="925" y="762" text-anchor="middle">completed / failed / needs_input</text><text class="bs" x="925" y="781" text-anchor="middle">空结果 → failed(empty)</text>
+  <path class="ar ar-v thin" d="M850,810 h18 q14,5 14,12 q0,7 -14,12 h-18" marker-end="url(#d8v)"/><text class="bs" x="875" y="824">outbox → 等空闲 ≥1.2 s（独立打断保护在岗）</text>
+  <path class="ar ar-v" d="M850,865 H1117" marker-end="url(#d8v)"/><text class="lab-v" x="975" y="857" text-anchor="middle">交付泵播出结果（单一出口 · 租约 300 s）</text><text class="bs" x="975" y="876" text-anchor="middle">打断 → record_delivery_heard（用户听到部分）</text>
+  <path class="ar ar-v dash thin" d="M240,898 h-18 q-14,5 -14,12 q0,7 14,12 h-18" marker-end="url(#d8v)"/><text class="bs" x="262" y="912">UI 泵（常驻）：1 s 轮询 task_panel_rows，diff → task_update</text>
 </svg>
 <figcaption>
-<b>图 7 · 话轮完整时序。</b>关键设计：① 回执在慢脑启动<b>前</b>上口——"已经安排好了"让用户立刻听到应承，可说性与执行解耦；
-② 持久化先行——operations / runs 落库后才执行，崩溃可追溯；③ grace 门与前端同一阈值、同一份 last_voice_ts，不另起计时器；
-④ 每条路径都有可听终态：回执、澄清、表达轮、无声兜底，任一分支都不会"零语音零日志"地结束一轮。
+<b>图 8 · 双路话轮完整时序。</b>关键设计：① <b>可说性与执行解耦</b>——闲聊路 ~1 s 开口应承，不等路由裁决；
+路由 3.5–4.3 s 只影响任务落库时机，不影响用户听感；② <b>持久化先行</b>——operations / runs 落库后才执行，
+崩溃可追溯；③ grace 门与前端同一阈值、同一份 last_voice_ts，两路共享，不另起计时器；
+④ 每条路径都有可听终态：闲聊路、照播回执、表达轮兜底、无声兜底，任一分支都不会"零语音零日志"地结束一轮。
 </figcaption>
 </figure>
 
-<!-- ================================================================ 7 -->
-<h2 id="s7"><span class="no">§7</span>路由器与三道守卫 + 回执话术模板</h2>
+<!-- ================================================================ 8 -->
+<h2 id="s8"><span class="no">§8</span>路由器与五道守卫 + 回执话术模板</h2>
 <p>
 路由器（<code>agent/router.py</code>）是控制平面唯一的决策入口。每次话轮，它把
-<b>系统提示 + 16 条 few-shot + 截断历史 + 快照渲染</b>发给快脑，要求以一次
-<code>route_turn</code> 工具调用返回 <code>plan_json</code>。主循环是
+<b>系统提示 + 8 条 few-shot + 截断历史 + 快照渲染</b>发给路由脑 :6009，要求以一次
+<code>route_turn</code> 工具调用返回 <code>plan_json</code>（few-shot 从 16 对砍到 8 对是路由提速三件套之一：
+prompt 3.5k → 1.8k token，被砍 8 例的语义全在系统提示硬规则里）。主循环是
 <code>for i in range(1 + repair_attempts)</code>（修复轮 ≤1）：每轮先取计划
-（优先读 route_turn 工具调用参数，文本中的裸 JSON 只作兜底），再依次过三道守卫；
-守卫不过就把纠错提示追加为 user 消息重跑一轮。<b>传输层失败（HTTP 错误、流截断、
-finish_reason≠stop）没有修复资格</b>——直接终态，不上任务，上口固定澄清话术。
+（优先读 route_turn 工具调用参数，文本中的裸 JSON 只作兜底），再依次过五道守卫；
+守卫不过就把纠错提示追加为 user 消息重跑一轮（修复原因上日志 <code>[router] repair 1/1 after: …</code>）。
+<b>传输层失败（HTTP 错误、流截断、finish_reason≠stop）没有修复资格</b>——直接终态，不上任务，上口固定澄清话术。
 </p>
 <p>
-三道守卫顺序固定，全部是<b>纯字符串运算</b>，不增加任何模型调用：
+五道守卫顺序固定，全部是<b>纯字符串运算</b>，不增加任何模型调用；第 ②③④⑤ 道各自来自一起实机事故：
 </p>
 <ol>
 <li><b>格式守卫 parse_plan</b>：schema_version、reply_mode 白名单、操作白名单、
@@ -978,410 +1148,354 @@ finish_reason≠stop）没有修复资格</b>——直接终态，不上任务�
 <li><b>接地守卫 _ungrounded_quote</b>：每个操作的引用（quote）归一化
 （<code>_NORM_RE</code> 去空白与中英文标点）后，必须是<b>本轮用户原文的子串</b>——
 模型不能引用用户没说过的话。evidence 三种写法都收：顶层 <code>quote</code>、
-<code>evidence_quote</code>、嵌套 <code>evidence.quote</code>（few-shot 教的是嵌套形，
-曾长期被解析器静默丢弃，导致接地守卫形同虚设）。</li>
+<code>evidence_quote</code>、嵌套 <code>evidence.quote</code>。指称对象只在上一轮说过
+（本轮只是附和 / 催促）时，操作照出但 <b>quote 留空</b>——留空不声明锚定，放行。</li>
 <li><b>吞句守卫 _stop_only_leftover</b>：整批只有 stop_speech 时，归一化后引用之外的
 原文超过 16 字即判吞句——「等一下等一下……顺便查一下湖人比赛」被吞成 21 秒安静的
 事故由此而来（事故句剩 30 字，正常填充词不到 10 字）。</li>
+<li><b>取消目标守卫 _cancel_targets_ungrounded</b>：取消的破坏力最大（杀运行任务 +
+毒化已完成任务的播报）。目标"被引用" = label 二元字组命中归一化原文，或整句是纯取消话
+（含取消词且去掉取消词 / 指示词 / 语气词后无剩余，如「算了」「那个先取消」）；
+都不满足 → 修复轮 <code>_CANCEL_NOTE</code> → 仍败终态拒绝。scope=all_active 只要求原文含取消词。</li>
+<li><b>get_task 目标守卫 _get_task_target_ungrounded</b>：泛泛追问（「查了吗」「怎么样了」）
+不该指向已完整播报的旧任务。同时满足——label 不命中 ∧ 任务已了结且已播报 / 已取消播报 ∧
+本轮无重播意图（<code>_REPLAY_RE</code>「再讲一遍」类）→ 修复轮 <code>_GET_NOTE</code> → 仍败终态拒绝；
+running / 未播出的目标放行（泛泛追问的天然落点）。</li>
 </ol>
 
 <figure>
-<svg viewBox="0 0 1140 980" role="img" aria-label="路由器守卫流程图：快脑返回计划后依次过传输完整性、严格解析、接地守卫、吞句守卫四道判定，任一不过进入至多一轮的修复重跑，传输故障与修复仍败均为终态">
+<svg viewBox="0 0 1140 1250" role="img" aria-label="路由器守卫流程图：路由脑返回计划后依次过传输完整性、格式、接地、吞句、取消目标、get_task 目标五道判定，任一不过进入至多一轮的修复重跑，传输故障与修复仍败均为终态">
   <defs>
-    <marker id="d8v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
-    <marker id="d8w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+    <marker id="d9v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
+    <marker id="d9w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
   </defs>
 
-  <rect class="bx" x="450" y="30" width="240" height="52" rx="7"/>
-  <text class="bt" x="570" y="51" text-anchor="middle">路由入口 router.route()</text>
-  <text class="bs" x="570" y="70" text-anchor="middle">系统提示 + 16 few-shot + 历史 + 快照</text>
+  <rect class="bx" x="450" y="24" width="240" height="52" rx="7"/>
+  <text class="bt" x="570" y="45" text-anchor="middle">路由入口 router.route()</text>
+  <text class="bs" x="570" y="64" text-anchor="middle">系统提示 + 8 few-shot + 历史 + 快照</text>
 
-  <rect class="bx" x="450" y="120" width="240" height="60" rx="7"/>
-  <text class="bt" x="570" y="142" text-anchor="middle">快脑 /agent_chat_v2</text>
-  <text class="bs" x="570" y="161" text-anchor="middle">route_turn 单工具 · NDJSON 流 · GEN_LOCK</text>
+  <rect class="bx" x="450" y="108" width="240" height="60" rx="7"/>
+  <text class="bt" x="570" y="130" text-anchor="middle">路由脑 :6009 /agent_chat_v2</text>
+  <text class="bs" x="570" y="149" text-anchor="middle">route_turn 单工具 · NDJSON 流 · GEN_LOCK</text>
 
-  <polygon class="bx2" points="570,215 700,270 570,325 440,270"/>
-  <text class="bi" x="570" y="263" text-anchor="middle">传输完整？</text>
-  <text class="bs" x="570" y="281" text-anchor="middle">done.finish_reason=stop</text>
+  <polygon class="bx2" points="570,200 705,252 570,304 435,252"/>
+  <text class="bi" x="570" y="245" text-anchor="middle">传输完整？</text>
+  <text class="bs" x="570" y="263" text-anchor="middle">done.finish_reason=stop</text>
 
-  <rect class="bx-warn" x="760" y="240" width="310" height="60" rx="7"/>
-  <text class="lab-w" x="775" y="263">终态：整批不提交，不上任务</text>
-  <text class="lab-w" x="775" y="284">ROUTER_FAIL_TEXT 上口（固定澄清）</text>
+  <rect class="bx-warn" x="770" y="222" width="310" height="60" rx="7"/>
+  <text class="lab-w" x="782" y="245">终态：整批不提交，不上任务</text>
+  <text class="lab-w" x="782" y="266">ROUTER_FAIL_TEXT 上口（固定澄清）</text>
 
-  <polygon class="bx2" points="570,360 705,410 570,460 435,410"/>
-  <text class="bi" x="570" y="403" text-anchor="middle">① 格式守卫 parse_plan</text>
-  <text class="bs" x="570" y="421" text-anchor="middle">结构 / 长度 / 白名单 / 引用完整性</text>
+  <polygon class="bx2" points="570,344 705,396 570,448 435,396"/>
+  <text class="bi" x="570" y="389" text-anchor="middle">① 格式守卫 parse_plan</text>
+  <text class="bs" x="570" y="407" text-anchor="middle">结构 / 长度 / 白名单 / 引用完整性</text>
 
-  <polygon class="bx2" points="570,495 705,545 570,595 435,545"/>
-  <text class="bi" x="570" y="538" text-anchor="middle">② 接地守卫 _ungrounded_quote</text>
-  <text class="bs" x="570" y="556" text-anchor="middle">quote 归一化后须为本轮原文子串</text>
+  <polygon class="bx2" points="570,486 705,538 570,590 435,538"/>
+  <text class="bi" x="570" y="531" text-anchor="middle">② 接地守卫 _ungrounded_quote</text>
+  <text class="bs" x="570" y="549" text-anchor="middle">quote 归一化后须为本轮原文子串</text>
 
-  <polygon class="bx2" points="570,630 705,680 570,730 435,680"/>
+  <polygon class="bx2" points="570,628 705,680 570,732 435,680"/>
   <text class="bi" x="570" y="673" text-anchor="middle">③ 吞句守卫 _stop_only_leftover</text>
   <text class="bs" x="570" y="691" text-anchor="middle">stop-only 且引用外原文 &gt;16 字</text>
 
-  <rect class="bx-v2" x="450" y="765" width="240" height="72" rx="7"/>
-  <text class="bt" x="570" y="787" text-anchor="middle" fill="var(--v2)">Plan 提交</text>
-  <text class="bs" x="570" y="806" text-anchor="middle" fill="var(--v2)">reply_mode ∈ direct / receipts /</text>
-  <text class="bs" x="570" y="823" text-anchor="middle" fill="var(--v2)">clarify / mixed · 幂等落库</text>
+  <polygon class="bx2" points="570,770 705,822 570,874 435,822"/>
+  <text class="bi" x="570" y="815" text-anchor="middle">④ 取消目标守卫</text>
+  <text class="bs" x="570" y="833" text-anchor="middle">label 二元字组命中 或 纯取消话</text>
 
-  <rect class="bx" x="760" y="735" width="330" height="140" rx="7"/>
-  <text class="bt" x="772" y="758">9 种操作（discriminated union）</text>
-  <text class="bs" x="772" y="780">create_task · amend_task · cancel_tasks</text>
-  <text class="bs" x="772" y="800">rerun_task · get_task · answer_task_question</text>
-  <text class="bs" x="772" y="820">followup_task · runtime_query(datetime)</text>
-  <text class="bs" x="772" y="840">stop_speech</text>
-  <text class="bs" x="772" y="862">amend 只改目标/约束，改不了 status/result</text>
+  <polygon class="bx2" points="570,912 705,964 570,1016 435,964"/>
+  <text class="bi" x="570" y="957" text-anchor="middle">⑤ get_task 目标守卫</text>
+  <text class="bs" x="570" y="975" text-anchor="middle">已了结且已播报 ∧ 无重播词 → 拦</text>
 
-  <rect class="bx2" x="60" y="390" width="300" height="330" rx="7"/>
-  <text class="bt" x="72" y="414">修复轮（≤1）</text>
-  <text class="bs" x="72" y="440">· 纠错提示追加为 user 消息重跑</text>
-  <text class="bs" x="72" y="464">· _REPAIR_NOTE（格式不合法）</text>
-  <text class="bs" x="72" y="488">· _GROUNDING_NOTE（携本轮原文）</text>
-  <text class="bs" x="72" y="512">· _COVERAGE_NOTE（吞句）</text>
-  <text class="bs" x="72" y="536">· 修复一轮仍败 → 终态拒绝</text>
-  <text class="bs" x="72" y="560">· HTTP / 协议故障直接终态，</text>
-  <text class="bs" x="72" y="580">　 不进修复（重试无意义）</text>
-  <text class="bs" x="72" y="610">守卫 = 纯字符串运算，</text>
-  <text class="bs" x="72" y="630">零额外模型调用</text>
+  <rect class="bx-v2" x="450" y="1050" width="240" height="72" rx="7"/>
+  <text class="bt" x="570" y="1072" text-anchor="middle" fill="var(--v2)">Plan 提交</text>
+  <text class="bs" x="570" y="1091" text-anchor="middle" fill="var(--v2)">reply_mode ∈ direct / receipts /</text>
+  <text class="bs" x="570" y="1108" text-anchor="middle" fill="var(--v2)">clarify / mixed · 幂等落库</text>
 
-  <rect class="bx2" x="60" y="870" width="1030" height="88" rx="7"/>
-  <text class="bi" x="72" y="894">实测背景：三道守卫各自来自一起实机事故——传输截断（404 复读）→ 终态不修复；嵌套 evidence.quote 被静默丢弃 → 接地守卫</text>
-  <text class="bi" x="72" y="914">真正生效；「等一下……查湖人比赛」被吞成 stop_speech → 覆盖守卫。路由实测（快脑 Qwen3.5-9B）：单轮 ≈4.8 s，attempts=1。</text>
-  <text class="bs" x="72" y="940">判定顺序即成本顺序：传输与格式是零成本字符串检查，先挡最廉价的失败；接地与吞句需要归一化比对，放最后。</text>
+  <rect class="bx" x="770" y="1020" width="330" height="140" rx="7"/>
+  <text class="bt" x="782" y="1043">9 种操作（discriminated union）</text>
+  <text class="bs" x="782" y="1065">create_task · amend_task · cancel_tasks</text>
+  <text class="bs" x="782" y="1085">rerun_task · get_task · answer_task_question</text>
+  <text class="bs" x="782" y="1105">followup_task · runtime_query(datetime)</text>
+  <text class="bs" x="782" y="1125">stop_speech</text>
+  <text class="bs" x="782" y="1147">amend 只改目标/约束，改不了 status/result</text>
 
-  <path class="ar ar-v" d="M570,82 V120" marker-end="url(#d8v)"/>
-  <path class="ar ar-v" d="M570,180 V215" marker-end="url(#d8v)"/>
-  <path class="ar ar-w" d="M700,270 H760" marker-end="url(#d8w)"/>
-  <text class="lab-w" x="722" y="262" text-anchor="middle">否</text>
-  <path class="ar ar-v" d="M570,325 V360" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="580" y="349">是</text>
-  <path class="ar ar-v dash" d="M435,410 H360" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="397" y="402" text-anchor="middle">否</text>
-  <path class="ar ar-v" d="M570,460 V495" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="580" y="484">是</text>
-  <path class="ar ar-v dash" d="M435,545 H360" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="397" y="537" text-anchor="middle">否</text>
-  <path class="ar ar-v" d="M570,595 V630" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="580" y="619">是</text>
-  <path class="ar ar-v dash" d="M435,680 H360" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="397" y="672" text-anchor="middle">否</text>
-  <path class="ar ar-v" d="M570,730 V765" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="580" y="754">是</text>
-  <path class="ar ar-v" d="M690,800 H760" marker-end="url(#d8v)"/>
-  <path class="ar ar-v dash" d="M210,390 V150 H450" marker-end="url(#d8v)"/>
-  <text class="lab-v" x="300" y="142">携纠错提示重跑（同一请求内）</text>
+  <rect class="bx2" x="60" y="420" width="310" height="440" rx="7"/>
+  <text class="bt" x="72" y="444">修复轮（≤1）</text>
+  <text class="bs" x="72" y="470">· 纠错提示追加为 user 消息重跑</text>
+  <text class="bs" x="72" y="494">· _REPAIR_NOTE（格式不合法）</text>
+  <text class="bs" x="72" y="518">· _GROUNDING_NOTE（携本轮原文）</text>
+  <text class="bs" x="72" y="542">· _COVERAGE_NOTE（吞句）</text>
+  <text class="bs" x="72" y="566">· _CANCEL_NOTE（取消目标不接地）</text>
+  <text class="bs" x="72" y="590">· _GET_NOTE（get_task 指错对象）</text>
+  <text class="bs" x="72" y="614">· 修复原因上日志：</text>
+  <text class="bs" x="72" y="634">　[router] repair 1/1 after: …</text>
+  <text class="bs" x="72" y="662">· 修复一轮仍败 → 终态拒绝</text>
+  <text class="bs" x="72" y="686">· HTTP / 协议故障直接终态，</text>
+  <text class="bs" x="72" y="706">　 不进修复（重试无意义）</text>
+  <text class="bi" x="72" y="740">系统提示硬规则：</text>
+  <text class="bs" x="72" y="764">· 数数 / 算术 / 笑话 / 背诗 =</text>
+  <text class="bs" x="72" y="784">　direct 空操作（不进慢脑）</text>
+  <text class="bs" x="72" y="808">· 面板已有同主题任务必须</text>
+  <text class="bs" x="72" y="828">　get_task，绝不重复 create</text>
+  <text class="bs" x="72" y="852">· goal 只复述本轮原文</text>
+
+  <rect class="bx2" x="60" y="900" width="310" height="130" rx="7"/>
+  <text class="bi" x="72" y="924">守卫 = 纯字符串运算，</text>
+  <text class="bi" x="72" y="944">零额外模型调用</text>
+  <text class="bs" x="72" y="972">设计理念：在保持泛化的基础上</text>
+  <text class="bs" x="72" y="992">用 harness / 框架协议设计让行为</text>
+  <text class="bs" x="72" y="1012">稳定，而不是堆 few-shot。</text>
+
+  <rect class="bx2" x="60" y="1160" width="1040" height="76" rx="7"/>
+  <text class="bi" x="72" y="1184">实测背景：五道守卫各自来自一起实机事故——传输截断（404 复读）→ 终态不修复；嵌套 evidence.quote 被静默丢弃 → 接地守卫</text>
+  <text class="bi" x="72" y="1204">真正生效；「等一下……查湖人比赛」→ 吞句守卫；「你再重新数到十」错取消 [T2 湖人, T3 笑话] → 取消目标守卫；</text>
+  <text class="bi" x="72" y="1224">「哎，你去查了吗」错锚已播报的天气任务全文重播 → get_task 目标守卫。路由实测（:6009 专用实例）：gen 3.5–4.3 s，queue_wait=0。</text>
+
+  <path class="ar ar-v" d="M570,76 V108" marker-end="url(#d9v)"/>
+  <path class="ar ar-v" d="M570,168 V200" marker-end="url(#d9v)"/>
+  <path class="ar ar-w" d="M705,252 H770" marker-end="url(#d9w)"/>
+  <text class="lab-w" x="730" y="244" text-anchor="middle">否</text>
+  <path class="ar ar-v" d="M570,304 V344" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="580" y="329">是</text>
+  <path class="ar ar-v dash" d="M435,396 H370" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="400" y="388" text-anchor="middle">否</text>
+  <path class="ar ar-v" d="M570,448 V486" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="580" y="472">是</text>
+  <path class="ar ar-v dash" d="M435,538 H370" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="400" y="530" text-anchor="middle">否</text>
+  <path class="ar ar-v" d="M570,590 V628" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="580" y="614">是</text>
+  <path class="ar ar-v dash" d="M435,680 H370" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="400" y="672" text-anchor="middle">否</text>
+  <path class="ar ar-v" d="M570,732 V770" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="580" y="756">是</text>
+  <path class="ar ar-v dash" d="M435,822 H370" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="400" y="814" text-anchor="middle">否</text>
+  <path class="ar ar-v" d="M570,874 V912" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="580" y="898">是</text>
+  <path class="ar ar-v dash" d="M435,964 H370" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="400" y="956" text-anchor="middle">否</text>
+  <path class="ar ar-v" d="M570,1016 V1050" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="580" y="1039">是</text>
+  <path class="ar ar-v" d="M690,1085 H770" marker-end="url(#d9v)"/>
+  <path class="ar ar-v dash" d="M215,420 V160 H450" marker-end="url(#d9v)"/>
+  <text class="lab-v" x="300" y="152">携纠错提示重跑（同一请求内）</text>
 </svg>
 <figcaption>
-<b>图 8 · 路由器守卫流程。</b>读图要点：① 传输故障是唯一的"硬终态"——它意味着连计划都拿不到，修复无从谈起；
-② 三道守卫全在快脑输出之后、计划落库之前，任何一道不过都不会产生半执行状态（要么整批提交，要么整批丢弃）；
-③ 修复轮复用同一次请求上下文，纠错提示作为追加 user 消息进入下一轮——模型看到的是"它上一次的输出哪里错了"。
+<b>图 9 · 路由器守卫流程。</b>读图要点：① 传输故障是唯一的"硬终态"——它意味着连计划都拿不到，修复无从谈起；
+② 五道守卫全在路由脑输出之后、计划落库之前，任何一道不过都不会产生半执行状态（要么整批提交，要么整批丢弃）；
+③ 修复轮复用同一次请求上下文，纠错提示作为追加 user 消息进入下一轮——模型看到的是"它上一次的输出哪里错了"；
+④ 判定顺序即成本顺序：传输与格式是零成本字符串检查先挡；④⑤ 两道是温度 0 下 few-shot 先验压过硬规则时的
+结构化兜底——先验改不动，就在出口把关。
 </figcaption>
 </figure>
 
-<h3 id="s7-2">§7.2 受控回执话术模板（receipt_text）</h3>
+<h3 id="s8-2">§8.2 受控回执话术模板（receipt_text）</h3>
 <p>
 回执话术由<b>程序模板</b>生成，不让模型自由解释"操作是否发生"：〈名〉来自经过校验的任务
 label（缺省回退 task_id），模板外的内容不进 TTS。适配层逐条顺序上口，<b>打断即终态</b>，
-本轮剩余回执不再上口。
+本轮剩余回执不再上口。<b>闲聊路活着时，受理 / 状态类回执整批静音</b>（§5 仲裁）——
+下表在实际话路上只剩纠错 / 失败类会播出。
 </p>
 <table>
 <tr><th>触发（outcome / 状态 / reason_code）</th><th>话术模板</th><th>备注</th></tr>
-<tr><td><code>accepted</code>（create_task 受理）</td><td>「〈名〉已经安排好了，稍后告诉你结果。」</td><td>可说性与执行解耦的锚点</td></tr>
+<tr><td><code>accepted</code>（create_task 受理）</td><td>「〈名〉已经安排好了，稍后告诉你结果。」</td><td>闲聊路在场时静音（它自己会应承）</td></tr>
 <tr><td><code>updated</code>（amend_task 生效）</td><td>「好的，〈名〉已经按你说的改了。」</td><td>修订号已推进</td></tr>
 <tr><td><code>cancel_requested</code></td><td>「正在停止〈名〉。」</td><td>停止中，尚未确认</td></tr>
-<tr><td><code>canceled</code></td><td>「〈名〉已经取消了。」</td><td>终态确认</td></tr>
+<tr><td><code>canceled</code></td><td>「〈名〉已经取消了。」</td><td>终态确认；同时掐在途播报</td></tr>
 <tr><td><code>already_completed</code></td><td>「〈名〉刚好已经完成了，结果先不重复说，你需要的话我再讲。」</td><td>避免立即复述长结果</td></tr>
 <tr><td><code>delivery_suppressed</code></td><td>「好的，〈名〉的结果先不说。」</td><td>用户在场压制了结果播报</td></tr>
-<tr><td rowspan="9"><code>info</code>（get_task 按当前状态）</td><td>queued / running：「〈名〉还在进行中，结果出来我就告诉你。」</td><td rowspan="9">只读查询也必须有可听终态——RC_INFO 无模板曾是整轮无声、gen 标志无人释放的事故根因。列表查询（无 target）没有单任务态，交给适配层无声兜底。</td></tr>
+<tr><td rowspan="10"><code>info</code>（get_task 按当前状态）</td><td>queued / running：「〈名〉还在进行中，结果出来我就告诉你。」</td><td rowspan="10">只读查询也必须有可听终态——RC_INFO 无模板曾是整轮无声、gen 标志无人释放的事故根因。列表查询（无 target）没有单任务态，交给适配层无声兜底。</td></tr>
 <tr><td>cancel_requested：「〈名〉正在停止。」</td></tr>
 <tr><td>waiting_input（redelivering）：「刚才的问题我没问完，我再问一次。」</td></tr>
 <tr><td>waiting_input：「〈名〉还差一点信息，稍后我会来问你。」</td></tr>
 <tr><td>completed（redelivering）：「〈名〉已经完成了，我再说一遍结果。」</td></tr>
+<tr><td>completed（already_delivered）：「〈名〉已经查过了，结果刚才也说过啦，想再听就说一声。」</td><td></td></tr>
 <tr><td>completed：「〈名〉已经完成了。」</td></tr>
 <tr><td>failed：「〈名〉没有完成，需要的话我换个方式再试。」</td></tr>
 <tr><td>canceled：「〈名〉已经取消了。」</td></tr>
 <tr><td>其余：「〈名〉的状态我确认过了。」</td></tr>
-<tr><td rowspan="5"><code>rejected</code>（按 reason_code）</td><td>stale_revision：「它的情况刚刚变过，我再确认一下最新状态。」</td><td rowspan="5">拒绝也要说人话：用户听到的是下一步，不是错误码</td></tr>
+<tr><td rowspan="5"><code>rejected</code>（按 reason_code）</td><td>stale_revision：「它的情况刚刚变过，我再确认一下最新状态。」</td><td rowspan="5">拒绝也要说人话：用户听到的是下一步，不是错误码。REJECTED 绝不被闲聊路静音</td></tr>
 <tr><td>unknown_task：「我没有找到你说的那个任务。」</td></tr>
 <tr><td>ambiguous：「你说的任务我不太确定是哪一个，能再说下名字吗？」</td></tr>
 <tr><td>queue_full：「现在排队的任务有点多，这个先没受理。」</td></tr>
 <tr><td>其余：「这项操作没有提交成功。」</td></tr>
-<tr><td>路由失败 / 轮 worker 崩溃（适配层）</td><td>「这个我一时没理清要做什么，你能再说一遍吗？」</td><td>终态兜底，队列已释放</td></tr>
-<tr><td>无声兜底（适配层）</td><td>「好的。」</td><td>计划已提交但零回执（且非 stop_speech）时补一口确认</td></tr>
+<tr><td>路由失败 / 轮 worker 崩溃（适配层）</td><td>「这个我一时没理清要做什么，你能再说一遍吗？」</td><td>终态兜底，队列已释放；闲聊路活着时不说</td></tr>
+<tr><td>无声兜底（适配层）</td><td>「好的。」</td><td>计划已提交但零回执（且非 stop_speech、闲聊路不在场）时补一口确认</td></tr>
 </table>
-
-<!-- ================================================================ 8 -->
-<h2 id="s8"><span class="no">§8</span>任务与交付生命周期（状态机 + 重播重入）</h2>
-<p>
-任务（做什么）与交付（什么时候说）是两条独立的状态机：任务停在 <code>completed</code>
-不代表结果已经说出口——交付链自己走 <code>pending → rendering → sending</code>，并落进
-三种可听语义之一。两条链通过 outbox（至少一次）衔接。
-</p>
-
-<figure>
-<svg viewBox="0 0 1140 790" role="img" aria-label="任务与交付双状态机：任务链 queued 到 completed、failed、waiting_input 并可经回答回到 queued；交付链 pending 到 rendering、sending 后落 played_confirmed、sent_unconfirmed 或 interrupted_partial，未听到的终态可被 get_task 重播重入回到 pending">
-  <defs>
-    <marker id="d9v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
-    <marker id="d9c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-c"/></marker>
-    <marker id="d9w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
-  </defs>
-
-  <text class="bi" x="60" y="42">任务链 execution_status（tasks · task_revisions，revision 单调）</text>
-
-  <rect class="bx" x="70" y="80" width="120" height="48" rx="7"/><text class="bt2" x="130" y="109" text-anchor="middle">queued</text>
-  <rect class="bx" x="260" y="80" width="120" height="48" rx="7"/><text class="bt2" x="320" y="109" text-anchor="middle">running</text>
-  <rect class="bx" x="560" y="40" width="130" height="48" rx="7"/><text class="bt2" x="625" y="69" text-anchor="middle">completed</text>
-  <rect class="bx" x="560" y="110" width="130" height="48" rx="7"/><text class="bt2" x="625" y="139" text-anchor="middle">failed</text>
-  <rect class="bx" x="560" y="180" width="130" height="48" rx="7"/><text class="bt2" x="625" y="209" text-anchor="middle">waiting_input</text>
-  <rect class="bx" x="245" y="170" width="150" height="48" rx="7"/><text class="bt2" x="320" y="199" text-anchor="middle">cancel_requested</text>
-  <rect class="bx" x="560" y="250" width="130" height="48" rx="7"/><text class="bt2" x="625" y="279" text-anchor="middle">canceled</text>
-
-  <rect class="bx2" x="760" y="150" width="330" height="112" rx="7"/>
-  <text class="bi" x="772" y="174">其他状态：</text>
-  <text class="bs" x="772" y="196">superseded — 被 amend 后的新版本取代</text>
-  <text class="bs" x="772" y="216">blocked_dependency — 依赖未完成，先挂起</text>
-  <text class="bs" x="772" y="236">amend_task 不原地改：写新 revision 重新排队</text>
-
-  <path class="ar ar-v" d="M190,104 H260" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="225" y="96" text-anchor="middle">调度 lease</text>
-  <path class="ar ar-v" d="M380,90 H460 V64 H560" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="508" y="58" text-anchor="middle">结果落库</text>
-  <path class="ar ar-v" d="M380,104 H540 V134 H560" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="400" y="166" text-anchor="middle">空结果 → failed(empty)</text>
-  <path class="ar ar-v" d="M380,118 H500 V204 H560" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="420" y="244" text-anchor="middle">缺信息 → 绑 question_id</text>
-  <path class="ar ar-v" d="M320,128 V170" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="330" y="156">cancel_tasks</text>
-  <path class="ar ar-v" d="M320,218 V328 H610 V298" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="455" y="322" text-anchor="middle">确认后</text>
-  <path class="ar ar-v dash" d="M625,228 V350 H130 V128" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="390" y="343">answer_task_question → 新 revision 重新排队</text>
-
-  <text class="bi" x="60" y="402">交付链 delivery_status（deliveries · outbox，等空闲 ≥1.2 s 才起播）</text>
-
-  <rect class="bx" x="70" y="440" width="130" height="48" rx="7"/><text class="bt2" x="135" y="469" text-anchor="middle">pending</text>
-  <rect class="bx" x="250" y="440" width="130" height="48" rx="7"/><text class="bt2" x="315" y="469" text-anchor="middle">rendering</text>
-  <rect class="bx" x="430" y="440" width="130" height="48" rx="7"/><text class="bt2" x="495" y="469" text-anchor="middle">sending</text>
-  <rect class="bx" x="680" y="370" width="180" height="48" rx="7"/>
-  <text class="bt2" x="770" y="392" text-anchor="middle">played_confirmed</text>
-  <text class="lab-c" x="770" y="408" text-anchor="middle">True · 服务端估计</text>
-  <rect class="bx" x="680" y="440" width="180" height="48" rx="7"/><text class="bt2" x="770" y="469" text-anchor="middle">sent_unconfirmed</text>
-  <rect class="bx-warn" x="680" y="510" width="180" height="48" rx="7"/>
-  <text class="bt2" x="770" y="532" text-anchor="middle">interrupted_partial</text>
-  <text class="lab-w" x="770" y="548" text-anchor="middle">False · 听了一半</text>
-
-  <rect class="grp" x="240" y="600" width="620" height="70" rx="7"/>
-  <text class="bi" x="252" y="622">「从未听到 / 没听全」终态（_DLV_REOPEN_FROM）</text>
-  <text class="bs" x="252" y="644">interrupted_before_audio（开播前被打断） · retry_exhausted（重试 ≤3 耗尽） · suppressed（在场压制） · interrupted_partial（听了一半）</text>
-
-  <path class="ar ar-v" d="M200,464 H250" marker-end="url(#d9v)"/>
-  <path class="ar ar-v" d="M380,464 H430" marker-end="url(#d9v)"/>
-  <path class="ar ar-c" d="M560,452 H640 V394 H680" marker-end="url(#d9c)"/>
-  <text class="lab-c" x="620" y="386" text-anchor="middle">完整播出</text>
-  <path class="ar ar-v" d="M560,464 H680" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="620" y="456" text-anchor="middle">无确认</text>
-  <path class="ar ar-w" d="M560,476 H640 V534 H680" marker-end="url(#d9w)"/>
-  <text class="lab-w" x="622" y="530" text-anchor="middle">播出后打断</text>
-  <path class="ar ar-w dash" d="M545,488 V600" marker-end="url(#d9w)"/>
-  <text class="lab-w" x="553" y="560">失败重试</text>
-  <path class="ar ar-v dash" d="M690,64 H705 V390 H135 V440" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="420" y="382" text-anchor="middle">结果排 outbox（至少一次）→ 等空闲起播</text>
-  <path class="ar ar-v dash" d="M240,635 H135 V488" marker-end="url(#d9v)"/>
-  <text class="lab-v" x="155" y="565">get_task 点名重听 → _redeliver_unheard：</text>
-  <text class="lab-v" x="155" y="583">重开交付行 + 复用原文 payload 重排；在途不双排，played 不重播</text>
-
-  <rect class="bx2" x="60" y="700" width="1030" height="72" rx="7"/>
-  <text class="bi" x="72" y="724">关键语义：交付终态只拦「自动重试」——用户点名重听（get_task）仍可重开「从未听到」的交付；played_confirmed 是服务端估计（无播放 ACK）。</text>
-  <text class="bs" x="72" y="748">waiting_input 的追问同样走交付链（kind=question，绑定 question_id，仅 waiting_input 态有效）；结果与追问共享 outbox 的至少一次语义（重试 ≤3）。</text>
-</svg>
-<figcaption>
-<b>图 9 · 任务与交付双状态机。</b>读图要点：① <code>completed</code> 只意味着"查完了"，用户听到与否由交付链独立记录；
-② 三态语义贯穿到底：True=完整播出（服务端估计）、False=播出后打断（终态）、None=从未起播（可重试）；
-③ 重播重入是用户权利——任务结果只要没被完整听到，get_task 就能点名重听，运行时重开交付行并复用原文 payload，不重新生成。
-</figcaption>
-</figure>
 
 <!-- ================================================================ 9 -->
-<h2 id="s9"><span class="no">§9</span>模块树与 SQLite 持久层</h2>
+<h2 id="s9"><span class="no">§9</span>任务与交付生命周期：单一出口 · 三态证据 · 重播重入</h2>
 <p>
-控制平面收敛在 <code>agent/</code> 包内，<b>纯标准库</b>（sqlite3 内置），不 import 任何语音
-客户端栈——这意味着路由、守卫、状态机、重入全部可以在无 GPU 环境下离线测试。语音前端与
-控制平面的全部耦合都在 <code>app.py</code> 的工厂函数里以回调注入完成。
+调度与交付分离：慢脑只负责把任务跑到终态（completed / failed / waiting_input），
+结果<b>何时、如何</b>到达用户耳朵是交付泵（<code>agent/delivery.py</code>）的职责。
+泵每次开口走 <code>speak_fn(envelope, text, stop_event)</code>，返回值三态与语音前端
+<code>_run_speech_pipeline</code> 的约定逐条对齐（语音前端本身不动）：
+<b>True</b> 完整播出 → <code>sent_unconfirmed → played_confirmed</code>（发射侧估计）；
+<b>False</b> 播出后被打断 → <code>interrupted_partial</code>，终态，不自动重播；
+<b>None</b> 一个字没播 → 静默重试 ≤3，耗尽 → <code>retry_exhausted</code>（不写 delivered，结果仍可查询）。
+不可送达（话权被占）时有界等待 2 s 后归还 outbox，不硬抢话轮。
+</p>
+<p>
+<b>单一出口（2026-11-07 根修）</b>：结果播报的唯一出口是交付泵。闲聊路上下文不注入
+结果原文（§8.1 渐进式披露），闲聊路无文本可复述——机制从根上消灭"闲聊路说一遍、
+泵又播一遍"的复读；用户说"再讲一遍"只能由泵兑现（重排 deliver），闲聊路不代劳。
+唯一例外是<b>窄版 voiced_by_lane（2026-11-09）</b>：「讲个笑话」被建成任务后，慢脑
+零工具自产另一个笑话，结果在面板挂"待播报"1 分 54 秒（泵让路），闲聊路只能当场
+和稀泥。根修：创建轮闲聊路亲口说过（creation_voiced 事件）∧ 完成的 run 零工具调用
+∧ 该任务首个 run，三条件同时成立 → 结果视同已播报，泵不入队。
+零工具是判别器——天气 / 体育类查询必带工具，照常走泵；首 run 条件防 rerun / amend
+（第二次执行必带上下文）被误杀。
+</p>
+<p>
+<b>重播重入（2026-11-09 收紧）</b>：get_task 显式追问时分两种语义——
+<code>_request_wants_replay</code> 查本轮原文是否含重播词（「再讲一遍 / 重新 / 一遍」类）：
+纯状态问句（「查了吗」「怎么样了」）对已完整播出的结果<b>不重播</b>，回执
+already_delivered「结果刚才也说过啦，想再听就说一声」；带重播词才
+<code>_reopen_delivery</code> 重开重排（重开白名单 7 态：interrupted×2 / retry_exhausted /
+suppressed / sent_unconfirmed / played_confirmed / voiced_by_lane）。用户没听过的结果
+（打断 / 重试耗尽）无需重播词照常重排——欠的账总要还。
+</p>
+<p>
+<b>取消抑制与掐音</b>：cancel_tasks 落在已 completed 任务 → 置 <code>cancel_intent=1</code>，
+两道 SpeechEnvelope 校验（valid_for 对 result 类）都拒绝 → 交付落 suppressed；
+同时 <code>stop_speaking_for_task / stop_speaking</code> 跨线程置 stop_event
+<b>掐掉在途播报</b>（泵线程被 speak_fn 占住，走队列 stop_speech 轮不到自己）；
+<code>_cut_speech_for_cancels</code> 在 commit / land 后扫回执，单目标掐该任务、
+all_active 掐会话当前在播。面板渲染「结果已取消播报」（绝不吊人）；get_task 重播清回标记。
 </p>
 
 <figure>
-<svg viewBox="0 0 1120 700" role="img" aria-label="模块树：app.py 与快脑服务在上，agent 包内九个模块按职责分列，右侧 SQLite 持久层按会话、任务、执行、交付、观测分域，底部为提交演进时间线">
+<svg viewBox="0 0 1160 1230" role="img" aria-label="任务交付生命周期图：慢脑完成后经三条件判定入队或视同已播报，交付泵驱动 pending-rendering-sending-sent_unconfirmed-played_confirmed 状态机，打断与静默重试落终态，下方四个专题框说明重播重入、取消抑制、防重租约与 delivery_heard 记账">
   <defs>
     <marker id="d10v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
-    <marker id="d10t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+    <marker id="d10c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-c"/></marker>
+    <marker id="d10w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
   </defs>
 
-  <rect class="bx" x="40" y="40" width="300" height="76" rx="7"/>
-  <text class="bt" x="52" y="62">app.py — 语音前端 + Runtime 接线</text>
-  <text class="bs" x="52" y="84">· _make_agent_v2 工厂：回调注入</text>
-  <text class="bs" x="52" y="104">· _begin_generation / _end_generation（gen_sn）</text>
+  <rect class="bx" x="40" y="16" width="230" height="64" rx="7"/>
+  <text class="bt" x="155" y="40" text-anchor="middle">慢脑 run 终态</text>
+  <text class="bs" x="155" y="60" text-anchor="middle">completed / failed / waiting_input</text>
 
-  <rect class="bx" x="370" y="40" width="310" height="76" rx="7"/>
-  <text class="bt" x="382" y="62">qwen35_fused_server.py — 快脑 :6007</text>
-  <text class="bs" x="382" y="84">· /chat 人设流式（表达轮）· GEN_LOCK</text>
-  <text class="bs" x="382" y="104">· /agent_chat_v2 NDJSON（路由）· _TagSplitter</text>
+  <polygon class="bx2" points="505,16 635,80 505,144 375,80"/>
+  <text class="bi" x="505" y="70" text-anchor="middle">三条件同时成立？</text>
+  <text class="bs" x="505" y="88" text-anchor="middle">闲聊路亲口说过 ∧ 零工具</text>
+  <text class="bs" x="505" y="104" text-anchor="middle">∧ 该任务首个 run</text>
 
-  <rect class="grp" x="40" y="136" width="640" height="436" rx="9"/>
-  <text class="bi" x="52" y="158">agent/ —— 控制平面包（纯 stdlib，不 import 语音栈）</text>
+  <rect class="bx2" x="710" y="30" width="280" height="92" rx="7"/>
+  <text class="bt" x="722" y="52">DLV_VOICED_BY_LANE（窄版）</text>
+  <text class="bs" x="722" y="74">泵不入队 · 面板视同已播报</text>
+  <text class="bs" x="722" y="92">零工具=判别器：查询类必带工具</text>
+  <text class="bs" x="722" y="110">首 run 条件防 rerun / amend 误杀</text>
 
-  <rect class="bx" x="60" y="170" width="290" height="66" rx="7"/>
-  <text class="bt2" x="72" y="192">contracts.py</text>
-  <text class="bs" x="72" y="212">· 9 操作判别联合 · parse_plan 严格校验</text>
-  <text class="bs" x="72" y="228">· receipt_text 模板 · evidence 三种写法</text>
+  <rect class="bx" x="375" y="190" width="260" height="64" rx="7"/>
+  <text class="bt" x="505" y="212" text-anchor="middle">outbox · kind=deliver 排队</text>
+  <text class="bs" x="505" y="234" text-anchor="middle">payload=结果原文（重播复用同一份）</text>
 
-  <rect class="bx" x="60" y="248" width="290" height="66" rx="7"/>
-  <text class="bt2" x="72" y="270">router.py</text>
-  <text class="bs" x="72" y="290">· 16 few-shot · 三道守卫 · 修复轮 ≤1</text>
-  <text class="bs" x="72" y="306">· _NORM_RE 归一化 · route_turn 单工具</text>
+  <rect class="bx-v2" x="710" y="190" width="280" height="64" rx="7"/>
+  <text class="bt" x="850" y="212" text-anchor="middle" fill="var(--v2)">交付泵 claim_outbox（limit=4）</text>
+  <text class="bs" x="850" y="234" text-anchor="middle" fill="var(--v2)">deliver 项租约 300 s · 带 lease_expires_at</text>
 
-  <rect class="bx" x="60" y="326" width="290" height="46" rx="7"/>
-  <text class="bt2" x="72" y="348">context.py</text>
-  <text class="bs" x="72" y="364">· 快照构建 · snapshot_version 单调</text>
+  <rect class="bx" x="100" y="300" width="240" height="72" rx="7"/>
+  <text class="bt" x="220" y="322" text-anchor="middle">pending（等待话权）</text>
+  <text class="bs" x="220" y="344" text-anchor="middle">can_deliver_fn 有界等待 2 s</text>
+  <text class="bs" x="220" y="362" text-anchor="middle">不可送达 → 归还 outbox 重试</text>
 
-  <rect class="bx" x="60" y="386" width="290" height="110" rx="7"/>
-  <text class="bt2" x="72" y="408">store.py — SQLite 持久层</text>
-  <text class="bs" x="72" y="428">· 10 表 · outbox · run lease</text>
-  <text class="bs" x="72" y="444">· _redeliver_unheard 重播重入</text>
-  <text class="bs" x="72" y="460">· task_panel_rows 面板视图</text>
-  <text class="bs" x="72" y="476">· 不删历史证据</text>
+  <rect class="bx" x="100" y="420" width="240" height="72" rx="7"/>
+  <text class="bt" x="220" y="442" text-anchor="middle">rendering（TTS）</text>
+  <text class="bs" x="220" y="464" text-anchor="middle">开口前按 SpeechEnvelope + 快照核验</text>
+  <text class="bs" x="220" y="482" text-anchor="middle">（改口 / 取消 / 旧修订不播）</text>
 
-  <rect class="bx" x="370" y="170" width="290" height="66" rx="7"/>
-  <text class="bt2" x="382" y="192">runtime.py — AgentRuntimeV2</text>
-  <text class="bs" x="382" y="212">· submit_request / commit_pending</text>
-  <text class="bs" x="382" y="228">· 事件信封 · SpeechEnvelope 有效性</text>
+  <rect class="bx" x="100" y="540" width="240" height="64" rx="7"/>
+  <text class="bt" x="220" y="562" text-anchor="middle">sending（播出中）</text>
+  <text class="bs" x="220" y="584" text-anchor="middle">speak_fn(delivery_protect=True) 三态</text>
 
-  <rect class="bx" x="370" y="248" width="290" height="66" rx="7"/>
-  <text class="bt2" x="382" y="270">scheduler.py</text>
-  <text class="bs" x="382" y="290">· run lease 围栏 · 僵尸接管</text>
-  <text class="bs" x="382" y="306">· needs_input → question 交付</text>
+  <rect class="bx" x="100" y="650" width="240" height="48" rx="7"/>
+  <text class="bt" x="220" y="670" text-anchor="middle">sent_unconfirmed</text>
+  <text class="bs" x="220" y="688" text-anchor="middle">发射侧估计</text>
 
-  <rect class="bx" x="370" y="326" width="290" height="46" rx="7"/>
-  <text class="bt2" x="382" y="348">delivery.py</text>
-  <text class="bs" x="382" y="364">· 三态 · 重试 ≤3 · 等空闲起播</text>
+  <rect class="bx-v2" x="100" y="740" width="240" height="56" rx="7"/>
+  <text class="bt" x="220" y="762" text-anchor="middle" fill="var(--v2)">played_confirmed</text>
+  <text class="bs" x="220" y="782" text-anchor="middle" fill="var(--v2)">用户已听到（delivered）</text>
 
-  <rect class="bx" x="370" y="386" width="290" height="110" rx="7"/>
-  <text class="bt2" x="382" y="408">frontend_adapter.py — 窄接入层</text>
-  <text class="bs" x="382" y="428">· grace 门轮询 0.05 s · _speak_safe</text>
-  <text class="bs" x="382" y="444">· 表达轮 generate_fn · 澄清上口</text>
-  <text class="bs" x="382" y="460">· UI 泵 1 s diff → task_update</text>
-  <text class="bs" x="382" y="476">· 无声兜底 · finally 释放 gen_sn</text>
+  <rect class="bx-warn" x="470" y="515" width="320" height="48" rx="7"/>
+  <text class="lab-w" x="482" y="536">interrupted_before_audio（终态）</text>
+  <text class="lab-w" x="482" y="554">一个字都没播 · 计入静默重试</text>
 
-  <rect class="bx" x="60" y="510" width="600" height="50" rx="7"/>
-  <text class="bt2" x="72" y="530">slow_brain.py — make_v2_runner 事件信封 · 空结果 → failed(empty)</text>
-  <text class="bs" x="72" y="548">tools.py — web_search · fetch_page · get_datetime · calculate（AST 白名单）</text>
+  <rect class="bx-warn" x="470" y="600" width="320" height="64" rx="7"/>
+  <text class="lab-w" x="482" y="622">interrupted_partial（终态）</text>
+  <text class="lab-w" x="482" y="640">打断即终态 · 不自动重播</text>
+  <text class="lab-w" x="482" y="658">heard=用户实际听到部分（delivery_heard）</text>
 
-  <rect class="bx" x="710" y="40" width="370" height="86" rx="7"/>
-  <text class="bt2" x="722" y="62">SQLite 持久层（每连接一库）</text>
-  <text class="bs2" x="722" y="82">checkpoints/agent_v2/{sha1(client_id)[:16]}.sqlite3</text>
-  <text class="bs" x="722" y="104">全新库 · 无迁移负担 · 崩溃可完整追溯</text>
+  <rect class="bx-warn" x="470" y="700" width="320" height="48" rx="7"/>
+  <text class="lab-w" x="482" y="721">retry_exhausted</text>
+  <text class="lab-w" x="482" y="739">静默重试 3 次耗尽 · 结果仍可查询</text>
 
-  <rect class="bx2" x="710" y="142" width="370" height="430" rx="7"/>
-  <text class="bi" x="722" y="166">表分域</text>
-  <text class="bi" x="722" y="192">会话域</text>
-  <text class="bs" x="722" y="210">requests（幂等）· operations（流水）</text>
-  <text class="bi" x="722" y="238">任务域</text>
-  <text class="bs" x="722" y="256">tasks · task_revisions（revision 单调）</text>
-  <text class="bi" x="722" y="284">执行域</text>
-  <text class="bs" x="722" y="302">runs（lease）· events（信封）· tool_calls</text>
-  <text class="bi" x="722" y="330">交付域</text>
-  <text class="bs" x="722" y="348">deliveries（三态）· outbox（至少一次）</text>
-  <text class="bi" x="722" y="376">观测</text>
-  <text class="bs" x="722" y="394">route_log（attempts / 延迟 / 守卫结果）</text>
-  <text class="bs" x="722" y="422">meta · sessions（closed 标记先落再关）</text>
-  <text class="bi" x="722" y="452">task_panel_rows —— 面板只读视图</text>
-  <text class="bs" x="722" y="470">UI 泵轮询它做 diff，不进控制平面</text>
-  <text class="bs" x="722" y="502">不删任何历史证据（失败 / 拒绝也留痕）</text>
+  <rect class="bx-warn" x="470" y="780" width="320" height="56" rx="7"/>
+  <text class="lab-w" x="482" y="802">suppressed（cancel_intent）</text>
+  <text class="lab-w" x="482" y="820">改口后旧结果不再播 · 重播词可重开</text>
 
-  <rect class="bx2" x="40" y="594" width="1040" height="84" rx="7"/>
-  <text class="bi" x="52" y="618">演进（dev）：e9db8e0 contracts → cd1642a store → e650ede tools → a31a630 scheduler/delivery/runtime → e107f14 /agent_chat_v2 → 3ad4cb7 router</text>
-  <text class="bi" x="52" y="640">8f2fc17 adapter + app 集成 → 49e6e1c 设置面板 → 3a8dfae 卡死三连修 → a7249e4 重播重入 + 接地 → b7153f1 吞句守卫 + UI 泵 → d16f313 冒烟更正</text>
-  <text class="bs" x="52" y="664">voice 前端模块（pvad_stream.py / 双轨录音 / 五层防御）不在本图——它们属于 §2–§4 的语音路径，与控制平面只通过回调边界相接。</text>
+  <rect class="bx2" x="40" y="880" width="540" height="200" rx="7"/>
+  <text class="bi" x="52" y="904">重播重入（get_task 显式追问 · 2026-11-09 收紧）</text>
+  <text class="bs" x="52" y="928">· _request_wants_replay：本轮原文含重播词（再讲一遍 / 重新 / 一遍…）</text>
+  <text class="bs" x="52" y="948">· 无重播词 ∧ 已完整播出（sent_unconfirmed / played_confirmed /</text>
+  <text class="bs" x="52" y="968">　 voiced_by_lane）→ 返回 "already"：不重排，already_delivered 回执</text>
+  <text class="bs" x="52" y="988">　 「结果刚才也说过啦，想再听就说一声」</text>
+  <text class="bs" x="52" y="1008">· 有重播词 → _reopen_delivery：重开白名单 7 态 → pending，复用 done</text>
+  <text class="bs" x="52" y="1028">　 payload 重排；voiced_by_lane 从未入队 → 从 completed 事件合成</text>
+  <text class="bs" x="52" y="1048">· 用户没听过（interrupted ×2 / retry_exhausted）→ 无需重播词照常重排</text>
+  <text class="bs" x="52" y="1068">· 抑制中（cancel_intent）→ 重播清回标记；amend / rerun 修订本就重置</text>
 
-  <path class="ar ar-v" d="M190,116 V136" marker-end="url(#d10v)"/>
-  <path class="ar ar-t" d="M525,136 V116" marker-end="url(#d10t)"/>
-  <text class="bs" x="537" y="130">NDJSON / 流式</text>
+  <rect class="bx2" x="620" y="880" width="500" height="200" rx="7"/>
+  <text class="bi" x="632" y="904">取消抑制与掐在途播报（cancel_intent）</text>
+  <text class="bs" x="632" y="928">· cancel_tasks 落在已 completed 任务 → 置 cancel_intent=1</text>
+  <text class="bs" x="632" y="948">· SpeechEnvelope.valid_for：result 类拒绝（两道信封校验都拦）</text>
+  <text class="bs" x="632" y="968">· set_delivery_state → suppressed；同态幂等：state==cur 直接 return</text>
+  <text class="bs" x="632" y="988">· stop_speaking_for_task(task) / stop_speaking(session)：跨线程置</text>
+  <text class="bs" x="632" y="1008">　 stop_event 掐在途播报（泵被 speak_fn 占住，stop_speech 轮不到自己）</text>
+  <text class="bs" x="632" y="1028">· _cut_speech_for_cancels：commit / land 后扫回执，单目标掐该任务、</text>
+  <text class="bs" x="632" y="1048">　 all_active 掐会话当前在播；面板渲染「结果已取消播报」</text>
+
+  <rect class="bx2" x="40" y="1100" width="540" height="116" rx="7"/>
+  <text class="bi" x="52" y="1124">防重与租约（at-least-once）</text>
+  <text class="bs" x="52" y="1148">· record_delivery 身份去重；重复 deliver 项见 _DLV_ALREADY_HANDLED（8 终态）</text>
+  <text class="bs" x="52" y="1168">　 直接收尾不重渲染不重播；complete_outbox token 失配 → warning 不崩</text>
+  <text class="bs" x="52" y="1188">· deliver 项租约 300 s：默认 30 s 会在长播报中途过期（e2e attempts=58 崩溃循环）；泵真死 300 s 后自愈</text>
+
+  <rect class="bx2" x="620" y="1100" width="500" height="116" rx="7"/>
+  <text class="bi" x="632" y="1124">delivery_heard：用户实际听到什么</text>
+  <text class="bs" x="632" y="1148">· 播完 / 打断都记 delivery_heard 事件（heard[:400]，按 seq 每任务最新）</text>
+  <text class="bs" x="632" y="1168">· 打断时 rc=False → 读 session.last_partial_spoken（线程 ident 防串门）</text>
+  <text class="bs" x="632" y="1188">· task_panel_rows 暴露 heard / interrupted / suppressed；voiced_by_lane 也算已播报</text>
+
+  <path class="ar ar-v" d="M270,48 H322 V80 H375" marker-end="url(#d10v)"/>
+  <path class="ar ar-v" d="M635,80 H710" marker-end="url(#d10v)"/>
+  <text class="lab-v" x="668" y="72" text-anchor="middle">是</text>
+  <path class="ar ar-v" d="M505,144 V190" marker-end="url(#d10v)"/>
+  <text class="lab-v" x="515" y="172">否（查询类照常走泵）</text>
+  <path class="ar ar-v" d="M635,222 H710" marker-end="url(#d10v)"/>
+  <path class="ar ar-v" d="M850,254 V336 H340" marker-end="url(#d10v)"/>
+  <path class="ar ar-v" d="M220,372 V420" marker-end="url(#d10v)"/>
+  <path class="ar ar-v" d="M220,492 V540" marker-end="url(#d10v)"/>
+  <path class="ar ar-v" d="M220,604 V650" marker-end="url(#d10v)"/>
+  <text class="lab-v" x="228" y="632">True 完整播出</text>
+  <path class="ar ar-v" d="M220,698 V740" marker-end="url(#d10v)"/>
+  <path class="ar ar-w" d="M340,555 H470" marker-end="url(#d10w)"/>
+  <text class="lab-w" x="405" y="547" text-anchor="middle">None</text>
+  <path class="ar ar-w" d="M340,578 H415 V632 H470" marker-end="url(#d10w)"/>
+  <text class="lab-w" x="405" y="570" text-anchor="middle">False</text>
+  <path class="ar ar-c dash" d="M340,590 H360 V724 H470" marker-end="url(#d10c)"/>
+  <text class="lab-c" x="352" y="660">静默重试 ≤3</text>
+  <path class="ar ar-w dash" d="M700,836 V880" marker-end="url(#d10w)"/>
 </svg>
 <figcaption>
-<b>图 10 · 模块树与持久层。</b>读图要点：① 语音前端对控制平面的全部知识就是一个工厂函数的回调清单——
-换掉 adapter 之外的任何东西都不需要动 app.py；② store 是唯一事实源，其余模块都是它周围的纯逻辑；
-③ 每连接一个全新 SQLite 库，无迁移、无跨会话污染，连接关闭先落 closed 标记再关连接。
+<b>图 10 · 任务交付生命周期。</b>读图要点：① 结果到达用户耳朵的唯一路径是交付泵——
+慢脑只负责把任务跑到终态，何时开口、被打断怎么记账、「再讲一遍」怎么兑现全是泵的职责；
+② speak_fn 三态（True / False / None）与语音前端 _run_speech_pipeline 的返回约定逐条对齐，
+语音前端本身不动；③ 窄版 voiced_by_lane 只放行"模型自产内容"（零工具调用的笑话 / 寒暄类），
+查询类结果照常走泵——单一出口原则不破，且它在重开白名单内，显式追问仍可兑现；
+④ 显式追问的语义分裂：状态问句只报状态（already_delivered 回执），重播词才重开重排——
+「查了吗」不该换来整段结果复述。⑤ suppressed → suppressed 同态写曾抛 StoreError 炸在
+complete_outbox 前（e2e 取消竞态），同态幂等后多写者收敛合法。
 </figcaption>
 </figure>
-
-<!-- ================================================================ 10 -->
-<h2 id="s10"><span class="no">§10</span>服务矩阵与部署</h2>
-<table>
-<tr><th>服务</th><th>端口 / GPU</th><th>角色</th></tr>
-<tr><td>turn server</td><td>:8000 · GPU5</td><td>语音前端：0.6B 流式轮次判别、五道毛刺门、两遍式 ASR（live + turn_final）</td></tr>
-<tr><td>web app（app.py）</td><td>:8090</td><td>FastAPI + WS：接收循环、话轮管线、宽限窗、能量守卫、统一语音出口、双轨录音；<b>Agent Runtime 全部在此进程内</b>（adapter / runtime / store / 调度 / 交付）</td></tr>
-<tr><td>快脑（qwen35_fused_server）</td><td>:6007 · GPU6</td><td>同一 Qwen3.5-9B：<code>/chat</code> 人设流式（表达轮）+ <code>/agent_chat_v2</code> 路由 NDJSON；GEN_LOCK 串行化</td></tr>
-<tr><td>慢脑</td><td>:6008 · GPU1</td><td>Qwen3.5-9B agent 循环：make_v2_runner 工具循环（web_search / fetch_page / get_datetime / calculate），MAX_STEPS=4</td></tr>
-<tr><td>VoxCPM2 TTS</td><td>:8085 · GPU7</td><td>流式合成：自训 LoRA + 锚定音色 + 服务端文本正则化；RTF≈0.32</td></tr>
-<tr><td>pvad sidecar</td><td>:8086 · CPU</td><td>pre-ASR 流门控（主动模式 + 已注册）；fail-open——服务不可用时放行</td></tr>
-<tr><td>tse sidecar</td><td>:8087 · GPU7</td><td>MossFormer2 回声参考通道：仅上报 sep_cos，不参与任何决策（负结果保留）</td></tr>
-</table>
-<p>
-部署要点：长任务一律 tmux + 日志；快脑服务重启后 <code>/agent_chat_v2</code> 才可用（404 复读事故的根源即旧进程无该端点）；
-web 重启对已有连接是断连截断（冒烟 bc9f233a 已验证该行为符合预期）。
-</p>
-
-<!-- ================================================================ 11 -->
-<h2 id="s11"><span class="no">§11</span>关键参数速查</h2>
-<table>
-<tr><th>参数</th><th>值</th><th>位置 / 说明</th></tr>
-<tr><td>上行 chunk</td><td>16 kHz float32 / 160 ms</td><td>前端 ↔ web app；异采样率 soxr VHQ 重采样</td></tr>
-<tr><td>下行音频</td><td>24 kHz PCM 流</td><td>TTS → 前端，按实时速率回放</td></tr>
-<tr><td><code>turn_wait_ms</code></td><td>800 ms（5 块，可调 160–3200）</td><td>wait 路径静音确认 → 服务端 max_wait_num</td></tr>
-<tr><td><code>turn_grace_ms</code></td><td>900 ms（可调 0–3000，0=关）</td><td>complete 宽限保持窗；Agent Runtime 提交门取同一份值</td></tr>
-<tr><td><code>_BARGEIN_MIN_CHUNKS</code></td><td>3（480 ms 迟滞）</td><td>播放期 nonidle 需 3 连续块才确认打断；每 episode 一次</td></tr>
-<tr><td>pvad 打分 / 环 / 迟滞</td><td>0.4 s/轮 / 1.2 s / thr−0.20 死区</td><td>流门控：连续 2 轮低分压制，任一轮达标立即解除</td></tr>
-<tr><td>两遍式 ASR 等待</td><td>≤500 ms</td><td>asr_correct_wait_ms；超时回落 live 文本</td></tr>
-<tr><td>交付空闲仲裁</td><td>静默 ≥1.2 s ∧ 无生成 ∧ 无播放</td><td>_agent_can_deliver；语音前端与 Agent Runtime 共用同一结论</td></tr>
-<tr><td>LLM 首段 / TTS 首块</td><td>~1 s / ~80 ms</td><td>实测；TTS RTF≈0.32（发射快于实时 → 双轨取证必要）</td></tr>
-<tr><td>路由帧上限 / 工具步数</td><td>1 MB / MAX_STEPS=4</td><td>路由 client 帧 1 MB 上限；慢脑工具循环步数围栏</td></tr>
-<tr><td>三道守卫阈值</td><td>子串接地 · 吞句 &gt;16 字 · 修复轮 1</td><td>router.py：_NORM_RE 归一化；_STOP_ONLY_LEFTOVER_CHARS=16；repair_attempts=1</td></tr>
-<tr><td>grace 提交门</td><td>轮询 0.05 s · 上限 grace+5 s</td><td>GRACE_POLL_S；窗口内续说 → 旧计划作废重新路由</td></tr>
-<tr><td>UI 泵</td><td>1 s 轮询 diff</td><td>UI_POLL_S；task_panel_rows → task_update，只读不进控制平面</td></tr>
-<tr><td>交付重试</td><td>≤3 次</td><td>outbox 至少一次；耗尽 → retry_exhausted（仍可被点名重听）</td></tr>
-<tr><td>路由实测</td><td>≈4.8 s · attempts=1</td><td>2026-11-06 实机（快脑 Qwen3.5-9B，"C罗近况"话轮）</td></tr>
-</table>
-
-<!-- ================================================================ 12 -->
-<h2 id="s12"><span class="no">§12</span>设计不变量</h2>
-<ol>
-<li><b>未说出口的不进历史</b>——对话历史只收已上口 / 已确认的文本；路由快照与表达轮都从同一份历史取材。</li>
-<li><b>跨层异步结果必须带代际校验</b>——grace_ref_ts（宽限窗）、run_break 锚（双轨录音）、gen_sn / gen_serial（生成标志）、stop_event（话轮线程）都是"实例"而非"全局"：迟到的结果对不上号就作废，绝不过期生效。</li>
-<li><b>确定性放 Runtime，概率性放模型</b>——守卫、回执模板、状态机、lease 围栏、重播重入是代码；路由、表达、工具循环是 LLM；SQLite 是两者之间唯一的交接面。</li>
-<li><b>语音前端是第一公民</b>——Agent Runtime 只读注入：grace 阈值、话权结论、发声管线全部复用前端现有实现，不复制第二套"怎么说"。</li>
-<li><b>门控旁路 fail-open</b>——pvad / tse 不可用时放行音频：语音可用性优先于门控精度；tse 只上报不决策。</li>
-<li><b>所有上话共用一条语音出口与三态语义</b>——True=完整播出、False=播出后打断、None=从未起播；不存在第二套播放路径，也就不存在第二套打断语义。</li>
-<li><b>空结果绝不谎报成功</b>——慢脑空结果 → failed(outcome=empty)，宁可想个新办法，不把"没查到"说成"完成了"。</li>
-<li><b>每一轮都必须有可听终态</b>——回执、澄清、表达轮、无声兜底、ROUTER_FAIL_TEXT 五选一；无声轮是事故级别（listening 卡死家族的公共根因）。</li>
-<li><b>gen 标志必须释放</b>——谁置位谁移交，话轮 worker 在 finally 里兜底释放（gen_serial 已变则自然 no-op）；漏放的后果是后台交付被永久拒绝。</li>
-</ol>
-
-<!-- ================================================================ 13 -->
-<h2 id="s13"><span class="no">§13</span>验证状态与实测记录</h2>
-<table>
-<tr><th>项</th><th>状态</th><th>说明</th></tr>
-<tr><td>离线测试（agent/）</td><td>全绿</td><td>7 套套件（runtime / store / tools / sched / v2_proto / router / adapter），296 断言基础上经事故修复持续扩容（router 守卫用例、adapter 无声轮 / 释放 / UI 泵场景）</td></tr>
-<tr><td>语音前端不变量回归</td><td>全绿</td><td>agent_smoke --offline 17 / selftalk 12 / empty_stream 15 / pvad_stream 24——每次触碰语音路径必跑</td></tr>
-<tr><td>实机部署</td><td>已完成</td><td>2026-11-06 12:15 重启 web :8090 / 快脑 :6007 / 慢脑 :6008；V2 路由实机验证（"C罗近况"）：create_task + 回执 ≈4.8 s，attempts=1</td></tr>
-<tr><td>实测事故修复</td><td>全部闭环</td><td>路由 404 复读（服务重启）；无声轮 listening 卡死（gen_sn 移交 + RC_INFO 模板 + 无声兜底 + 澄清上口）；get_task 重播缺失与接地守卫失效（_redeliver_unheard + evidence 嵌套形修复）；「等一下」吞句（覆盖守卫 + few-shot #16）</td></tr>
-<tr><td>断连截断</td><td>已验证</td><td>15:02 重启后冒烟会话 bc9f233a：断连时未播完的生成按预期截断</td></tr>
-<tr><td>待办</td><td>未做</td><td>路由语义评测（120 条人工标注集，逐类 precision / recall）；路由延迟分布实测（当前只有单点 4.8 s）；播放 ACK（当前 played_confirmed 为服务端估计）</td></tr>
-</table>
-
-<p style="text-align:center;color:var(--muted);font-size:12.5px;margin-top:48px">
-SoulX 全链路系统流图 · 修订 v2 · 2026-11-06 · dev <span class="mono">d16f313</span> · 范围：主线语音路径 + 新版 Agent Runtime
-</p>
-
-</div><!-- /wrap -->
-</body>
-</html>
