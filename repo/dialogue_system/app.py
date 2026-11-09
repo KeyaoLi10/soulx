@@ -1,4 +1,5 @@
 import hmac
+import itertools
 import os
 import re
 import time
@@ -1152,21 +1153,88 @@ def _make_agent_v2(session, client_id, mode=None):
         _playback_bargein_deferred），且播报开口前积累的用户语音证据
         清零（用户在播报开口前说的那声"好"不能白送满窗计数）。"""
         tts_client, tts_options = _tts_pair()
-        # 回执让路（2026-11-06 湖人事故第 4 环）：路由慢时（13s）回执上口
-        # 时上一个任务的播报还在浏览器里放——设计假设"回执紧跟用户说话"
-        # 被打破，无条件 interrupt 直接把天气播报掐在 6.5/11s。用户自交付
-        # 开播后没再开口（last_voice_ts < assistant_audible_ts）= 在安静
-        # 听，回执等播报放完再上口；用户插话过则照旧立刻掐断（对话优先）。
-        # 有界 20s：playback_end 是发射侧估计，卡住不能把回执饿死。
+        # 回执让路（2026-11-06 湖人事故第 4 环）+ 播报保护门（2026-11-10
+        # 根修），一个等待循环管两段：
+        # · 话权空闲（非播报期）：原语义不变。播放在放且用户自开播后没
+        #   再开口（last_voice_ts < assistant_audible_ts）= 在安静听，
+        #   回执等播报放完再上口；用户插话过则照旧立刻掐断（对话优先）。
+        # · 慢脑播报期（delivery_speech_active）：与 barge-in 信号路
+        #   （_playback_bargein_deferred）/commit 路（_delivery_hold_turn）
+        #   同源判定——用户语音证据未达 delivery_bargein 阈值就不掐播报。
+        #   2026-11-10 事故：3-chunk 的"嗯，说说。"被 commit 路 hold 之后，
+        #   闲聊路 _speak 仍凭 last_voice_ts 无条件 interrupt 把播报掐到
+        #   Ratio 0.37（三条执行路径里只有这条不受证据阈值约束，hold 形
+        #   同虚设），静默 2s 后闲聊 LLM 还编造了结果内容。held 话轮的
+        #   commit 已清 bargein_times，这里读到空窗 = 等待，正是要的；
+        #   播报已死（session.stop_event 已置——真打断）、已播完
+        #   （_reply_in_flight 转 False）、证据攒够，任一出现即放行。
+        # 有界 20s：playback_end 是发射侧估计，卡住不能把回执饿死；播报
+        # 可能长于 20s，播报期等待的下界跟着播报自身的结束估计走。
         yield_deadline = time.time() + 20.0
-        while (not stop_event.is_set() and time.time() < yield_deadline):
+        _defer_logged = False
+        while time.time() < yield_deadline:
+            if stop_event.is_set():
+                # 本话轮已被取代/停止（新话轮置 chitchat_stop、stop-only、
+                # duplex_stop）：安静让位，不落 interrupt 段——原实现从
+                # 等待退出后仍会无条件 interrupt，等于无证据杀在放语音
+                return None
             with session.lock:
                 playing = time.time() < session.playback_end
                 user_spoke_since = (
                     session.last_voice_ts >= session.assistant_audible_ts)
-            if not playing or user_spoke_since:
-                break
+                delivery_floor = session.delivery_speech_active
+            if delivery_floor:
+                if not _defer_logged:
+                    # 取证口（与 commit 路 "turn held during result
+                    # delivery" 对应）：本路让路只在这一行可见
+                    _defer_logged = True
+                    logger.info(
+                        f"[{client_id}] speak deferred during result "
+                        f"delivery (evidence "
+                        f"{len(session.bargein_times)} chunk(s))")
+                if session.stop_event.is_set() or \
+                        not _reply_in_flight(session):
+                    break  # 播报已被真打断 / 已发射+播完：立即接替
+                n_chunks, span_s = _delivery_bargein_thresholds(session)
+                times = session.bargein_times
+                if len(times) >= n_chunks and \
+                        time.time() - times[0] >= span_s:
+                    break  # 证据攒够（与信号/commit 两路同阈值）：对话优先
+                yield_deadline = max(yield_deadline,
+                                     session.playback_end + 2.0)
+            else:
+                if not playing or user_spoke_since:
+                    break
             time.sleep(0.1)
+        # 上口时机后移（2026-11-10 B 修）：先从生成器拿到首段文本再接管
+        # 话权——原来 interrupt 与新内容之间夹着 LLM 首段延迟（实测 1-2s
+        # 静默窗：旧语音已掐、新文本还没来）。预取期间话权易手（别的路
+        # 完成了一轮 interrupt+reset——交付泵/回执/新话轮管线，或
+        # duplex_stop 的 set+reset）= 本回复作废安静退出，生成器关掉让
+        # HTTP 流落地。判据用**身份比较**而非 is_set()：session.stop_event
+        # 换了对象才算易手；原地 set（如 barge-in confirm 杀掉播报）只是
+        # 旧持有者被杀，不产生新持有者——本回复仍该上口（A2 场景：等在
+        # 死播报后面的接替者不能被进门时的旧 set 误杀）。
+        # 单段 str（回执/交付播报）无需预取。
+        if isinstance(item, str):
+            gen = iter([item])
+        else:
+            floor_event = session.stop_event
+            try:
+                first = next(iter(item))
+            except StopIteration:
+                # 空流：掐死在首分句前（不接管话权、不 interrupt、不误
+                # 报成功——2026-11-05 空流三态语义）
+                return None
+            if stop_event.is_set() or session.stop_event is not floor_event:
+                close = getattr(item, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                return None
+            gen = itertools.chain([first], item)
         # forensic cut first, while the pending state still names the reply
         # whose playback this delivery is about to stop
         session.cut_pending_audio()
@@ -1176,7 +1244,6 @@ def _make_agent_v2(session, client_id, mode=None):
         current_stop_event = session.stop_event
         if current_stop_event.is_set():
             return None  # stopped before starting: nothing audible yet
-        gen = iter([item]) if isinstance(item, str) else item
         if not delivery_protect:
             # 新一代语音真正上口（回执/闲聊/表达轮）：上一段慢脑播报的
             # 保护失效。注意吸收轮不经过这里——交付播报照常放，保护

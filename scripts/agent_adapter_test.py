@@ -371,10 +371,11 @@ check("13b speaking turn releases gen flag in finally", ok,
       str(st["gen_releases"]))
 
 # ==== 场景 14：get_task 重播——交付被打断的结果再说一遍（2026-11-06
-# 待办：outbox 重入语义）====================================================
+# 待办：outbox 重入语义；2026-11-10 用户新原则：被打断不主动重播）=====
 GET_TASK = plan_json([{"op": "get_task", "target_task_id": "T1"}],
                      reply_mode="receipts")
-rt, ad, st = make_env(tmp, [GET_TASK, GET_TASK, GET_TASK, GET_TASK])
+rt, ad, st = make_env(tmp, [GET_TASK, GET_TASK, GET_TASK, GET_TASK,
+                            GET_TASK, GET_TASK])
 rt_ref[0] = rt
 rt.store.ensure_session("s1")
 rt.store.commit_plan("s1", "R0", C.parse_plan(CREATE_PLAN), plan_version=1)
@@ -391,29 +392,41 @@ rt.store._conn.execute(
     "UPDATE deliveries SET state='interrupted_partial' WHERE delivery_id=?",
     (dlv_row["delivery_id"],))
 rt.store._conn.commit()
+# 2026-11-10 用户新原则：被打断的交付不主动重播——播报打断已做得比
+# 闲聊难，误打断留不住真想听的用户；泛泛追问只如实告知打断
+# （delivery_interrupted 回执），系统不主动重排全文
 ad.handle_utterance("你还没说完呢")
-ok = wait(lambda: any("我再说一遍结果" in str(x) for x in st["speak_calls"]))
-check("14b interrupted delivery → get_task says redelivering receipt",
+ok = wait(lambda: any("播到一半被打断" in str(x) for x in st["speak_calls"]))
+check("14b interrupted delivery → status-only receipt (no auto replay)",
       ok, str(st["speak_calls"]))
+time.sleep(0.4)
+check("14c no re-delivery after interrupted status receipt",
+      st["speak_calls"].count("北京晴") == 1, str(st["speak_calls"]))
+
+# 显式重播意图（"再讲一遍"类）才重排——结果播报唯一出口是交付泵
+ad.handle_utterance("那你再讲一遍")
+ok = wait(lambda: any("我再说一遍结果" in str(x) for x in st["speak_calls"]))
+check("14d explicit replay reopens interrupted delivery", ok,
+      str(st["speak_calls"]))
 ok = wait(lambda: st["speak_calls"].count("北京晴") >= 2)
-check("14c result re-spoken via re-enqueued outbox", ok,
+check("14e result re-spoken via re-enqueued outbox", ok,
       str(st["speak_calls"]))
 ok = wait(lambda: (rt.store.delivery_row(dlv_row["delivery_id"])
                    or {"state": ""})["state"] == C.DLV_PLAYED_CONFIRMED)
-check("14d reopened delivery reaches played_confirmed again", ok)
+check("14f reopened delivery reaches played_confirmed again", ok)
 
-# 14e：已完整听到（played_confirmed）→ 状态问句只报状态，不重播
+# 14g：已完整听到（played_confirmed）→ 状态问句只报状态，不重播
 # （2026-11-09 收紧：重播只认"再讲一遍"类显式重播词——上午事故
 # "哎，你去查了吗？"把北京天气全文重播了一遍）
 ad.handle_utterance("那个天气的结果是什么来着")
 ok = wait(lambda: any("刚才也说过啦" in str(x) for x in st["speak_calls"]))
-check("14e heard-before task → status-only receipt (no replay)", ok,
+check("14g heard-before task → status-only receipt (no replay)", ok,
       str(st["speak_calls"]))
 time.sleep(0.4)
-check("14f no re-delivery after status-only receipt",
+check("14h no re-delivery after status-only receipt",
       st["speak_calls"].count("北京晴") == 2, str(st["speak_calls"]))
 
-# 14g：交付在途（outbox pending）→ 不重复重排
+# 14i：交付在途（outbox pending）→ 不重复重排
 rt.store._conn.execute(
     "UPDATE deliveries SET state='interrupted_partial' WHERE delivery_id=?",
     (dlv_row["delivery_id"],))
@@ -428,17 +441,17 @@ ad.handle_utterance("好了吗")
 ok = wait(lambda: any("已经完成了" in str(x) for x in st["speak_calls"]))
 n_after = rt.store._conn.execute(
     "SELECT COUNT(*) c FROM outbox WHERE kind='deliver'").fetchone()["c"]
-check("14g in-flight delivery not double-enqueued",
+check("14i in-flight delivery not double-enqueued",
       ok and n_before == n_after, f"{n_before} -> {n_after}")
 
-# 14h：显式重播词（"再讲一遍"）对已完整听过的结果照旧重排重播——
+# 14j：显式重播词（"再讲一遍"）对已完整听过的结果照旧重排重播——
 # 收紧只挡状态问句，不挡显式请求（晚七单一出口语义保留）
 ad.handle_utterance("再讲一遍结果")
 ok = wait(lambda: any("我再说一遍结果" in str(x) for x in st["speak_calls"]))
-check("14h explicit replay word still re-delivers", ok,
+check("14j explicit replay word still re-delivers", ok,
       str(st["speak_calls"]))
 ok = wait(lambda: st["speak_calls"].count("北京晴") >= 3)
-check("14h result re-spoken via re-enqueued outbox", ok,
+check("14j result re-spoken via re-enqueued outbox", ok,
       str(st["speak_calls"]))
 
 # ==== 场景 15：V2 任务面板 UI 泵（2026-11-06 enforce 实测反馈：

@@ -208,8 +208,14 @@ def render_chitchat_context(panel_rows, max_tasks: int = 8):
                 else:
                     bits.append("结果播报被打断")
             else:
-                bits.append("结果已播报过" if r.get("delivered")
-                            else "结果待播报")
+                if r.get("delivered"):
+                    bits.append("结果已播报过")
+                else:
+                    # 待播报 = 结果内容只在后台交付泵手里（2026-11-10 T3
+                    # 事故：用户"嗯，说说。" + 面板只写"待播报"，闲聊 LLM
+                    # 编造了具体新闻内容）。把认知边界写进标记本身——
+                    # 面板说"已完成"会诱发模型以为自己可以谈内容
+                    bits.append("结果待播报（具体内容你不知道，等后台播）")
         lines.append("，".join(bits))
     panel = "\n".join(lines) if lines else "（当前没有任何任务）"
     return CHITCHAT_CONTEXT_TEMPLATE.format(panel=panel)

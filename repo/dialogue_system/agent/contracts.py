@@ -432,6 +432,10 @@ def receipt_text(receipt: Receipt, label: str = "") -> str:
             if receipt.reason_code == "already_delivered":
                 # 状态问句对已播报任务：只报状态不重播（2026-11-09 收紧）
                 return f"{name}已经查过了，结果刚才也说过啦，想再听就说一声。"
+            if receipt.reason_code == "delivery_interrupted":
+                # 被打断的交付不主动重播（2026-11-10 用户新原则）：
+                # 如实告知打断，想听让用户开口——不冒称"说过了"
+                return f"{name}查到了，刚才播到一半被打断了，想听完整版就说一声。"
             return f"{name}已经完成了。"
         if state == EXEC_FAILED:
             return f"{name}没有完成，需要的话我换个方式再试。"

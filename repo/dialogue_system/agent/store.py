@@ -962,6 +962,10 @@ class AgentStore:
                     r.reason_code = "redelivering"
                 elif outcome == "already":
                     r.reason_code = "already_delivered"
+                elif outcome == "interrupted":
+                    # 2026-11-10：被打断不冒称"说过了"，回执如实告知，
+                    # 但不主动重排（用户原则：只有主动问才重播）
+                    r.reason_code = "delivery_interrupted"
         else:
             tasks = self.task_view(session_id)
             if o.list_scope == "active":
@@ -1076,10 +1080,12 @@ class AgentStore:
         在途交付（outbox 未消费 / delivery pending-rendering-sending）会让
         结果自然到达，不重排；已听到（played_confirmed /
         sent_unconfirmed，含 voiced_by_lane——创建轮闲聊路亲口说过，
-        2026-11-09 窄版 voiced-by-lane）只在显式重播意图（replay=True，
-        "再讲一遍"类）或结果从未完整播出（打断/重试耗尽——用户没听过）
-        时重排——结果播报的唯一出口是交付泵，用户"再讲一遍"只能由它
-        兑现（2026-11-07 单一出口重构）。"""
+        2026-11-09 窄版 voiced-by-lane）与被打断（interrupted_partial，
+        2026-11-10 用户新原则：打断保护已做厚，误打断留不住真想听的
+        用户，系统不主动重提）都只在显式重播意图（replay=True，"再讲
+        一遍"类）时重排；仍会自动重排的只剩"从未完整播出且一字未出声"
+        的重试耗尽/before_audio。结果播报的唯一出口是交付泵，用户"再讲
+        一遍"只能由它兑现（2026-11-07 单一出口重构）。"""
         task_id = t["task_id"]
         for row in self._conn.execute(
                 "SELECT payload_json FROM outbox WHERE session_id=? AND "
@@ -1099,6 +1105,16 @@ class AgentStore:
                                                 C.DLV_VOICED_BY_LANE) \
                 and not replay:
             return "already"
+        if dlv is not None and dlv["state"] == C.DLV_INTERRUPTED_PARTIAL \
+                and not replay:
+            # 2026-11-10 用户新原则：被打断的交付不主动重播。播报打断已
+            # 做得比闲聊难（证据阈值三路同源），误打断留不住真想听的
+            # 用户——他们会主动问；系统不提，面板只示"播报被打断"。
+            # 只有显式重播意图（replay=True，"再讲一遍"类）才重排。
+            # 区别于 "already"：没播完不冒称"说过了"，回执如实说被打断
+            # （reason_code=delivery_interrupted）。before_audio 不在此列
+            # ——一字未出声，用户没听过，追问照常送出结果。
+            return "interrupted"
         if dlv is not None and dlv["state"] not in _DLV_REOPEN_FROM:
             return False
         src = None
