@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "repo" / "dialogue_system"))
 
 from agent import contracts as C  # noqa: E402
 from agent import context as agent_context  # noqa: E402
+from agent import frontend_adapter  # noqa: E402
 from agent import slow_brain as SB  # noqa: E402
 from agent.frontend_adapter import (ROUTER_FAIL_TEXT,  # noqa: E402
                                     SILENT_TURN_ACK_TEXT,
@@ -373,7 +374,7 @@ check("13b speaking turn releases gen flag in finally", ok,
 # 待办：outbox 重入语义）====================================================
 GET_TASK = plan_json([{"op": "get_task", "target_task_id": "T1"}],
                      reply_mode="receipts")
-rt, ad, st = make_env(tmp, [GET_TASK, GET_TASK, GET_TASK])
+rt, ad, st = make_env(tmp, [GET_TASK, GET_TASK, GET_TASK, GET_TASK])
 rt_ref[0] = rt
 rt.store.ensure_session("s1")
 rt.store.commit_plan("s1", "R0", C.parse_plan(CREATE_PLAN), plan_version=1)
@@ -401,13 +402,15 @@ ok = wait(lambda: (rt.store.delivery_row(dlv_row["delivery_id"])
                    or {"state": ""})["state"] == C.DLV_PLAYED_CONFIRMED)
 check("14d reopened delivery reaches played_confirmed again", ok)
 
-# 14e：已完整听到（played_confirmed）→ 只报状态，不重播
+# 14e：已完整听到（played_confirmed）→ 状态问句只报状态，不重播
+# （2026-11-09 收紧：重播只认"再讲一遍"类显式重播词——上午事故
+# "哎，你去查了吗？"把北京天气全文重播了一遍）
 ad.handle_utterance("那个天气的结果是什么来着")
-ok = wait(lambda: sum("已经完成了" in str(x) for x in st["speak_calls"]) >= 1)
-check("14e heard-before task → plain done receipt", ok,
+ok = wait(lambda: any("刚才也说过啦" in str(x) for x in st["speak_calls"]))
+check("14e heard-before task → status-only receipt (no replay)", ok,
       str(st["speak_calls"]))
 time.sleep(0.4)
-check("14f no re-delivery after plain receipt",
+check("14f no re-delivery after status-only receipt",
       st["speak_calls"].count("北京晴") == 2, str(st["speak_calls"]))
 
 # 14g：交付在途（outbox pending）→ 不重复重排
@@ -427,6 +430,16 @@ n_after = rt.store._conn.execute(
     "SELECT COUNT(*) c FROM outbox WHERE kind='deliver'").fetchone()["c"]
 check("14g in-flight delivery not double-enqueued",
       ok and n_before == n_after, f"{n_before} -> {n_after}")
+
+# 14h：显式重播词（"再讲一遍"）对已完整听过的结果照旧重排重播——
+# 收紧只挡状态问句，不挡显式请求（晚七单一出口语义保留）
+ad.handle_utterance("再讲一遍结果")
+ok = wait(lambda: any("我再说一遍结果" in str(x) for x in st["speak_calls"]))
+check("14h explicit replay word still re-delivers", ok,
+      str(st["speak_calls"]))
+ok = wait(lambda: st["speak_calls"].count("北京晴") >= 3)
+check("14h result re-spoken via re-enqueued outbox", ok,
+      str(st["speak_calls"]))
 
 # ==== 场景 15：V2 任务面板 UI 泵（2026-11-06 enforce 实测反馈：
 # enforce 下前端看不到慢脑任务）================================================
@@ -595,6 +608,98 @@ check("19e explicit get_task re-delivers after retraction", ok,
       str(st["speak_calls"]))
 check("19f retraction flag cleared by re-delivery",
       rt.store.task_row("s1", "T1")["cancel_intent"] == 0)
+
+# ==== 场景 19g：取消落在"结果正在播"的窗口 → 在途交付语音被掐断 ======
+# （2026-11-09 e2e 取消竞态）状态面由 19b 覆盖（cancel_intent+suppressed），
+# 这里补声音面：泵线程被 speak_fn 占住，队列里的 stop_speech 自己永远
+# 轮不到——取消的提交路径必须跨线程把 stop_event 置位。同时覆盖同态
+# 幂等：_suppress_deliveries 与泵的开口后复核并发写 suppressed，旧
+# 状态机会抛 StoreError 炸在 complete_outbox 之前（deliver 项卡在
+# leased 等租约超时自愈）。
+rt, ad, st = make_env(tmp, [CREATE_PLAN, CANCEL_PLAN])
+rt_ref[0] = rt
+cut_log = []
+
+def _blocking_deliver(env, text, stop_event):
+    cut_log.append(("start", env.task_id))
+    cut = stop_event.wait(5.0)        # 在途播报：只有被掐才提前返回
+    cut_log.append(("cut" if cut else "full", env.task_id))
+    return not cut                   # True=完整播出
+
+rt.delivery.speak_fn = _blocking_deliver
+ad.handle_utterance("查一下骑士队的比赛")
+stop_pump = threading.Event()
+
+def _pump_loop():
+    while not stop_pump.is_set():
+        rt.delivery.pump()
+        time.sleep(0.02)
+
+pump_t = threading.Thread(target=_pump_loop, daemon=True)
+pump_t.start()
+deadline = time.monotonic() + 5
+while (not any(e[0] == "start" for e in cut_log)
+       and time.monotonic() < deadline):
+    rt.scheduler.pump()
+    time.sleep(0.02)
+check("19g delivery starts speaking",
+      any(e[0] == "start" for e in cut_log), str(cut_log))
+ad.handle_utterance("算了，不用查了")
+ok = wait(lambda: ("cut", "T1") in cut_log)
+stop_pump.set()
+pump_t.join(timeout=6)
+check("19g2 cancel cuts in-flight delivery speech", ok, str(cut_log))
+dstate = rt.store.result_delivery_states("s1").get("T1")
+check("19g3 cut delivery lands suppressed (same-state idempotent)",
+      dstate == C.DLV_SUPPRESSED, str(dstate))
+_rows = rt.store._conn.execute(
+    "SELECT state FROM outbox WHERE kind='deliver'").fetchall()
+check("19g4 deliver outbox item finalized, not stuck leased",
+      _rows and all(r["state"] in ("done", "pending") for r in _rows),
+      str([dict(r) for r in _rows]))
+
+# ==== 场景 19h：过期租约重领的重复 deliver 项不得重播/不得崩溃 ======
+# （2026-11-09 e2e 事故）长结果播报 >30s 租约 → 项被重领归还 pending、
+# 泵的 complete_outbox token 静默失效 → 泵重领同一项，record_delivery
+# 按身份去重回已 played_confirmed 的交付行再写 RENDERING → StoreError
+# 崩溃循环（attempts=58）。修 = deliver 领取租约 300s + 泵见终态处置
+# 的重复项直接收尾。这里用"同 payload 再排一条 deliver"精确模拟重领项。
+rt, ad, st = make_env(tmp, [CREATE_PLAN])
+rt_ref[0] = rt
+ad.handle_utterance("查一下骑士队的比赛")
+ok = wait(lambda: any("北京晴" in str(x) for x in st["speak_calls"]))
+check("19h first delivery spoken once", ok, str(st["speak_calls"]))
+_tid = [r for r in rt.store.task_panel_rows("s1")
+        if r["task_id"] == "T1"][0]["task_id"]
+_dlv = rt.store._conn.execute(
+    "SELECT state FROM deliveries WHERE task_id=? ORDER BY rowid "
+    "DESC LIMIT 1", (_tid,)).fetchone()
+check("19h2 delivery row played_confirmed",
+      _dlv and _dlv["state"] == C.DLV_PLAYED_CONFIRMED, str(dict(_dlv or {})))
+_src = rt.store._conn.execute(
+    "SELECT payload_json FROM outbox WHERE kind='deliver' AND state='done' "
+    "ORDER BY outbox_id DESC LIMIT 1").fetchone()["payload_json"]
+import json as _json
+rt.store._enqueue("s1", "deliver", _json.loads(_src))
+for _ in range(4):
+    rt.delivery.pump()
+    time.sleep(0.05)
+check("19h3 duplicate deliver item does not re-speak",
+      sum("北京晴" in str(x) for x in st["speak_calls"]) == 1,
+      str(st["speak_calls"]))
+_dup = rt.store._conn.execute(
+    "SELECT state FROM outbox WHERE kind='deliver' ORDER BY outbox_id "
+    "DESC LIMIT 1").fetchone()
+check("19h4 duplicate deliver item finalized", _dup["state"] == "done",
+      str(dict(_dup)))
+# deliver 领取租约必须远大于默认 30s（覆盖长结果播报）
+rt.store._enqueue("s1", "deliver", _json.loads(_src))
+_items = rt.delivery._claim_kind("deliver")
+check("19h5 deliver claim uses long lease",
+      _items and _items[0]["lease_expires_at"] - time.time() > 200,
+      str(_items[:1]))
+for _i in _items:
+    rt.store.complete_outbox(_i["outbox_id"], _i["token"])
 
 # ==== 场景 20-25：双路并行（2026-11-06 闲聊路设计，方案 A/B/C）===========
 # 闲聊路（chitchat_fn）与路由路并行：闲聊路负责常规口播，路由路只在
@@ -893,6 +998,19 @@ check("29 chitchat context hides undelivered result text",
 check("29b chitchat context marks delivered, hides its result text",
       "开拓者" not in ctx and "结果已播报过" in ctx, ctx[:200])
 
+# 29b2-29b3：interrupted 渲染（2026-11-09 复读事故：被打断的播报被当
+# "结果待播报"，模型无限承诺"马上到"却永不兑现——晚九修了 suppressed
+# 的同型问题，interrupted_partial 漏了）
+ctx = agent_context.render_chitchat_context([
+    {"task_id": "T3", "goal": "查热火国王比赛",
+     "execution_status": "completed", "progress": "",
+     "result": "国王赢了", "interrupted": True},
+])
+check("29b2 interrupted delivery not rendered as pending",
+      "结果播报被打断" in ctx, ctx[:200])
+check("29b3 interrupted result text hidden (single outlet)",
+      "国王赢了" not in ctx, ctx[:200])
+
 rt, ad, st = make_env(
     tmp, [CREATE_PLAN, GET_PLAN], chitchat_impl=_std_chitchat,
     runner=lambda s, c, p: {"type": "completed",
@@ -917,7 +1035,10 @@ check("29e re-ask on delivered result replays via pump", ok,
 # 事故：路由 10-20s > 用户开口间隔 → 每句被下一句作废，请求永远
 # registered、任务建不出来 → 闲聊路对空面板连应三遍"我去查一下"。
 # 修 = ①窗口外（独立话轮）新话轮把挂起计划 land 落地（跳 grace +
-# create 去重）不合并文本；②被取代话轮的在途路由断流（释放 GEN_LOCK）。
+# create 去重）不合并文本；②窗口内被取代话轮的在途路由断流（释放
+# GEN_LOCK）。2026-11-09 折中根修：窗口外不再断流在途路由（断流作废
+# 的是还没返回的路由，land 又只救已挂起的计划——两头落空），改由新
+# worker 有界等待它返回并落地（场景 34）。
 
 def _slow_create():
     time.sleep(0.3)
@@ -1002,6 +1123,69 @@ time.sleep(0.3)
 check("33b cancelled turn never speaks ROUTER_FAIL_TEXT",
       all("没理清" not in str(x) for x in st["speak_calls"]),
       str(st["speak_calls"]))
+
+# 34 独立话轮不杀在途路由（2026-11-09 上午事故：C罗查询路由 10.5s 在途，
+# 用户 9.3s 后的补充话轮把它 route_stop 掐死——land 只救已挂起计划，
+# 两头落空，请求永远 registered）。新 worker 有界等待在途路由返回并
+# 落地：任务建出来、文本不合并、两请求都 committed
+_release34 = threading.Event()
+
+
+def _hanging_route34():
+    _release34.wait(5.0)
+    return CREATE_PLAN
+
+
+rt, ad, st = make_env(tmp, [_hanging_route34, DIRECT_PLAN],
+                      chitchat_impl=_std_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查北京天气")   # 路由挂住在途
+time.sleep(0.05)
+ad._active_turn["started_at"] -= 100   # 用户隔了 100s → 独立话轮
+ad.handle_utterance("对了再帮我查点别的")
+time.sleep(0.3)
+check("34 outside-window turn does NOT kill inflight route",
+      not (st.get("router_stop_events")
+           and st["router_stop_events"][0].is_set()),
+      str([e.is_set() for e in st.get("router_stop_events", [])]))
+_release34.set()                       # 旧路由返回 → 挂起 → 新 worker 落地
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
+check("34b inflight route landed (task created)", ok)
+ok = wait(lambda: st["router_calls"] == 2)
+check("34c new turn's route submitted after landing", ok)
+check("34c2 texts not merged",
+      "北京天气" not in st["routed_texts"][-1], str(st["routed_texts"]))
+ok = wait(lambda: _committed_count(rt) == 2)
+check("34d both requests committed (no eternal registered)", ok)
+
+# 34e 有界等待超时放行：路由挂死超过预算（测试里压到 0.3s）→ 新话轮
+# 照常提交自己的路由，不无限等；旧路由返回后仍可自行走 grace 提交
+_orig_land_wait = frontend_adapter._LAND_WAIT_INFLIGHT_S
+frontend_adapter._LAND_WAIT_INFLIGHT_S = 0.3
+_release34e = threading.Event()
+
+
+def _hanging_route34e():
+    _release34e.wait(5.0)
+    return CREATE_PLAN
+
+
+rt, ad, st = make_env(tmp, [_hanging_route34e, DIRECT_PLAN],
+                      chitchat_impl=_std_chitchat)
+rt_ref[0] = rt
+ad.handle_utterance("帮我查上海天气")
+time.sleep(0.05)
+ad._active_turn["started_at"] -= 100
+t0 = time.monotonic()
+ad.handle_utterance("聊点别的")
+ok = wait(lambda: st["router_calls"] == 2, timeout=6.0)
+check("34e wait budget exhausted → new route still submitted", ok)
+check("34e wait bounded (~0.3s, not 5s)",
+      time.monotonic() - t0 < 3.0)
+frontend_adapter._LAND_WAIT_INFLIGHT_S = _orig_land_wait
+_release34e.set()
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
+check("34f slow inflight route still lands via its own grace", ok)
 
 
 # ==== 场景 9：close 释放 ====================================================

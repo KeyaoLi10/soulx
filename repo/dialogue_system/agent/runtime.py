@@ -674,6 +674,7 @@ class AgentRuntimeV2:
         res = self.store.commit_plan(session_id, entry["request_id"],
                                      entry["plan"],
                                      plan_version=entry["version"])
+        self._cut_speech_for_cancels(session_id, res)
         texts = self._receipt_texts(session_id, res,
                                     chitchat_spoke=chitchat_spoke)
         # plan 一并带回：adapter 需要 reply_mode/direct_question 决定
@@ -714,12 +715,35 @@ class AgentRuntimeV2:
         res = self.store.commit_plan(session_id, entry["request_id"],
                                      plan,
                                      plan_version=entry["version"])
+        self._cut_speech_for_cancels(session_id, res)
         texts = self._receipt_texts(session_id, res,
                                     chitchat_spoke=chitchat_spoke)
         logger.info("[%s] land_pending: committed stale plan for req %s",
                     session_id[:8], entry["request_id"])
         return {"result": res, "texts": texts, "plan": plan,
                 "request_id": entry["request_id"]}
+
+    def _cut_speech_for_cancels(self, session_id, res):
+        """§9.2 第三层的声音面（2026-11-09 e2e 取消竞态）。
+
+        _op_cancel 对"已完成"任务只压状态（cancel_intent=1 + 交付行
+        suppressed），但如果那条结果已经在播，用户会把一段明确取消
+        的内容完整听完。状态面之外，这里按回执把对应任务在途的交付
+        语音掐断（DeliveryManager.stop_speaking_for_task 跨线程置
+        stop_event）。单目标回执带 task_id；all_active/多目标回执
+        task_id 为空 → 掐该会话当前在播的交付。"""
+        receipts = getattr(res, "receipts", None) or []
+        for r in receipts:
+            if getattr(r, "op", "") != "cancel_tasks":
+                continue
+            if getattr(r, "outcome", "") not in (
+                    _C.RC_ALREADY_COMPLETED, _C.RC_CANCELED,
+                    _C.RC_CANCEL_REQUESTED):
+                continue
+            if r.task_id:
+                self.delivery.stop_speaking_for_task(session_id, r.task_id)
+            else:
+                self.delivery.stop_speaking(session_id)
 
     # 落地去重认的"任务还在"状态：非终态一律算（completed 且结果还没
     # 播出去的也算——重复 create 会连环播报）；canceled/superseded 与

@@ -424,6 +424,9 @@ def receipt_text(receipt: Receipt, label: str = "") -> str:
         if state == EXEC_COMPLETED:
             if receipt.reason_code == "redelivering":
                 return f"{name}已经完成了，我再说一遍结果。"
+            if receipt.reason_code == "already_delivered":
+                # 状态问句对已播报任务：只报状态不重播（2026-11-09 收紧）
+                return f"{name}已经查过了，结果刚才也说过啦，想再听就说一声。"
             return f"{name}已经完成了。"
         if state == EXEC_FAILED:
             return f"{name}没有完成，需要的话我换个方式再试。"

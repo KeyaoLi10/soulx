@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -26,6 +27,8 @@ from contextlib import contextmanager
 from typing import Optional
 
 from agent import contracts as C
+
+_log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 DEFAULT_DB_PATH = os.path.join(
@@ -353,6 +356,17 @@ class AgentStore:
                 "SELECT * FROM tasks WHERE session_id=? AND task_id=?",
                 (session_id, task_id)).fetchone()
 
+    def result_delivery_states(self, session_id):
+        """task_id -> 最近一条 result 交付状态（无交付行则缺项）。只读，
+        供路由快照标注"结果已完整播报"（2026-11-09 get_task 目标守卫：
+        泛泛追问不该落到已播报的旧任务上）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, state FROM deliveries WHERE session_id=? "
+                "AND kind='result' AND task_id IS NOT NULL ORDER BY rowid",
+                (session_id,)).fetchall()
+        return {r["task_id"]: r["state"] for r in rows}
+
     def revision_row(self, session_id, task_id, revision):
         with self._lock:
             return self._conn.execute(
@@ -386,11 +400,22 @@ class AgentStore:
                     progress[e["task_id"]] = str(p.get("desc", ""))[:120]
                 else:
                     result[e["task_id"]] = str(p.get("summary", ""))[:400]
+            dstate = {}
             for d in self._conn.execute(
                     "SELECT task_id, state FROM deliveries WHERE "
                     "session_id=? AND kind='result' AND task_id IS NOT NULL "
                     "ORDER BY rowid", (session_id,)).fetchall():
-                delivered[d["task_id"]] = d["state"] == C.DLV_PLAYED_CONFIRMED
+                dstate[d["task_id"]] = d["state"]
+            delivered = {tid: st == C.DLV_PLAYED_CONFIRMED
+                         for tid, st in dstate.items()}
+            # 播报被打断/没送出去（打断是终态，泵不自动重播）：面板与
+            # 闲聊路据此不再渲染"结果待播报"（2026-11-09 复读事故——
+            # interrupted_partial 被当"待播报"，模型无限承诺"马上到"）
+            interrupted = {
+                tid: st in (C.DLV_INTERRUPTED_PARTIAL,
+                            C.DLV_INTERRUPTED_BEFORE_AUDIO,
+                            C.DLV_RETRY_EXHAUSTED)
+                for tid, st in dstate.items()}
             return [{
                 "task_id": t["task_id"], "goal": t["goal"] or t["label"],
                 "execution_status": t["execution_status"],
@@ -402,6 +427,7 @@ class AgentStore:
                 "progress": progress.get(t["task_id"], ""),
                 "result": result.get(t["task_id"], ""),
                 "delivered": delivered.get(t["task_id"], False),
+                "interrupted": interrupted.get(t["task_id"], False),
             } for t in tasks]
 
     # -------------------------------------------------------------- 事件
@@ -839,10 +865,19 @@ class AgentStore:
             # played_confirmed——闲聊路不再代播结果，"再讲一遍"只能由交付
             # 泵兑现），回执改说"再说一遍"。在途交付不双排。用户显式追问
             # ≠ 自动重试，不违反"打断是终态"。
-            if (t["execution_status"] in (C.EXEC_COMPLETED,
-                                          C.EXEC_WAITING_INPUT)
-                    and self._redeliver_unheard(session_id, t)):
-                r.reason_code = "redelivering"
+            # 2026-11-09 收紧：重播只认显式重播意图（"再讲一遍"类）或
+            # 结果未完整播出的任务（打断/重试耗尽——用户没听过，追问
+            # "查了吗"正该把结果送出来）；纯状态问句对已播报任务不再
+            # 全文重播（上午事故："哎，你去查了吗？"→ 北京天气重播一遍）
+            if t["execution_status"] in (C.EXEC_COMPLETED,
+                                          C.EXEC_WAITING_INPUT):
+                outcome = self._redeliver_unheard(
+                    session_id, t, replay=self._request_wants_replay(
+                        request_id))
+                if outcome is True:
+                    r.reason_code = "redelivering"
+                elif outcome == "already":
+                    r.reason_code = "already_delivered"
         else:
             tasks = self.task_view(session_id)
             if o.list_scope == "active":
@@ -934,14 +969,31 @@ class AgentStore:
              C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED,
              C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED))
 
-    def _redeliver_unheard(self, session_id, t):
+    def _request_wants_replay(self, request_id):
+        """get_task 重播意图（2026-11-09）：本轮原文含"再讲一遍"类显式
+        重播词才算；纯状态问句（"查了吗/怎么样了"）不算。request 查不
+        到按无重播意图处理（保守：不重播已听过的结果）。"""
+        from agent.router import _REPLAY_RE
+        if not request_id:
+            return False
+        row = self._conn.execute(
+            "SELECT text FROM requests WHERE request_id=?",
+            (request_id,)).fetchone()
+        return bool(row and _REPLAY_RE.search(row["text"] or ""))
+
+    def _redeliver_unheard(self, session_id, t, replay=False):
         """必须已在 _tx 内。任务已有结果 → 显式追问（get_task）重排一条
         deliver outbox（复用最近一条已完成 deliver 的原文 payload）并
-        重开交付行。返回 True 表示已重排（回执应说"再说一遍"）。
+        重开交付行。返回 True=已重排（回执说"再说一遍"），
+        "already"=结果已完整播过且本轮无重播意图（回执只报状态，
+        2026-11-09 收紧：状态问句不再把已听过的结果全文重播），
+        False=不重排。
         在途交付（outbox 未消费 / delivery pending-rendering-sending）会让
         结果自然到达，不重排；已听到（played_confirmed /
-        sent_unconfirmed）也重排——结果播报的唯一出口是交付泵，用户
-        "再讲一遍"只能由它兑现（2026-11-07 单一出口重构）。"""
+        sent_unconfirmed）只在显式重播意图（replay=True，"再讲一遍"类）
+        或结果从未完整播出（打断/重试耗尽——用户没听过）时重排——结果
+        播报的唯一出口是交付泵，用户"再讲一遍"只能由它兑现（2026-11-07
+        单一出口重构）。"""
         task_id = t["task_id"]
         for row in self._conn.execute(
                 "SELECT payload_json FROM outbox WHERE session_id=? AND "
@@ -956,6 +1008,10 @@ class AgentStore:
             "SELECT delivery_id, state FROM deliveries WHERE session_id=? "
             "AND kind='result' AND task_id=? ORDER BY rowid DESC LIMIT 1",
             (session_id, task_id)).fetchone()
+        if dlv is not None and dlv["state"] in (C.DLV_PLAYED_CONFIRMED,
+                                                C.DLV_SENT_UNCONFIRMED) \
+                and not replay:
+            return "already"
         if dlv is not None and dlv["state"] not in _DLV_REOPEN_FROM:
             return False
         src = None
@@ -1027,6 +1083,12 @@ class AgentStore:
             if row is None:
                 raise StoreError(f"delivery {delivery_id} not found")
             cur = row["state"]
+            if state == cur:
+                # 同态幂等（2026-11-09 e2e 取消竞态）：cancel 路径的
+                # _suppress_deliveries 与交付泵"开口后再核"可能并发对
+                # 同一条交付写 suppressed——多写者收敛到同一状态是合法
+                # 协议行为，不是非法迁移（跨状态迁移照旧严格拒绝）
+                return
             allowed = _DLV_TRANSITIONS.get(cur, set())
             if state not in allowed:
                 raise StoreError(
@@ -1196,7 +1258,8 @@ class AgentStore:
             out.append({"outbox_id": oid, "token": tok,
                         "kind": row["kind"],
                         "payload": json.loads(row["payload_json"]),
-                        "attempts": row["attempts"]})
+                        "attempts": row["attempts"],
+                        "lease_expires_at": row["lease_expires_at"]})
         return out
 
     def complete_outbox(self, outbox_id, token, state="done"):
@@ -1205,6 +1268,10 @@ class AgentStore:
                 "SELECT lease_token FROM outbox WHERE outbox_id=?",
                 (outbox_id,)).fetchone()
             if cur is None or cur["lease_token"] != token:
+                # 静默失败曾是盲区（2026-11-09 e2e 事故：租约在长播报
+                # 中途过期被重领，交付泵收尾 no-op 无任何痕迹，项转入
+                # 崩溃循环）——留一行可 grep 的证据
+                _log.warning("complete_outbox token mismatch: %s", outbox_id)
                 return False
             state = state if state in ("done", "failed", "pending") else "done"
             if state == "pending":

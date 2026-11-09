@@ -29,6 +29,21 @@ from agent import store as S
 SILENT_DELIVERY_RETRIES = 3
 DELIVERY_WAIT_S = 2.0        # 话权不可用时的有界等待
 POLL_INTERVAL_S = 0.25
+# deliver 项的领取租约：必须覆盖最长结果播报（长结果 TTS+播放可达
+# 1-2 分钟）。默认 OUTBOX_LEASE_TTL_S=30s 会在播报中途过期——其他
+# 消费者（scheduler 的跨 kind 领取）把过期项归还 pending 会让本泵
+# 的 complete_outbox token 静默失效，项被自己重领后对已 played_confirmed
+# 的交付行再写 RENDERING → StoreError 崩溃循环（2026-11-09 e2e 事故，
+# attempts=58）。泵线程若真死，300s 后仍可自愈（at-least-once）。
+_DELIVER_LEASE_TTL_S = 300.0
+
+# 已终态处置的交付状态：重复 deliver 项见到即收尾，不重渲染不重播。
+# sending 也算——它只在开口之后才写入（rc True/False 两分支都是先播
+# 完才落 sending），遗留 sending 必属"上一 attempt 语音已出"的崩溃残留。
+_DLV_ALREADY_HANDLED = frozenset({
+    C.DLV_SENDING, C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED,
+    C.DLV_SUPPRESSED, C.DLV_INTERRUPTED_PARTIAL,
+    C.DLV_INTERRUPTED_BEFORE_AUDIO, C.DLV_RETRY_EXHAUSTED})
 
 
 class DeliveryManager:
@@ -65,6 +80,29 @@ class DeliveryManager:
         if self._thread:
             self._thread.join(join_timeout)
 
+    # ------------------------------------------------------------------ 掐音口
+
+    def stop_speaking_for_task(self, session_id, task_id):
+        """掐断该任务正在播的交付语音（2026-11-09 e2e 取消竞态）。
+
+        取消落在"已完成、结果正在播"的窗口里时，_op_cancel 只压状态
+        （cancel_intent + suppressed），在途语音会完整播完——用户明确
+        说了"算了"，却把整段已取消的结果听完。泵线程被 speak_fn 占住，
+        队列里的 stop_speech 自己永远轮不到，必须由提交路径跨线程把
+        stop_event 置位（speak_fn 内部轮询它，rc 返回 False=被打断，
+        泵的开口后复核会把交付落成 suppressed 终态）。"""
+        with self._speaking_lock:
+            cur = self._speaking.get(session_id)
+            if cur and cur["envelope"].task_id == task_id:
+                cur["stop_event"].set()
+
+    def stop_speaking(self, session_id):
+        """掐断该会话当前在播的交付语音（all_active 取消的兜底口）。"""
+        with self._speaking_lock:
+            cur = self._speaking.get(session_id)
+            if cur:
+                cur["stop_event"].set()
+
     # ------------------------------------------------------------------ 主循环
 
     def _loop(self):
@@ -82,7 +120,11 @@ class DeliveryManager:
         self._pump_one_delivery()
 
     def _claim_kind(self, kind):
-        claimed = self.store.claim_outbox(limit=4)
+        # deliver 的租约必须覆盖最长播报（见 _DELIVER_LEASE_TTL_S 注释）；
+        # 其余 kind 用 store 默认 30s
+        ttl = _DELIVER_LEASE_TTL_S if kind == "deliver" \
+            else S.OUTBOX_LEASE_TTL_S
+        claimed = self.store.claim_outbox(limit=4, lease_ttl=ttl)
         keep = [i for i in claimed if i["kind"] == kind]
         for i in claimed:
             if i["kind"] != kind:
@@ -158,6 +200,16 @@ class DeliveryManager:
         delivery_id = self.store.record_delivery(
             session_id, payload.get("kind", "result"), task_id=task_id,
             revision=revision, run_id=payload.get("run_id"))
+        row = self.store.delivery_row(delivery_id)
+        if row and row["state"] in _DLV_ALREADY_HANDLED:
+            # 重复 deliver 项（2026-11-09 e2e 事故）：这条结果已有终态
+            # 处置——已播出（played/sent）、被压制、被打断或重试耗尽。
+            # 重渲染会撞终态迁移（StoreError 崩溃循环），把已听过的
+            # 结果再播一遍本身就是重复播报。收尾走人。
+            # （合法重播不受影响：_redeliver_unheard 在重排前必先把
+            # 交付行重置回 pending。）
+            self.store.complete_outbox(item["outbox_id"], item["token"])
+            return
         self.store.set_delivery_state(delivery_id, C.DLV_RENDERING)
         stop_event = threading.Event()
         with self._speaking_lock:

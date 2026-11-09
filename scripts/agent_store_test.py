@@ -369,6 +369,14 @@ try:
 except S.StoreError:
     bad = True
 check("unknown delivery state rejected", bad)
+# 同态幂等（2026-11-09 e2e 取消竞态）：cancel 的 _suppress_deliveries
+# 与交付泵"开口后再核"并发写 suppressed——多写者收敛不是非法迁移
+db.set_delivery_state(dd, C.DLV_INTERRUPTED_PARTIAL)
+dd3 = db.record_delivery(SID5, "result", task_id="T9")
+db.set_delivery_state(dd3, C.DLV_SUPPRESSED)
+db.set_delivery_state(dd3, C.DLV_SUPPRESSED)
+check("same-state delivery write is a no-op",
+      db.delivery_row(dd3)["state"] == C.DLV_SUPPRESSED)
 
 # ---- route log --------------------------------------------------------------
 db.log_route(SID5, ro, "shadow", snapshot={"tasks": 2}, plan_json=None,

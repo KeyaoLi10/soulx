@@ -516,6 +516,78 @@ rr = PlanRouter(transport=tr).route(SNAP, "把那个取消。")
 check("B27 off-snapshot target not blocked here",
       rr.ok and rr.attempts == 1, rr.to_log())
 
+# B28-B33 get_task 目标接地（2026-11-09 上午事故："哎，你去查了吗？"
+# 被路由成 get_task 已完整播报过的 T1 天气 → 全文重播北京天气；用户
+# 追问的对象其实在途的 C罗任务上）。对称 B21 取消守卫：
+# 指向"已播报的旧任务"+本轮没提到它+没有重播词 → 修复/终态拒绝；
+# running / 未播出 / 话题点名 / 显式重播词都不拦
+GT_SNAP = {"snapshot_version": 9, "request_id": "R2", "user_text": "",
+           "focus_task_id": "T4", "pending_question": None,
+           "tasks": [{"task_id": "T4", "revision": 1, "label": "C罗退役",
+                      "goal": "查C罗退役的新闻", "constraints": {},
+                      "execution_status": "running"}],
+           "recent_terminal": [{"task_id": "T1", "revision": 1,
+                                "label": "北京天气",
+                                "goal": "查询北京今天的天气",
+                                "execution_status": "completed",
+                                "delivered": True}],
+           "capabilities": ["web_search"], "timezone": "Asia/Shanghai"}
+GET_DELIVERED = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "get_task", "target_task_id": "T1",
+         "evidence": {"quote": "你去查了吗"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+GET_RUNNING = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "get_task", "target_task_id": "T4",
+         "evidence": {"quote": "你去查了吗"}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+GET_WEATHER_EMPTYQ = json.dumps({
+    "schema_version": 1, "operations": [
+        {"op": "get_task", "target_task_id": "T1",
+         "evidence": {"quote": ""}}],
+    "reply_mode": "receipts"}, ensure_ascii=False)
+# 事故形态：指向已播报的 T1 → 修复轮换目标到 running 的 T4 → 通过
+tr, calls = _mk_transport([_tool_call_result(GET_DELIVERED),
+                           _tool_call_result(GET_RUNNING)])
+rr = PlanRouter(transport=tr).route(GT_SNAP, "哎，你去查了吗？")
+check("B28 incident replay: get_task on delivered old task repaired",
+      rr.ok and rr.attempts == 2
+      and rr.plan.operations[0].target_task_id == "T4", rr.to_log())
+note = calls[1]["messages"][-1]
+check("B28b get_task note carries ids and utterance",
+      note["role"] == "user" and "T1" in note["content"]
+      and "你去查了吗" in note["content"], note["content"][:80])
+# B29 持续不接地 → 终态拒绝（重播旧结果比让用户重说一遍更糟）
+tr, calls = _mk_transport([_tool_call_result(GET_DELIVERED),
+                           _tool_call_result(GET_DELIVERED)])
+rr = PlanRouter(transport=tr).route(GT_SNAP, "哎，你去查了吗？")
+check("B29 persistent ungrounded get_task terminal",
+      not rr.ok and "get_task target not referenced" in rr.error
+      and rr.attempts == 2, rr.to_log())
+# B30 话题点名不误伤："北京天气怎么样了"提到 label → 一次通过
+tr, calls = _mk_transport([_tool_call_result(GET_WEATHER_EMPTYQ)])
+rr = PlanRouter(transport=tr).route(GT_SNAP, "北京天气怎么样了？")
+check("B30 topic-named get_task on delivered passes",
+      rr.ok and rr.attempts == 1, rr.to_log())
+# B31 显式重播词不拦（重播是合法诉求，交给 store 的收紧逻辑把关）
+tr, calls = _mk_transport([_tool_call_result(GET_WEATHER_EMPTYQ)])
+rr = PlanRouter(transport=tr).route(GT_SNAP, "再讲一遍北京天气。")
+check("B31 explicit replay word bypasses guard",
+      rr.ok and rr.attempts == 1, rr.to_log())
+# B32 running 任务不拦：泛泛追问的天然落点（事故正解——该指 C罗）
+tr, calls = _mk_transport([_tool_call_result(GET_RUNNING)])
+rr = PlanRouter(transport=tr).route(GT_SNAP, "哎，你去查了吗？")
+check("B32 get_task on running task passes (no topic word)",
+      rr.ok and rr.attempts == 1, rr.to_log())
+# B33 结果未播出的完成任务不拦（追问该触发重播，把没听到的结果送出）
+GT_SNAP2 = json.loads(json.dumps(GT_SNAP))
+GT_SNAP2["recent_terminal"][0]["delivered"] = False
+tr, calls = _mk_transport([_tool_call_result(GET_DELIVERED)])
+rr = PlanRouter(transport=tr).route(GT_SNAP2, "哎，你去查了吗？")
+check("B33 get_task on completed-but-unheard passes",
+      rr.ok and rr.attempts == 1, rr.to_log())
+
 # ==== C. context.build_router_snapshot ======================================
 
 tmp = tempfile.mkdtemp(prefix="agent_router_ctx_")
@@ -584,6 +656,22 @@ msg = CT.render_snapshot_message(snap, "改查五天的")
 check("C9 render message carries snapshot + raw text",
       "snapshot_version" in msg and "改查五天的" in msg
       and "route_turn" in msg)
+
+# C10 终态条目带"结果已完整播报"标注（2026-11-09 get_task 目标守卫的
+# 数据来源：泛泛追问不该落到已播报的旧任务上）
+_t1 = [t for t in snap["recent_terminal"] if t["task_id"] == "T1"][0]
+check("C10 terminal entry carries delivered flag (no delivery row yet)",
+      _t1.get("delivered") is False, str(_t1))
+_did = store.record_delivery("s1", "result", task_id="T1", revision=1,
+                             run_id=run_id)
+store._conn.execute(
+    "UPDATE deliveries SET state=? WHERE delivery_id=?",
+    (C.DLV_PLAYED_CONFIRMED, _did))
+store._conn.commit()
+snap3 = CT.build_router_snapshot(store, "s1", "查了吗")
+_t1 = [t for t in snap3["recent_terminal"] if t["task_id"] == "T1"][0]
+check("C10b played_confirmed marks terminal delivered",
+      _t1.get("delivered") is True, str(_t1))
 
 store.close()
 

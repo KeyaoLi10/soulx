@@ -1133,10 +1133,11 @@ function handleSelftalkDrop({ reason } = {}) {
 
 // ==================== Background Tasks (fast/slow brain agent) ====================
 // task_update payloads: {task_id, goal, status, progress, result}
-// status: queued | running | completed | delivered | failed | canceled
+// status: queued | running | completed | delivered | interrupted | failed | canceled
 const TASK_STATUS_LABEL = {
   queued: 'queued', running: 'running', completed: 'done',
-  delivered: 'reported', failed: 'failed', canceled: 'canceled',
+  delivered: 'reported', interrupted: 'cut short', failed: 'failed',
+  canceled: 'canceled',
 };
 const MAX_TASK_CARDS = 10;
 

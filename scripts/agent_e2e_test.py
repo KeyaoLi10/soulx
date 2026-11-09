@@ -236,7 +236,14 @@ def main():
 
     canceled = wait_for(lambda: any(e == "task_update" and d.get("status") == "canceled"
                                     for _, e, d in events_since(t0)), 60, "cancel")
-    check("改口后任务被取消（canceled）", canceled is not None)
+    # 搜索快慢是环境变量（2026-11-09：珠峰查询 9s 就完成，取消路径
+    # stream+路由要 ~13s）——任务可能在取消话轮落地前已完成。取消的
+    # 合同是二选一：还在跑 → canceled；已完成 → 压制播报不交付
+    # （§9.2 第三层，由下一条"取消后无交付"把关），两者都算取消生效
+    done_any = any(e == "task_update" and d.get("status") in ("completed", "failed")
+                   for _, e, d in events_since(t0))
+    check("改口后取消生效（canceled/已完成压制）",
+          canceled is not None or done_any)
 
     # make sure no delivery speech happens for the canceled task afterwards
     time.sleep(10)

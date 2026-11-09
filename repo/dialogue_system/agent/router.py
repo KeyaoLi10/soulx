@@ -50,6 +50,7 @@ ROUTER_SYSTEM_PROMPT = """你是对话系统的控制路由器。本轮只调用
 "全部取消"必须有明确作用域；"那个取消"存在多个合理候选时澄清。
 不得根据"最近完成"自行改变用户话题焦点。
 evidence.quote 必须是本轮用户原文的连续片段，绝不能引用历史对话、任务名或你自己的话。
+用户这轮只是附和、催促或确认（如"好呀你快去查吧""嗯你去查吧""对对"）、指代的事务只在上一轮说过时：这轮的操作照样出（create_task/get_task 等），但 evidence.quote 必须留空字符串——本轮原文里没有事务内容可摘，宁缺毋滥，绝不能去抄历史对话。
 create_task/amend_task 的 goal 只能复述用户本轮原文说过的要求，不得补全用户没说的细节（如具体日期、哪一场比赛、哪个城市）；用户没说清时用 reply_mode=clarify 提问，绝不能自行假定后创建任务。
 "你在吗/你听得到吗/喂"这类确认在场或催促的话是闲聊：reply_mode=direct 且 operations 为空列表，不要当成任务追问。
 get_task 只在本轮原文确实在问任务的状态或结果时使用。
@@ -160,7 +161,9 @@ _REPAIR_NOTE = (
 _GROUNDING_NOTE = (
     "上一轮计划的证据引用 {quote} 不在本轮用户原文里——"
     "evidence.quote 只能摘自本轮用户原文的连续片段，绝不能引用历史"
-    "对话、任务名或你自己的话。本轮用户原文是：{text}\n重新调用 "
+    "对话、任务名或你自己的话；如果操作针对的事务本轮没有明说"
+    "（用户只是附和/催促，事务在上一轮），就把 evidence.quote 留空"
+    "字符串再提交。本轮用户原文是：{text}\n重新调用 "
     "route_turn；如果本轮没有提到任何任务或操作，用 reply_mode="
     "direct 且 operations 为空列表。")
 
@@ -172,6 +175,24 @@ _COVERAGE_NOTE = (
     "但计划只有 stop_speech——同句的其他要求也必须出对应操作（如 "
     "create_task），不能只停发言把其余要求丢掉。本轮用户原文是：{text}\n"
     "重新调用 route_turn。")
+
+# 取消目标修复提示（2026-11-07 晚实测事故：用户"你再重新数到十"——与
+# 任务毫无关系的琐碎请求——被路由成 cancel_tasks [T2 湖人比赛, T3 讲
+# 笑话]：运行中的查询被掐死；刚完成的 T3 落进 RC_ALREADY_COMPLETED
+# 分支被置 cancel_intent=1，交付泵永久拒播 → 14s 无声 + 闲聊路（单一
+# 出口纪律下无结果文本可说）无限"我给你讲个笑话听听？"死循环。温度 0
+# 下 few-shot 改口取消模板的先验压过"数数=direct"硬规则，须结构化校验）
+# get_task 目标修复提示（2026-11-09 上午事故："哎，你去查了吗？"被路由
+# 成 get_task 已完整播报过的天气任务 → 全文重播北京天气；用户的追问
+# 对象其实在途的另一个任务上）
+_GET_NOTE = (
+    "上一轮计划要查询的任务（{ids}）在本轮用户原文里没有被提到，而且"
+    "它的结果早已完整播报过——泛泛的进度追问（如「查了吗」「怎么样"
+    "了」）应该指向还没出结果或还没播报的任务，不该把已播报的旧任务"
+    "翻出来重播。本轮用户原文是：{text}\n重新调用 route_turn；如果用户"
+    "在催问还没完成的事，用 get_task 指向那个任务；如果要重听已播报的"
+    "结果，用户会明说「再讲一遍」；都不沾边就用空 operations 配合适的"
+    " reply_mode。")
 
 # 取消目标修复提示（2026-11-07 晚实测事故：用户"你再重新数到十"——与
 # 任务毫无关系的琐碎请求——被路由成 cancel_tasks [T2 湖人比赛, T3 讲
@@ -280,6 +301,59 @@ def _cancel_targets_ungrounded(plan: C.Plan, snapshot: dict,
     return bad
 
 
+# 重播意图词：用户明确要"再听一遍结果"——get_task 重播已完整播报过的
+# 结果的唯一合法入口。纯状态问句（"查了吗/怎么样了"）不算（2026-11-09
+# 事故："哎，你去查了吗？"被路由成 get_task 已播报的天气任务 → 全文
+# 重播北京天气）
+_REPLAY_RE = re.compile(r"再.{0,4}(说|讲|播|报|念)|重新|一遍|重说|重播")
+
+
+def _get_task_target_ungrounded(plan: C.Plan, snapshot: dict,
+                                user_text: str):
+    """返回不该被 get_task 指向的"已了结"目标 task_id 列表（空=放行）。
+
+    对称晚九取消守卫（2026-11-09 事故）：get_task 目标有问题 = 同时
+    满足——
+    ① 本轮话语没提到该任务（label 二元字组不命中：用户提任务必然带
+    话题词，与取消守卫同一判定）；
+    ② 任务已了结（终态且结果已完整播报/已取消播报——没有可等的东西，
+    泛泛的"查了吗"不该落到它头上）；
+    ③ 本轮没有重播意图（"再讲一遍"类是显式重播，任意目标合法）。
+    未完成 / 结果还没完整播出的目标放行：泛泛追问的天然落点（事故
+    正解：C罗在途、天气已播，"你去查了吗"该指 C罗）。快照外的 id
+    交给 store 的 unknown_task 拒绝，不在此拦。"""
+    hay = _norm_text(user_text)
+    if _REPLAY_RE.search(hay):
+        return []
+    hay_bg = _bigrams(hay)
+    refs = {}
+    for t in (snapshot or {}).get("tasks", []) \
+            + (snapshot or {}).get("recent_terminal", []):
+        tid = t.get("task_id")
+        if tid:
+            refs[tid] = t
+    bad = []
+    for o in plan.operations:
+        if o.op != "get_task":
+            continue
+        if not getattr(o, "target_task_id", ""):
+            continue   # 列表查询（无目标）不拦
+        t = refs.get(o.target_task_id)
+        if t is None:
+            continue
+        if t.get("execution_status") not in ("completed", "failed",
+                                             "canceled", "superseded"):
+            continue   # 未完成：泛泛追问的合法落点
+        if not t.get("delivered") and not t.get("suppressed"):
+            continue   # 结果未完整播出：追问该触发重播
+        label = (_norm_text(t.get("label") or "")
+                 or _norm_text(t.get("goal") or ""))[:40]
+        if label and (_bigrams(label) & hay_bg):
+            continue   # 本轮明确提到了这个任务
+        bad.append(o.target_task_id)
+    return bad
+
+
 @dataclass
 class RouteResult:
     ok: bool = False
@@ -382,21 +456,35 @@ class PlanRouter:
                             last_error = ("cancel target not referenced: "
                                           + ",".join(bad_cancels))
                         else:
-                            leftover = _stop_only_leftover(plan, user_text)
-                            if not leftover:
-                                return RouteResult(
-                                    ok=True, plan=plan, plan_json=plan_json,
-                                    attempts=attempts,
-                                    finish_reason=res.finish_reason,
-                                    text=res.text,
-                                    latency_ms=int(
-                                        (time.monotonic() - started) * 1000),
-                                    frames_meta={"tool_calls": n_calls})
-                            # stop_speech-only 吞句：修复一轮，仍吞则终态
-                            # 拒绝（无声 + 请求被丢比让用户重说一遍更糟）
-                            last_error = (
-                                f"stop_speech-only plan left {leftover} "
-                                "chars unhandled")
+                            bad_gets = _get_task_target_ungrounded(
+                                plan, snapshot, user_text)
+                            if bad_gets:
+                                # get_task 指向已播报的旧任务且本轮没提
+                                # 到它：修复一轮（2026-11-09 重播事故），
+                                # 仍不接地则终态拒绝——把天气全文重播一
+                                # 遍比让用户重说一遍更糟
+                                last_error = (
+                                    "get_task target not referenced: "
+                                    + ",".join(bad_gets))
+                            else:
+                                leftover = _stop_only_leftover(plan, user_text)
+                                if not leftover:
+                                    return RouteResult(
+                                        ok=True, plan=plan,
+                                        plan_json=plan_json,
+                                        attempts=attempts,
+                                        finish_reason=res.finish_reason,
+                                        text=res.text,
+                                        latency_ms=int(
+                                            (time.monotonic() - started)
+                                            * 1000),
+                                        frames_meta={"tool_calls": n_calls})
+                                # stop_speech-only 吞句：修复一轮，仍吞则
+                                # 终态拒绝（无声 + 请求被丢比让用户重说
+                                # 一遍更糟）
+                                last_error = (
+                                    f"stop_speech-only plan left {leftover} "
+                                    "chars unhandled")
                 except C.PlanError as e:
                     last_error = f"parse: {e}"
             if i < self.repair_attempts:
@@ -409,6 +497,9 @@ class PlanRouter:
                         quote=last_error.split(": ", 1)[1], text=user_text)
                 elif last_error.startswith("cancel target"):
                     note = _CANCEL_NOTE.format(
+                        ids=last_error.split(": ", 1)[1], text=user_text)
+                elif last_error.startswith("get_task target"):
+                    note = _GET_NOTE.format(
                         ids=last_error.split(": ", 1)[1], text=user_text)
                 elif last_error.startswith("stop_speech-only"):
                     note = _COVERAGE_NOTE.format(

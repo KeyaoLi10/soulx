@@ -936,6 +936,7 @@ input[type="range"] {
 .task-status[data-s="running"] { color: var(--accent); border-color: rgba(34, 211, 238, 0.4); }
 .task-status[data-s="completed"], .task-status[data-s="delivered"] { color: var(--green); border-color: rgba(52, 211, 153, 0.4); }
 .task-status[data-s="failed"] { color: var(--amber); border-color: rgba(245, 158, 11, 0.4); }
+.task-status[data-s="interrupted"] { color: var(--amber); border-color: rgba(245, 158, 11, 0.4); }
 
 .task-goal {
   font-size: 12px;

@@ -66,6 +66,13 @@ _ACK_RE = re.compile(
 # 一下马上告诉你"。0.9s 碎片、1s 纠错都远小于窗口。
 _CONT_MERGE_WINDOW_S = 8.0
 
+# 折中根修（2026-11-09 上午事故）：独立话轮不杀上一话轮的在途路由，
+# 新话轮 worker 改为有界等待它返回并落地——上限 5s（实测接地修复轮
+# 路由 10.5s，从用户开口起算通常 5s 内已返回一半以上；等待期间闲聊路
+# 已先行启动，不拖慢本轮首句上口）。超时放弃等待但依然不断流：旧路由
+# 返回后自行走 grace 提交，或被更高 seq 的新挂起计划按 §6.2 作废。
+_LAND_WAIT_INFLIGHT_S = 5.0
+
 # 提交门轮询间隔（秒）。只读时间戳，无锁竞争。
 GRACE_POLL_S = 0.05
 # 路由失败时的固定澄清话术（§6.2：超时/失败必须有终态并释放队列）
@@ -170,7 +177,11 @@ class AgentFrontendAdapter:
             for r in rows:
                 status = _UI_STATUS_MAP.get(
                     r["execution_status"], r["execution_status"])
-                if status == "completed" and r.get("delivered"):
+                if status == "completed" and r.get("interrupted"):
+                    # 播报被打断：区别于"待播报/已播报"（2026-11-09 复读
+                    # 事故——面板显示"已完成"但既没播也不许吊着用户）
+                    status = "interrupted"
+                elif status == "completed" and r.get("delivered"):
                     status = "delivered"
                 key = (status, r.get("progress", ""), r.get("result", ""))
                 if seen.get(r["task_id"]) == key:
@@ -245,8 +256,9 @@ class AgentFrontendAdapter:
         自然成为 no-op）。
 
         流程（§6/§7，2026-11-06 双路并行）：
-          1. 上一话轮的计划还没过 grace 门 → 作废；窗口内续说合并文本
-             重路由，长间隔（独立话轮）则把挂起计划 land 落地、不合并
+          1. 上一话轮的计划还没过 grace 门 → 窗口内（碎片续说）作废并
+             合并文本重路由；长间隔（独立话轮）不断流在途路由——挂起
+             计划 land 落地、在途路由由新 worker 有界等待后落地
           2. 闲聊路（chitchat_fn）与路由并行启动：闲聊路过 grace 门后
              生成+流式上口，负责本轮常规口播
           3. submit_request（路由，3-6s）→ 计划挂起 → 等 grace 门开
@@ -254,6 +266,9 @@ class AgentFrontendAdapter:
           4. 纠错/失败类回执上口；闲聊路失败时 clarify/表达轮兜底
         """
         turn_land = False
+        # 折中根修（2026-11-09）：窗口外且上一 worker 还活着（在途路由）
+        # 时，新 worker 先有界等待上一路由返回并落地，再提交自己的路由
+        land_wait_prev = None
         with self._utterance_lock:
             self._turn_seq += 1
             turn_seq = self._turn_seq
@@ -296,17 +311,10 @@ class AgentFrontendAdapter:
                     ages.append(pend_age)
                 age = max(ages) if ages else 0.0
                 if prev_uncommitted:
-                    # abandoned 置在 prev_turn（worker 自己持有的 dict）上
-                    # 才真正生效
-                    prev_turn["abandoned"] = True
-                    # 掐上一话轮的在途路由：断流让服务端取消生成、释放
-                    # GEN_LOCK——否则新话轮的路由要排在死话轮的生成后面
-                    # （2026-11-07 复读事故：queue_wait 被死路由推到 5-10s）
-                    prev_route_stop = prev_turn.get("route_stop")
-                    if prev_route_stop is not None:
-                        prev_route_stop.set()
-                    # 闲聊路一并作废：停生成（已发射的音频由新话轮的上口
-                    # interrupt 掐掉，与回执让路同一套语义）
+                    # 闲聊路一律作废（两个分支都掐）：停生成——已发射的
+                    # 音频由新话轮的上口 interrupt 掐掉，与回执让路同一
+                    # 套语义。旧 voice lane 的口播已过时，留着只会两路
+                    # 闲聊并线抢 TTS
                     prev_stop = prev_turn.get("chitchat_stop")
                     if prev_stop is not None:
                         prev_stop.set()
@@ -316,7 +324,30 @@ class AgentFrontendAdapter:
                     # 在路由前落地（land_pending）——任务不能因为用户
                     # 一直在说话就永远建不出来
                     turn_land = True
+                    if prev_uncommitted:
+                        # 折中根修（2026-11-09 上午事故）：独立话轮绝不
+                        # 杀在途路由。route_stop 断流作废的是"还没返回的
+                        # 路由"，而 land 只能落地"已返回并挂起"的计划——
+                        # 两头落空，请求永远停在 registered（C罗查询 11s
+                        # 从未 committed，靠用户连问三遍才建出任务）。
+                        # 旧路由放行到底：新 worker 有界等待它返回并立即
+                        # 落地（_land_inflight_bounded，最多
+                        # _LAND_WAIT_INFLIGHT_S）；超时则放其自行了结
+                        # （grace 提交 / 被更高 seq 的新挂起计划作废），
+                        # 有界，不会无限占 GEN_LOCK。
+                        land_wait_prev = prev_turn
                 else:
+                    if prev_uncommitted:
+                        # abandoned 置在 prev_turn（worker 自己持有的 dict）
+                        # 上才真正生效——只属于碎片续说分支
+                        prev_turn["abandoned"] = True
+                        # 掐上一话轮的在途路由：断流让服务端取消生成、
+                        # 释放 GEN_LOCK——否则新话轮的路由要排在死话轮
+                        # 的生成后面（2026-11-07 复读事故：queue_wait 被
+                        # 死路由推到 5-10s）
+                        prev_route_stop = prev_turn.get("route_stop")
+                        if prev_route_stop is not None:
+                            prev_route_stop.set()
                     self.runtime.discard_pending(self.session_id,
                                                  reason="continuation")
                     # 续说合并：被作废片段的文本并入新句一起重路由
@@ -336,6 +367,9 @@ class AgentFrontendAdapter:
                 "route_stop": threading.Event(),
                 # 长间隔新话轮：worker 先把上一句的挂起计划落地再路由
                 "land": turn_land,
+                # 独立话轮且上一 worker 活着：新 worker 有界等待其在途
+                # 路由返回并落地（2026-11-09 折中根修），值为上一 turn
+                "land_wait_prev": land_wait_prev,
                 # 闲聊路（voice lane）状态：stop 掐生成；rc 三态与 speak_fn
                 # 一致；failed=异常（仲裁回退旧路径）；done=线程收尾
                 "chitchat_stop": threading.Event(),
@@ -365,6 +399,15 @@ class AgentFrontendAdapter:
             route_stop = turn.get("route_stop")
             if route_stop is not None:
                 route_stop.set()
+            # 折中根修伴生（2026-11-09）：独立话轮放行的旧在途路由也要
+            # 一并断流——手动停止是唯一比"任务别丢"更优先的信号，否则
+            # 停完话旧路由返回还会提交计划、上口回执
+            prev = turn.get("land_wait_prev")
+            if prev is not None:
+                prev["abandoned"] = True
+                prev_stop = prev.get("route_stop")
+                if prev_stop is not None:
+                    prev_stop.set()
         try:
             self.runtime.discard_pending(self.session_id, reason="user_stop")
         except Exception:  # noqa: BLE001
@@ -415,6 +458,53 @@ class AgentFrontendAdapter:
             # 无声轮若不释放则标志永久 True → 后台交付被永久拒绝
             # （2026-11-06 listening 卡死事故的致命一环）。
             self._release_gen(gen_sn)
+
+    def _land_inflight_bounded(self, turn, budget_s: Optional[float] = None):
+        """有界等待上一话轮的在途路由返回并落地（2026-11-09 折中根修）。
+
+        独立话轮不再断流旧路由（route_stop 只会作废还没返回的路由，
+        land 又只救已挂起的计划——两头落空），改由本 worker 等它返回：
+        挂起计划一出现就 land_pending 强制提交（跳 grace——那句话早
+        说完了），新路由的快照因此能看到刚建的任务。结束条件：
+        - 挂起计划出现 → 落地后返回（上一 worker 的 grace 循环会看到
+          pending 消失自行退场）
+        - 上一话轮自己提交了 / worker 退场（路由失败退出）→ 返回
+        - 超时（默认 _LAND_WAIT_INFLIGHT_S）→ 放弃等待：旧路由返回后
+          自行走 grace 提交，或被本话轮更高 seq 的挂起计划按 §6.2
+          作废——有界，不占死
+        打断（speak 返回 False）即终态，本轮路由不再提交。
+        budget_s=None 时读模块常量（测试可压短）。
+        """
+        if budget_s is None:
+            budget_s = _LAND_WAIT_INFLIGHT_S
+        prev = turn.get("land_wait_prev")
+        if prev is None:
+            return
+        deadline = time.time() + budget_s
+        while time.time() < deadline:
+            if self._stop.is_set() or turn.get("abandoned"):
+                return
+            if prev.get("committed") or not prev["thread"].is_alive():
+                return   # 上一话轮已自行了结（grace 提交/路由失败退出）
+            if self.runtime.pending_exists(self.session_id):
+                try:
+                    landed = self.runtime.land_pending(
+                        self.session_id, chitchat_spoke=True)
+                except Exception:  # noqa: BLE001 — 落地失败不拦新话轮
+                    logger.exception("[%s][v2] land inflight failed",
+                                     self.session_id[:8])
+                    return
+                logger.info("[%s][v2] inflight route landed after %.1fs",
+                            self.session_id[:8], budget_s - (
+                                deadline - time.time()))
+                if landed is not None:
+                    for receipt_text in landed.get("texts") or []:
+                        if not self._speak_safe(receipt_text):
+                            return   # 打断即终态
+                return
+            time.sleep(self.grace_poll_s)
+        logger.info("[%s][v2] land inflight wait budget exhausted (%.0fs)",
+                    self.session_id[:8], budget_s)
 
     def _chitchat_worker(self, turn):
         """闲聊路（voice lane）：grace 门开后生成 + 流式上口，与路由路
@@ -481,12 +571,22 @@ class AgentFrontendAdapter:
                 target=self._chitchat_worker, daemon=True,
                 name=f"agent-v2-chat-{self.session_id[:8]}",
                 args=(turn,)).start()
+        # 折中根修（2026-11-09）：独立话轮不杀上一话轮的在途路由，这里
+        # 有界等待它返回并立即落地（闲聊路已启动，等待不拖首句上口）。
+        # 落地必须赶在本话轮 submit_request 之前——新路由返回时会按
+        # seq 覆盖挂起计划，上一句的 create 就被静默丢掉了
+        if turn.get("land_wait_prev") is not None:
+            self._land_inflight_bounded(turn)
         res = self.runtime.submit_request(
             self.session_id, text, source_commit_id=source_commit_id,
             request_seq=turn.get("seq"), stop_event=turn.get("route_stop"))
-        if turn.get("abandoned"):
+        if turn.get("abandoned") or res.get("stale"):
             # 本话轮已被更新话轮取代（路由被取消/结果作废）——不是失败，
-            # 绝不能说 ROUTER_FAIL_TEXT（用户会听到莫名其妙的"没理清"）
+            # 绝不能说 ROUTER_FAIL_TEXT（用户会听到莫名其妙的"没理清"）。
+            # stale：路由结果因 seq 落后被丢弃（2026-11-09 起独立话轮不再
+            # 断流旧路由，慢路由可能晚于新话轮返回）——本 worker 已无事
+            # 可做，挂起计划归新话轮，也不得再走 grace/commit（会把别人
+            # 的挂起计划当自己的提交）
             return
         if not res.get("ok"):
             # 路由失败/超时：终态 + 固定澄清（§6.2），队列已释放。
