@@ -49,27 +49,50 @@ class QwenLLM_stream:
     MAX_BUFFER_LEN = 30
     MAX_BUFFER_SESSION = 5
 
-    # keep in sync with frontend/script.js DEFAULT_PERSONA and
-    # services/qwen35_fused_server.py SYSTEM_PROMPT. Chinese-first on
-    # purpose: a one-line English persona loses to the model's Chinese
-    # assistant prior ("我是小爱同学" incident, 2026-11-05 session fb4870f6
-    # — asked 你先介绍一下你自己, the model answered as Xiaomi's assistant
-    # despite the Elva prompt). The identity block anchors the name with
-    # explicit negatives.
-    SYSTEM_PROMPT = (
-        "你是 Elva，一个温柔、自然的语音对话助手，正在通过语音和用户实时聊天。"
-        "请用简短、口语化的自然中文回答，就像真人说话一样；不要输出多余解释，"
-        "不要用列表或 Markdown 格式。"
-        "用户表示同意、附和或只是简单回应时，顺着上文继续说即可。"
-        "说话要像真人：应承、附和、告别这些高频话不要每次都用一模一样的句子，"
-        "开口前看一眼自己刚才说过什么，刚用过的句式就换一个说法——"
-        "重复的固定句式听起来非常机械。"
-        "用户让你停下时，就什么都不要说。"
-        "身份必须始终如一：你的名字是 Elva。被问到“你是谁”时，"
-        "用一两句口语化的中文介绍自己是 Elva。"
-        "你不是小爱同学、不是 Siri、不是小度，也不是任何手机或其他公司自带的"
-        "语音助手——永远不要用这些身份自称或介绍自己。"
+    # Persona 拆分（2026-11-09 用户指令）：说话风格纪律收归服务端私有
+    # （STYLE_PROMPT），UI / settings["system_prompt"] 只承载身份类设定
+    # （"你叫 Elva"这类一句话身份，frontend DEFAULT_PERSONA 与之同步）。
+    # compose_system_prompt() 是唯一组装口，所有调用方一律走它——风格
+    # 的演进只改服务端，不再依赖 UI 里残留的旧文本。
+    # 系统目标是完全拟人（用户无法分辨真人/机器），风格纪律按"打电话"
+    # 而不是"写文章"设计；不含任何"被问是否 AI 时否认"类欺骗指令——
+    # 拟人做到风格层，身份被直接问到时不撒谎。
+    # Chinese-first on purpose: a one-line English persona loses to the
+    # model's Chinese assistant prior ("我是小爱同学" incident, 2026-11-05
+    # session fb4870f6 — asked 你先介绍一下你自己, the model answered as
+    # Xiaomi's assistant despite the Elva prompt). The identity block
+    # anchors the name with explicit negatives.
+    DEFAULT_IDENTITY = (
+        "你是 Elva，一个温柔、自然的女生，正在通过语音和用户实时聊天。"
     )
+    STYLE_PROMPT = (
+        "【说话方式——必须遵守】\n"
+        "你在打电话，不是在写文章：全程用口语化的中文，句子要短，"
+        "一次只说一两句，说完就停，等对方开口。\n"
+        "不要有助手腔：不说“希望这能帮到你”“总的来说”“以下是”这类书面客套话，"
+        "不用列表、编号、Markdown，不念标点、符号和单位缩写。\n"
+        "像真人一样有分寸：用户只是应承、附和或简单回应时，顺着接一两个词就行，"
+        "不要重新展开话题；用户让你停下时，就什么都不要说。\n"
+        "别机械重复：开口前看一眼自己刚才说过什么，刚用过的词和句式就换一个说法，"
+        "“嗯”“好呀”“我去看看”这类高频话不要每次一模一样。\n"
+        "像真人一样诚实：没把握就说“我不太确定”“我查一下”，"
+        "绝不编造具体的数字、名字或事实；不知道的直接说不知道。\n"
+        "数字和日期要念得自然：说“三点五”而不是“3.5”。\n"
+        "身份必须始终如一：以上面的身份为准，被问到“你是谁”时，"
+        "用一两句口语化的中文介绍自己。你不是小爱同学、不是 Siri、不是小度，"
+        "也不是任何手机或其他公司自带的语音助手——永远不要用这些身份自称或"
+        "介绍自己。"
+    )
+    # keep in sync with services/qwen35_fused_server.py SYSTEM_PROMPT
+    # (only used when the caller doesn't send one — the app always does).
+    SYSTEM_PROMPT = DEFAULT_IDENTITY + "\n" + STYLE_PROMPT
+
+    @classmethod
+    def compose_system_prompt(cls, identity=None):
+        """身份（可被 UI / settings["system_prompt"] 覆盖）+ 服务端风格
+        纪律 → 完整 system prompt。identity 为空串/None 时回落默认身份。"""
+        ident = (identity or "").strip() or cls.DEFAULT_IDENTITY
+        return ident + "\n" + cls.STYLE_PROMPT
 
     def __init__(self, api_url: str = "http://localhost:6007/chat"):
         self.api_url = api_url
@@ -159,7 +182,9 @@ class QwenLLM_stream:
     ):
         """Stream the reply for a session.
 
-        system_prompt: per-session persona override (None = class default).
+        system_prompt: per-session identity override, identity-only
+            ("你叫 Elva" 这类一句话身份，不再含风格纪律). Callers pass
+            compose_system_prompt(...) output; None = class default.
         max_history: how many past turns to include (None = class default).
         min_seg_len: minimum characters before a segment is yielded for TTS
             (None = class default). Smaller = audio starts sooner.
@@ -343,6 +368,11 @@ class QwenLLM_stream:
             pass
 
 
+# module-level alias：persona 组装唯一入口（app.py / settings.py 统一从
+# 这里 import，避免各调用方各自拼接漂移）
+compose_system_prompt = QwenLLM_stream.compose_system_prompt
+
+
 class ControlStreamError(Exception):
     """/agent_chat_v2 协议违规（帧超限/非 JSON 行/非 v2 帧）。"""
 
@@ -471,168 +501,6 @@ class AgentControlClient:
             text="".join(text_parts), reasoning="".join(reason_parts),
             tool_calls=calls, finish_reason=finish, error=error,
             interrupted=bool(stop_event is not None and stop_event.is_set()))
-
-
-class QwenLLM_IndexTTS_stream:
-    MAX_BUFFER_SESSION = 5
-    # keep in sync with frontend/script.js DEFAULT_PERSONA and
-    # services/qwen35_fused_server.py SYSTEM_PROMPT. Chinese-first on
-    # purpose: a one-line English persona loses to the model's Chinese
-    # assistant prior ("我是小爱同学" incident, 2026-11-05 session fb4870f6
-    # — asked 你先介绍一下你自己, the model answered as Xiaomi's assistant
-    # despite the Elva prompt). The identity block anchors the name with
-    # explicit negatives.
-    SYSTEM_PROMPT = (
-        "你是 Elva，一个温柔、自然的语音对话助手，正在通过语音和用户实时聊天。"
-        "请用简短、口语化的自然中文回答，就像真人说话一样；不要输出多余解释，"
-        "不要用列表或 Markdown 格式。"
-        "用户表示同意、附和或只是简单回应时，顺着上文继续说即可。"
-        "说话要像真人：应承、附和、告别这些高频话不要每次都用一模一样的句子，"
-        "开口前看一眼自己刚才说过什么，刚用过的句式就换一个说法——"
-        "重复的固定句式听起来非常机械。"
-        "用户让你停下时，就什么都不要说。"
-        "身份必须始终如一：你的名字是 Elva。被问到“你是谁”时，"
-        "用一两句口语化的中文介绍自己是 Elva。"
-        "你不是小爱同学、不是 Siri、不是小度，也不是任何手机或其他公司自带的"
-        "语音助手——永远不要用这些身份自称或介绍自己。"
-    )
-
-    def __init__(self, api_url="http://localhost:6007/chat_indextts"):
-        self.api_url = api_url
-        self.sessions = {}
-
-    def get_session(self, client_id):
-        if client_id not in self.sessions:
-            self.sessions[client_id] = []
-        return self.sessions[client_id]
-
-    def add_message(self, client_id, role, content):
-        session = self.get_session(client_id)
-        session.append({"role": role, "content": content})
-
-        merged = []
-        for role_key, group in groupby(session, key=lambda x: x["role"]):
-            contents = [msg["content"] for msg in group]
-            merged.append({"role": role_key, "content": "\n".join(contents)})
-
-        self.sessions[client_id] = merged[-self.MAX_BUFFER_SESSION :]
-
-    def generate_with_history(self, client_id, stop_event=None):
-        messages = self.get_session(client_id)
-        conversation = [{"role": "system", "content": self.SYSTEM_PROMPT}] + messages
-
-        response = None
-        try:
-            response = requests.post(
-                self.api_url, json={"messages": conversation}, stream=True, timeout=60
-            )
-
-            seg = ""
-
-            for chunk in response.iter_content(chunk_size=None, decode_unicode=False):
-                if stop_event and stop_event.is_set():
-                    break
-
-                if not chunk:
-                    continue
-
-                tag = chunk[:1]
-                payload = chunk[1:]
-
-                if tag == b"B":
-                    tmp = seg.strip()
-                    seg = ""
-                    yield {"text": tmp, "wav": payload}
-                else:
-                    seg += payload.decode("utf-8")
-
-        except Exception as e:
-            print(f"Qwen or IndexTTS API call failed: {e}")
-            yield {"text": "Sorry, I cannot answer right now.", "wav": b""}
-        finally:
-            # close the socket on EVERY path (normal end, stop, timeout) —
-            # an unclosed abandoned response kept the connection alive so
-            # the server never saw the disconnect and kept generating
-            if response is not None:
-                response.close()
-
-
-class QwenLLM_Cosyvoice_stream:
-    MAX_BUFFER_SESSION = 5
-    # keep in sync with frontend/script.js DEFAULT_PERSONA and
-    # services/qwen35_fused_server.py SYSTEM_PROMPT. Chinese-first on
-    # purpose: a one-line English persona loses to the model's Chinese
-    # assistant prior ("我是小爱同学" incident, 2026-11-05 session fb4870f6
-    # — asked 你先介绍一下你自己, the model answered as Xiaomi's assistant
-    # despite the Elva prompt). The identity block anchors the name with
-    # explicit negatives.
-    SYSTEM_PROMPT = (
-        "你是 Elva，一个温柔、自然的语音对话助手，正在通过语音和用户实时聊天。"
-        "请用简短、口语化的自然中文回答，就像真人说话一样；不要输出多余解释，"
-        "不要用列表或 Markdown 格式。"
-        "用户表示同意、附和或只是简单回应时，顺着上文继续说即可。"
-        "说话要像真人：应承、附和、告别这些高频话不要每次都用一模一样的句子，"
-        "开口前看一眼自己刚才说过什么，刚用过的句式就换一个说法——"
-        "重复的固定句式听起来非常机械。"
-        "用户让你停下时，就什么都不要说。"
-        "身份必须始终如一：你的名字是 Elva。被问到“你是谁”时，"
-        "用一两句口语化的中文介绍自己是 Elva。"
-        "你不是小爱同学、不是 Siri、不是小度，也不是任何手机或其他公司自带的"
-        "语音助手——永远不要用这些身份自称或介绍自己。"
-    )
-
-    def __init__(self, api_url="http://localhost:6007/chat_cosyvoice"):
-        self.api_url = api_url
-        self.sessions = {}
-
-    def get_session(self, client_id):
-        if client_id not in self.sessions:
-            self.sessions[client_id] = []
-        return self.sessions[client_id]
-
-    def add_message(self, client_id, role, content):
-        session = self.get_session(client_id)
-        session.append({"role": role, "content": content})
-
-        merged = []
-        for role_key, group in groupby(session, key=lambda x: x["role"]):
-            contents = [msg["content"] for msg in group]
-            merged.append({"role": role_key, "content": "\n".join(contents)})
-
-        self.sessions[client_id] = merged[-self.MAX_BUFFER_SESSION :]
-
-    def generate_with_history(self, client_id, stop_event=None):
-        messages = self.get_session(client_id)
-        conversation = [{"role": "system", "content": self.SYSTEM_PROMPT}] + messages
-
-        try:
-            response = requests.post(
-                self.api_url, json={"messages": conversation}, stream=True, timeout=60
-            )
-
-            seg = ""
-
-            for chunk in response.iter_content(chunk_size=None, decode_unicode=False):
-                if stop_event and stop_event.is_set():
-                    response.close()
-                    break
-
-                if not chunk:
-                    continue
-
-                tag = chunk[:1]
-                payload = chunk[1:]
-
-                if tag == b"B":
-                    tmp = seg.strip()
-                    seg = ""
-                    yield {"text": tmp, "wav": payload}
-                else:
-                    seg += payload.decode("utf-8")
-
-        except Exception as e:
-            print(f"Qwen or Cosyvoice API call failed: {e}")
-            yield {"text": "Sorry, I cannot answer right now.", "wav": b""}
 
 
 # test

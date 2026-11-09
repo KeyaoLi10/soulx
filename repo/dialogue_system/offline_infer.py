@@ -13,12 +13,7 @@ import torchaudio
 import argparse
 from omegaconf import OmegaConf
 
-from clients.tts_client import IndexTTS_VLLM, Cosyvoice_Streaming_VLLM
-from clients.llm_client import (
-    QwenLLM_stream,
-    QwenLLM_IndexTTS_stream,
-    QwenLLM_Cosyvoice_stream,
-)
+from clients.llm_client import QwenLLM_stream
 from clients.vad_client import TurnTaking
 from modules.utils.backchannel_utils import check_backchannel
 from modules.utils.text_utils import split_cn_en
@@ -685,14 +680,14 @@ def main():
     print(f"Found {len(wav_files)} wav files for evaluation.")
 
     vad_api = TurnTaking()
+    # 2026-11-09：IndexTTS/Cosyvoice/FireRedTTS 全线退役，离线模拟器统一
+    # 走 /chat（纯文本流）——历史 --streaming_tts 分支随之失效，保留旗标
+    # 只为老命令行兼容。
     if args.streaming_tts:
-        print("[OfflineSimulator] Using streaming Cosyvoice model.")
-        llm_api = QwenLLM_Cosyvoice_stream()
-        tts_api = None
-    else:
-        print("[OfflineSimulator] Using IndexTTS model.")
-        llm_api = QwenLLM_IndexTTS_stream()
-        tts_api = None
+        print("[OfflineSimulator] --streaming_tts is a no-op now "
+              "(legacy fused TTS endpoints removed).")
+    llm_api = QwenLLM_stream()
+    tts_api = None
 
     simulator = OfflineDuplexSimulator(
         vad_api=vad_api,

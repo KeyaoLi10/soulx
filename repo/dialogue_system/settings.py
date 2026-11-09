@@ -26,17 +26,18 @@ class Config:
     PORT = 8090
 
 
-# Command-line TTS engine choice (TTS_ENGINE env) only sets the DEFAULT_SETTINGS
-# default below; the live engine is chosen per session from the web UI panel.
-TTS_ENGINE = os.environ.get("TTS_ENGINE", "voxcpm")
-
 # Per-session live settings (web UI "Settings" panel, applied via the
-# update_config WS event; no restart needed).
+# update_config WS event; no restart needed). 2026-11-09: VoxCPM2 is the
+# only TTS and the SoulX turn server the only turn engine — the tts_engine /
+# turn_engine selectors were removed along with FireRedTTS and the FRC
+# dual-EOT engine; the VoxCPM LoRA checkpoint (tts_lora) is selectable live.
 DEFAULT_SETTINGS = {
-    "system_prompt": QwenLLM_stream.SYSTEM_PROMPT,
+    # identity-only（2026-11-09 persona 拆分）：UI / settings 只承载身份类
+    # 设定（"你叫 Elva"），说话风格纪律在服务端 STYLE_PROMPT，由
+    # QwenLLM_stream.compose_system_prompt() 组装——此值不再存全文 prompt
+    "system_prompt": QwenLLM_stream.DEFAULT_IDENTITY,
     "max_history": 5,          # LLM memory turns
     "min_seg_len": 10,         # chars before a segment is sent to TTS
-    "tts_engine": TTS_ENGINE,  # voxcpm | firered
     "tts_cfg": 2.0,            # VoxCPM2 expressiveness
     "tts_timesteps": 10,       # VoxCPM2 quality steps
     # (voice: fixed by the TTS server's anchor reference, not a setting —
@@ -88,14 +89,11 @@ DEFAULT_SETTINGS = {
     # env var at startup. While legacy background tasks are still
     # running, enforce defers to the legacy path until they drain.
     "agent_runtime_mode": os.environ.get("AGENT_RUNTIME_MODE", "legacy"),
-    # Voice frontend processing mode. "soulx" = SoulX-Duplug turn server
-    # (:8000, the default this system was built around). "frc" =
-    # FireRedChat architecture (frc_engine.py): pvad speech-activity
-    # endpointing + dual EOT (ultraVAD audio + Qwen first-token 是/否) +
-    # FireRedASR — same LLMs and TTS, different turn-taking. TTS/LLM
-    # services are shared, the FRC-only services (ultraVAD :8082,
-    # FireRedASR :8010) must be running for "frc".
-    "turn_engine": "soulx",
+    # VoxCPM LoRA checkpoint 选择（2026-11-09 双 checkpoint）：服务端
+    # (services/voxcpm_tts_server.py) 同时加载 step_0000500 / step_0000400
+    # 两份 LoRA，请求按此值路由；UI 下拉可实时切换。500 是长期默认
+    # （400 曾实测数数音色崩，见 memory soulx-voxcpm-lora-enum-instability）。
+    "tts_lora": "step_0000500",
     # Wait-path silence confirmation after an <|user_incomplete|>: how long
     # the user must stay quiet before the reply fires. Live-tunable; shown
     # as ms in the UI and pushed to the turn server as max_wait_num chunks
@@ -155,9 +153,8 @@ SETTING_RULES = {
     "delivery_bargein_chunks": (int, 1, 20),
     "delivery_bargein_span_ms": (int, 0, 5000),
 }
-TTS_ENGINES = ("voxcpm", "firered")
 PVAD_MODES = ("off", "shadow", "enforce")
-TURN_ENGINES = ("soulx", "frc")
+TTS_LORAS = ("step_0000500", "step_0000400")
 AGENT_RUNTIME_MODES = ("legacy", "shadow", "enforce")
 
 
@@ -201,12 +198,10 @@ def sanitize_updates(data) -> dict:
         else:  # str
             if isinstance(value, str):
                 clean[key] = value[:hi]
-    if data.get("tts_engine") in TTS_ENGINES:
-        clean["tts_engine"] = data["tts_engine"]
     if data.get("pvad_mode") in PVAD_MODES:
         clean["pvad_mode"] = data["pvad_mode"]
-    if data.get("turn_engine") in TURN_ENGINES:
-        clean["turn_engine"] = data["turn_engine"]
+    if data.get("tts_lora") in TTS_LORAS:
+        clean["tts_lora"] = data["tts_lora"]
     if data.get("agent_runtime_mode") in AGENT_RUNTIME_MODES:
         clean["agent_runtime_mode"] = data["agent_runtime_mode"]
     if "agent_enabled" in data:

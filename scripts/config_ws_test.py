@@ -110,7 +110,7 @@ s = send_update(ws, {
     "system_prompt": "You are a pirate captain. Answer in one short sentence.",
     "max_history": 12,
     "min_seg_len": 6,
-    "tts_engine": "voxcpm",
+    "tts_lora": "step_0000400",
     "tts_cfg": 3.5,
     "tts_timesteps": 20,
     "turn_wait_ms": 1600,
@@ -124,7 +124,8 @@ check("config_applied steps=20", s.get("tts_timesteps") == 20)
 check("config_applied turn_wait_ms=1600", s.get("turn_wait_ms") == 1600)
 check("config_applied turn_grace_ms=1500", s.get("turn_grace_ms") == 1500)
 check("removed key tts_voice_desc ignored", "tts_voice_desc" not in s)
-check("config_applied engine", s.get("tts_engine") == "voxcpm")
+check("removed key tts_engine ignored", "tts_engine" not in s)
+check("config_applied lora", s.get("tts_lora") == "step_0000400")
 
 # turn_wait_ms=1600 must reach the turn server as max_wait_num=10 chunks.
 # The web app pushes it via the config message, BUT the pooled TurnTaking
@@ -158,7 +159,7 @@ s2 = send_update(ws, {
     "tts_cfg": "not-a-number",   # ignored, keeps 3.5
     "tts_timesteps": 1e9,        # clamp to 40
     "system_prompt": 12345,      # wrong type, ignored
-    "tts_engine": "voiceclone",  # invalid, ignored
+    "tts_lora": "step_0000123",  # invalid, ignored
     "turn_wait_ms": 99999,       # clamp to 3200
     "turn_grace_ms": -100,       # clamp to 0 (window disabled)
     "evil_key": "x",             # unknown, ignored
@@ -168,7 +169,7 @@ check("clamp min_seg_len=4", s2.get("min_seg_len") == 4)
 check("bad cfg ignored (3.5)", s2.get("tts_cfg") == 3.5)
 check("clamp timesteps=40", s2.get("tts_timesteps") == 40)
 check("bad persona ignored", s2.get("system_prompt") == "You are a pirate captain. Answer in one short sentence.")
-check("bad engine ignored", s2.get("tts_engine") == "voxcpm")
+check("bad lora ignored", s2.get("tts_lora") == "step_0000400")
 check("clamp turn_wait_ms=3200", s2.get("turn_wait_ms") == 3200)
 check("clamp turn_grace_ms=0", s2.get("turn_grace_ms") == 0)
 check("unknown key ignored", "evil_key" not in s2)

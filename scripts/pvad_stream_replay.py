@@ -33,9 +33,9 @@ try:
 except ImportError:
     # Part D runs under the ECAPA venv (full_duplex/venv-frc), which lacks
     # the web app's client stack. settings.py needs only the
-    # QwenLLM_stream.SYSTEM_PROMPT default — stub the module.
+    # QwenLLM_stream.DEFAULT_IDENTITY default — stub the module.
     _llm = types.ModuleType("clients.llm_client")
-    _llm.QwenLLM_stream = types.SimpleNamespace(SYSTEM_PROMPT="")
+    _llm.QwenLLM_stream = types.SimpleNamespace(DEFAULT_IDENTITY="")
     _pkg = types.ModuleType("clients")
     _pkg.__path__ = []
     sys.modules["clients"] = _pkg
@@ -301,7 +301,10 @@ def part_d():
         return
     try:
         import torch
-        from livekit.plugins.fireredchat_pvad.vad import VadProcessor
+        # 2026-11-09: in-repo processor (services/pvad_proc.py) replaces the
+        # livekit plugin import — same _spk_extractor.get_embedding surface
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
+        from pvad_proc import PVADProcessor
     except ImportError as e:
         print("SKIP (no ECAPA venv:", e, ")")
         return
@@ -323,7 +326,7 @@ def part_d():
         a = epoch(h, m, s) - t0
         return mic[int(a * SR):int((a + d) * SR)]
 
-    proc = VadProcessor()
+    proc = PVADProcessor()
 
     def embed(wav):
         w = np.ascontiguousarray(wav[-80000:])    # pvad_server ENROLL_WINDOW

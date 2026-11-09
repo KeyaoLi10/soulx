@@ -426,10 +426,10 @@
         `<div class="t">${esc(cur.id)} ` +
         `<span class="dur">${fmtAbs(cur.start)} – ${fmtAbs(cur.end)} · ${fmtDur(cur.end - cur.start)} · ${cur.events.length} 事件</span></div>` +
         `<div class="chips">` +
-        chip("pvad", st.pvad_mode) + chip("turn", st.turn_engine) +
+        chip("pvad", st.pvad_mode) +
         chip("guard", st.playback_guard) + chip("wait", st.turn_wait_ms) +
         chip("grace", st.turn_grace_ms) + chip("asrfix", st.asr_correct) +
-        chip("tts", st.tts_engine) +
+        chip("lora", st.tts_lora) +
         chip("agent", st.agent_enabled) + `</div>`;
     }
 

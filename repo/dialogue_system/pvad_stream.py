@@ -41,7 +41,8 @@ Scope guards (the "no collateral damage when unused" invariant):
     worst failure.
   - shadow mode    => evaluates and reports (pvad_status.gated) but
     never suppresses.
-  - SoulX engine only (the FRC engine has its own pvad endpointing).
+  (The FRC engine that had its own pvad endpointing was removed 2026-11-09;
+  SoulX is the only turn engine.)
 """
 import logging
 import threading

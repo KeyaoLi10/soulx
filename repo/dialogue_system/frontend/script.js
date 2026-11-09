@@ -812,31 +812,16 @@ function updateCircleState(state) {
 // ==================== Live Settings Panel ====================
 // Mirrors backend DEFAULT_SETTINGS (app.py). Sent via `update_config`;
 // the server merges per-session and echoes back `config_applied`.
+//
+// Persona 拆分（2026-11-09）：这里只承载身份类设定（identity-only，
+// 与服务端 QwenLLM_stream.DEFAULT_IDENTITY 同步）。说话风格纪律在
+// 服务端 STYLE_PROMPT 里，由 compose_system_prompt() 组装，UI 不暴露、
+// 也不随设置回传——风格的演进只改服务端。
 const DEFAULT_PERSONA =
-  "你是 Elva，一个温柔、自然的语音对话助手，正在通过语音和用户实时聊天。" +
-  "请用简短、口语化的自然中文回答，就像真人说话一样；不要输出多余解释，不要用列表或 Markdown 格式。" +
-  "用户表示同意、附和或只是简单回应时，顺着上文继续说即可。" +
-  "说话要像真人：应承、附和、告别这些高频话不要每次都用一模一样的句子，" +
-  "开口前看一眼自己刚才说过什么，刚用过的句式就换一个说法——重复的固定句式听起来非常机械。" +
-  "用户让你停下时，就什么都不要说。" +
-  "身份必须始终如一：你的名字是 Elva。被问到“你是谁”时，用一两句口语化的中文介绍自己是 Elva。" +
-  "你不是小爱同学、不是 Siri、不是小度，也不是任何手机或其他公司自带的语音助手——" +
-  "永远不要用这些身份自称或介绍自己。";
+  "你是 Elva，一个温柔、自然的女生，正在通过语音和用户实时聊天。";
 
 const PERSONA_PRESETS = {
   default: DEFAULT_PERSONA,
-  concise:
-    "You are a voice assistant who answers as briefly as possible — one or two short sentences at most. " +
-    "Speak naturally and colloquially, never use lists or markdown. " +
-    "If the user agrees or backchannels, continue with the key point only.",
-  storyteller:
-    "You are a warm storyteller talking with the user over voice. " +
-    "Tell vivid, immersive little stories or anecdotes, 3-5 sentences per turn, ending with a small hook that invites the user to respond. " +
-    "Keep language spoken-style and simple; no lists or markdown.",
-  tutor:
-    "You are a patient tutor explaining things over voice. " +
-    "Break every explanation into small spoken steps, use simple everyday analogies, and check understanding with one short question at the end of each turn. " +
-    "Never use lists or markdown; keep each turn under five sentences.",
 };
 
 const settingsEls = {
@@ -845,8 +830,7 @@ const settingsEls = {
   applyBtn: document.getElementById('applyPersonaBtn'),
   resetBtn: document.getElementById('resetPersonaBtn'),
   saved: document.getElementById('personaSaved'),
-  ttsEngine: document.getElementById('ttsEngine'),
-  turnEngine: document.getElementById('turnEngine'),
+  ttsLora: document.getElementById('ttsLora'),
   turnWaitMs: document.getElementById('turnWaitMs'),
   turnWaitMsVal: document.getElementById('turnWaitMsVal'),
   turnGraceMs: document.getElementById('turnGraceMs'),
@@ -888,8 +872,7 @@ function currentSettings() {
     system_prompt: settingsEls.persona.value.trim() || DEFAULT_PERSONA,
     max_history: parseInt(settingsEls.maxHistory.value, 10) || 5,
     min_seg_len: parseInt(settingsEls.minSegLen.value, 10) || 10,
-    tts_engine: settingsEls.ttsEngine.value,
-    turn_engine: settingsEls.turnEngine.value,
+    tts_lora: settingsEls.ttsLora.value,
     turn_wait_ms: parseInt(settingsEls.turnWaitMs.value, 10) || 800,
     turn_grace_ms: parseInt(settingsEls.turnGraceMs.value, 10) || 900,
     tts_cfg: parseFloat(settingsEls.ttsCfg.value) || 2.0,
@@ -925,8 +908,7 @@ function applyServerSettings(s) {
   settingsSyncedByAck = true;
   const set = (el, v) => { if (el && v !== undefined && v !== null) el.value = v; };
   if (s.system_prompt) settingsEls.persona.value = s.system_prompt;
-  set(settingsEls.ttsEngine, s.tts_engine);
-  set(settingsEls.turnEngine, s.turn_engine);
+  set(settingsEls.ttsLora, s.tts_lora);
   set(settingsEls.turnWaitMs, s.turn_wait_ms);
   settingsEls.turnWaitMsVal.textContent = settingsEls.turnWaitMs.value + ' ms';
   set(settingsEls.turnGraceMs, s.turn_grace_ms);
@@ -954,7 +936,6 @@ function applyServerSettings(s) {
   if (s.pvad_stream_gate !== undefined) settingsEls.pvadStreamGate.checked = !!s.pvad_stream_gate;
   if (s.speaker_sep !== undefined) settingsEls.speakerSep.checked = !!s.speaker_sep;
   if (s.agent_enabled !== undefined) settingsEls.agentEnabled.checked = !!s.agent_enabled;
-  syncTurnTimingState();
 }
 
 function sendCurrentSettings() {
@@ -992,8 +973,7 @@ function debouncedSend() {
   configDebounce = setTimeout(() => {
     const s = currentSettings();
     sendConfig({
-      tts_engine: s.tts_engine,
-      turn_engine: s.turn_engine,
+      tts_lora: s.tts_lora,
       turn_wait_ms: s.turn_wait_ms,
       turn_grace_ms: s.turn_grace_ms,
       tts_cfg: s.tts_cfg,
@@ -1015,24 +995,9 @@ function debouncedSend() {
   }, 400);
 }
 
-// The two turn-timing sliders only affect the SoulX engine — gray them out
-// while frc is selected (values still ride along in the payload, the server
-// ignores them in frc mode).
-function syncTurnTimingState() {
-  const frc = settingsEls.turnEngine.value === 'frc';
-  [settingsEls.turnWaitMs, settingsEls.turnGraceMs, settingsEls.playbackGuard,
-   settingsEls.deliveryBargeinChunks, settingsEls.deliveryBargeinSpanMs,
-   settingsEls.asrCorrect, settingsEls.asrCorrectWaitMs].forEach((el) => {
-    el.disabled = frc;
-    el.closest('.field').classList.toggle('frc-off', frc);
-  });
-}
-
-settingsEls.ttsEngine.addEventListener('change', debouncedSend);
-settingsEls.turnEngine.addEventListener('change', () => {
-  syncTurnTimingState();
-  debouncedSend();
-});
+// 2026-11-09：FireRedChat 双 EOT 引擎退役，SoulX 是唯一 turn engine——
+// 原 frc 模式下的灰显逻辑（syncTurnTimingState）随之拆除。
+settingsEls.ttsLora.addEventListener('change', debouncedSend);
 settingsEls.turnWaitMs.addEventListener('input', () => {
   settingsEls.turnWaitMsVal.textContent = settingsEls.turnWaitMs.value + ' ms';
   debouncedSend();
@@ -1054,7 +1019,6 @@ settingsEls.asrCorrectWaitMs.addEventListener('input', () => {
   settingsEls.asrCorrectWaitMsVal.textContent = settingsEls.asrCorrectWaitMs.value + ' ms';
   debouncedSend();
 });
-syncTurnTimingState();
 settingsEls.ttsCfg.addEventListener('input', () => {
   settingsEls.ttsCfgVal.textContent = parseFloat(settingsEls.ttsCfg.value).toFixed(1);
   debouncedSend();

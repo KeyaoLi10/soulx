@@ -69,18 +69,12 @@ def dump_asyncio_tasks(*_args):
 
 signal.signal(signal.SIGUSR2, dump_asyncio_tasks)
 
-from clients.tts_client import (
-    IndexTTS_VLLM,
-    Cosyvoice_Streaming_VLLM,
-    FireRedTTS,
-    VoxCPM_TTS,
-)
-from clients.llm_client import QwenLLM_stream
+from clients.tts_client import VoxCPM_TTS
+from clients.llm_client import QwenLLM_stream, compose_system_prompt
 from clients.vad_client import TurnTaking
 from clients.pvad_client import PVADSession
 from modules.utils.backchannel_utils import check_backchannel
 from agent.runtime import AgentRuntime, AGENT_SYSTEM_ADDON, FAST_TOOLS
-from frc_engine import FrcEngine, services_available as frc_services_available
 
 # agent-runtime V2 发布开关（手册 §19）：legacy（默认——行为与今天完全
 # 一致，语音前端一行不改）/ shadow（后台观察路由，只写日志，等快脑空闲
@@ -120,7 +114,7 @@ from pvad_gate import (
 # of the pvad path — the receive loop only reads a flag; the scorer
 # thread does the blocking ECAPA work.
 from pvad_stream import PvadStreamGate, stream_gate_active, stream_gate_filter
-from settings import (Config, DEFAULT_SETTINGS, TTS_ENGINE, sanitize_updates,
+from settings import (Config, DEFAULT_SETTINGS, sanitize_updates,
                       save_ui_default_updates, UI_DEFAULT_OVERRIDES,
                       pin_env_runtime_mode)
 
@@ -327,10 +321,6 @@ class ChatSession:
         # legacy 时在 websocket endpoint 创建；legacy 默认恒为 None，
         # 以下所有 V2 分支都不会执行。
         self.agent_v2 = None
-        # FrcEngine (FireRedChat-architecture turn engine, only fed audio
-        # while settings turn_engine == "frc"). Created in the websocket
-        # endpoint alongside the agent runtime.
-        self.frc = None
         # Recent assistant text segments (the LLM chunks that get spoken),
         # newest last, capped. Each entry is {"text", "run", "cum", "ts"}:
         # run = playback_run_serial the chunk's audio belongs to, cum =
@@ -446,12 +436,10 @@ session_manager = SessionManager()
 # wire the modules that must not import app back (see the import note above)
 emitter.set_session_lookup(session_manager.get_session)
 llm = QwenLLM_stream()
-# Both TTS engines instantiated — the active one is chosen per session from
-# the web UI settings panel (defaults in settings.DEFAULT_SETTINGS; the
-# TTS_ENGINE env only picks that default).
+# VoxCPM2 是唯一 TTS（2026-11-09 FireRedTTS 整体退役）——服务在 :8085，
+# LoRA checkpoint 由 settings.tts_lora 每轮快照选择（双 checkpoint 模式）。
 TTS_CLIENTS = {
     "voxcpm": VoxCPM_TTS(),   # VoxCPM2 service on :8085
-    "firered": FireRedTTS(),  # FireRedTTS on :8081 (shared with full_duplex)
 }
 asr = None  # Placeholder for ASR client if transcription isn't handled within VAD
 
@@ -561,8 +549,8 @@ def _reply_in_flight(session):
     """Is a reply pending or playing? BOTH phases, not just playback:
     generation (turn committed, LLM/TTS streaming, gen_in_progress —
     nothing is audible yet, so playback_end is stale) and playback
-    (playback_end + grace). frc_engine already uses this same pair for
-    its EOT wait. The 2026-11-03 01:01 incident (session 338b1765): a
+    (playback_end + grace; the retired frc_engine used this same pair for
+    its EOT wait). The 2026-11-03 01:01 incident (session 338b1765): a
     1-2 chunk mic blip in the GENERATION window (a) confirmed a
     zero-evidence barge-in that killed the in-flight generation and
     (b) completed a phantom turn '是。' that replaced the user's real
@@ -1066,17 +1054,17 @@ def _agent_deliver_entry(session, client_id, entry):
     logger.info(f"[{client_id}] Delivering background task {entry['task_id']}")
 
     settings = dict(session.settings)
-    tts_client = TTS_CLIENTS.get(
-        settings.get("tts_engine"), TTS_CLIENTS[DEFAULT_SETTINGS["tts_engine"]]
-    )
+    tts_client = TTS_CLIENTS["voxcpm"]
     tts_options = {
         "cfg_value": settings.get("tts_cfg", 2.0),
         "inference_timesteps": settings.get("tts_timesteps", 10),
+        "lora": settings.get("tts_lora", "step_0000500"),
     }
     gen = llm.generate_with_history(
         client_id,
         stop_event=current_stop_event,
-        system_prompt=settings.get("system_prompt") or None,
+        # settings["system_prompt"] 语义 = identity-only，风格由服务端拼
+        system_prompt=compose_system_prompt(settings.get("system_prompt")),
         max_history=settings.get("max_history"),
         min_seg_len=settings.get("min_seg_len"),
     )
@@ -1147,12 +1135,11 @@ def _make_agent_v2(session, client_id, mode=None):
 
     def _tts_pair():
         settings = dict(session.settings)
-        tts_client = TTS_CLIENTS.get(
-            settings.get("tts_engine"),
-            TTS_CLIENTS[DEFAULT_SETTINGS["tts_engine"]])
+        tts_client = TTS_CLIENTS["voxcpm"]
         tts_options = {
             "cfg_value": settings.get("tts_cfg", 2.0),
             "inference_timesteps": settings.get("tts_timesteps", 10),
+            "lora": settings.get("tts_lora", "step_0000500"),
         }
         return tts_client, tts_options
 
@@ -1237,7 +1224,8 @@ def _make_agent_v2(session, client_id, mode=None):
         extra_context = agent_context.render_chitchat_context(panel)
         return llm.generate_with_history(
             client_id, stop_event=stop_event,
-            system_prompt=settings.get("system_prompt") or None,
+            # identity-only + 服务端风格纪律（闲聊路同样吃完整 prompt）
+            system_prompt=compose_system_prompt(settings.get("system_prompt")),
             max_history=settings.get("max_history"),
             min_seg_len=settings.get("min_seg_len"),
             extra_context=extra_context)
@@ -1318,7 +1306,9 @@ def _make_agent_v2(session, client_id, mode=None):
         generate_fn=lambda stop_event: llm.generate_with_history(
             client_id,
             stop_event=stop_event,
-            system_prompt=dict(session.settings).get("system_prompt") or None,
+            # identity-only + 服务端风格纪律（表达轮）
+            system_prompt=compose_system_prompt(
+                dict(session.settings).get("system_prompt")),
             max_history=dict(session.settings).get("max_history"),
             min_seg_len=dict(session.settings).get("min_seg_len"),
         ),
@@ -1569,12 +1559,11 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
         # Snapshot live settings for this pipeline run (user may tweak the
         # UI mid-generation; one consistent view per turn is enough)
         settings = dict(session.settings)
-        tts_client = TTS_CLIENTS.get(
-            settings.get("tts_engine"), TTS_CLIENTS[DEFAULT_SETTINGS["tts_engine"]]
-        )
+        tts_client = TTS_CLIENTS["voxcpm"]
         tts_options = {
             "cfg_value": settings.get("tts_cfg", 2.0),
             "inference_timesteps": settings.get("tts_timesteps", 10),
+            "lora": settings.get("tts_lora", "step_0000500"),
         }
 
         llm.add_message(client_id, "user", asr_text)
@@ -1636,8 +1625,8 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
             current_stop_event = session.stop_event
             held = False
         if agent_runtime:
-            system_prompt = (
-                settings.get("system_prompt") or QwenLLM_stream.SYSTEM_PROMPT
+            system_prompt = compose_system_prompt(
+                settings.get("system_prompt")
             ) + "\n\n" + AGENT_SYSTEM_ADDON
             # deterministic retraction handling: if the user's words clearly
             # cancel a running task, the Runtime cancels it NOW (the fast
@@ -1683,7 +1672,9 @@ def pipeline_worker(client_id, audio_segment, sample_rate, turn_trigger=None,
             llm_reply_gen = llm.generate_with_history(
                 client_id,
                 stop_event=current_stop_event,
-                system_prompt=settings.get("system_prompt") or None,
+                # identity-only + 服务端风格纪律（非 agent 回退路径）
+                system_prompt=compose_system_prompt(
+                    settings.get("system_prompt")),
                 max_history=settings.get("max_history"),
                 min_seg_len=settings.get("min_seg_len"),
             )
@@ -1784,18 +1775,6 @@ def _merge_session_settings(session, data: dict, persist: bool = False) -> dict:
             logger.info("agent_runtime_mode update to %r dropped: pinned "
                         "by AGENT_RUNTIME_MODE env", wanted)
 
-    if clean.get("turn_engine") not in (None, session.settings.get("turn_engine")):
-        # engine switch mid-session: drop any half-finished FRC
-        # utterance so a stale pending commit can't fire later
-        if session.frc is not None:
-            session.frc.reset()
-        # switching back to soulx: re-apply the wait override — it was
-        # skipped while in frc mode, and the server session may have
-        # been GC'd during the detour (recreated from session_config,
-        # but only if a push ever happened)
-        if clean["turn_engine"] == "soulx":
-            _push_turn_wait_num(session)
-
     session.settings.update(clean)
 
     if "turn_wait_ms" in clean:
@@ -1813,14 +1792,10 @@ def _merge_session_settings(session, data: dict, persist: bool = False) -> dict:
 def _push_turn_wait_num(session):
     """Push the session's turn_wait_ms to the turn server as max_wait_num.
 
-    Call after the setting changes and once at session init. Skipped in frc
-    mode (the SoulX turn server sees no audio then — harmless either way,
-    but the push would race the engine switch for nothing). The turn server
-    keeps the override in a GC-surviving store, so it survives frc detours
-    and reconnects.
+    Call after the setting changes and once at session init. The turn server
+    keeps the override in a GC-surviving store, so it survives reconnects.
+    (The frc-engine skip is gone along with the engine — 2026-11-09.)
     """
-    if session.settings.get("turn_engine") == "frc":
-        return
     wait_ms = session.settings.get("turn_wait_ms")
     if wait_ms is None:
         return
@@ -1914,38 +1889,6 @@ async def websocket_endpoint(websocket: WebSocket):
         if _v2_mode != "legacy":
             _ensure_agent_v2(session, client_id, _v2_mode)
 
-        # FireRedChat-architecture turn engine (only fed audio while
-        # settings turn_engine == "frc"; started here so the UI switch is
-        # live without a reconnect)
-        def _frc_last_assistant_text():
-            # what the user just heard: the pending (still-playing) reply
-            # if any, else the last committed assistant message
-            with session.lock:
-                pending = session.pending_message
-            if pending and pending.strip():
-                return pending
-            for m in reversed(llm.get_session(client_id)):
-                if m["role"] == "assistant" and (m.get("content") or "").strip():
-                    return m["content"]
-            return ""
-
-        def _frc_commit(transcript):
-            # same speech pipeline as the SoulX path; no grace window —
-            # the dual-EOT decision already guards against premature turns
-            sn = _begin_generation(session)
-            threading.Thread(
-                target=pipeline_worker,
-                args=(client_id, transcript, Config.SAMPLE_RATE, None, sn),
-                daemon=True,
-            ).start()
-
-        session.frc = FrcEngine(
-            session, client_id,
-            commit_cb=_frc_commit,
-            context_cb=_frc_last_assistant_text,
-        )
-        session.frc.start()
-
         # Now emission works via session_manager lookups
         emit_to_room(client_id, "connect_ack", {
             "client_id": client_id,
@@ -1993,14 +1936,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                 else:
                     session.audio_mic.write(data)   # already int16 @16k LE
-
-                # FireRedChat frontend mode: the chunk goes to the FrcEngine
-                # (pvad speech-activity endpointing → dual EOT → FireRedASR)
-                # and the SoulX turn server is bypassed for this session.
-                # Switching is per-session and live (Settings panel).
-                if session.settings.get("turn_engine") == "frc":
-                    session.frc.feed(audio_chunk)
-                    continue
 
                 # PVAD sidecar: async copy of the mic chunk + enrollment ring.
                 # Both are outside session.lock so the turn-controller path
@@ -2355,8 +2290,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 session.agent_runtime.shutdown()
             if session.agent_v2 is not None:
                 session.agent_v2.close()
-            if session.frc:
-                session.frc.stop()
             session.pvad.stop()
             if session.pvad_stream_gate is not None:
                 session.pvad_stream_gate.stop()
@@ -2805,8 +2738,8 @@ def _parse_log_sessions() -> dict:
                 if isinstance(d, dict):
                     rec["settings"] = {
                         k: d.get(k) for k in (
-                            "pvad_mode", "turn_engine", "playback_guard",
-                            "turn_wait_ms", "turn_grace_ms", "tts_engine",
+                            "pvad_mode", "playback_guard",
+                            "turn_wait_ms", "turn_grace_ms", "tts_lora",
                             "agent_enabled",
                         )
                     }

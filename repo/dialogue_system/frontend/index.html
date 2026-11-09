@@ -113,14 +113,11 @@
         </div>
         <select id="personaPreset" class="input">
           <option value="">— Presets —</option>
-          <option value="default">Default · Elva (gentle assistant)</option>
-          <option value="concise">Concise · short answers</option>
-          <option value="storyteller">Storyteller · narrator</option>
-          <option value="tutor">Patient tutor · explains simply</option>
+          <option value="default">Default · Elva</option>
           <option value="custom">Custom…</option>
         </select>
-        <textarea id="personaPrompt" class="input textarea" rows="6" spellcheck="false"></textarea>
-        <p class="block-hint">System prompt sent to the LLM. Define a character, a role-play script, or speaking rules.</p>
+        <textarea id="personaPrompt" class="input textarea" rows="4" spellcheck="false"></textarea>
+        <p class="block-hint">Identity only — who you are, your name, one or two sentences. Speaking style (natural, human-like Chinese) is fixed on the server and cannot be changed here.</p>
         <div class="btn-row">
           <button id="applyPersonaBtn" class="btn btn-primary btn-sm">Apply</button>
           <button id="resetPersonaBtn" class="btn btn-ghost btn-sm">Reset</button>
@@ -133,58 +130,51 @@
           <h2>Voice Engine</h2>
         </div>
         <div class="field">
-          <label for="turnEngine">Turn engine</label>
-          <select id="turnEngine" class="input">
-            <option value="soulx">SoulX-Duplug</option>
-            <option value="frc">FireRedChat (dual EOT)</option>
-          </select>
-          <span class="block-hint">Turn-taking architecture: SoulX semantic turn server, or the FireRedChat pipeline (pVAD endpointing + ultraVAD/Qwen dual end-of-turn). LLM and voice are the same either way.</span>
-        </div>
-        <div class="field">
           <label for="turnWaitMs">Incomplete→wait silence <span id="turnWaitMsVal" class="val">800 ms</span></label>
           <input id="turnWaitMs" type="range" min="160" max="3200" step="160" value="800">
-          <span class="block-hint">After the model judges &lt;|user_incomplete|&gt; (unfinished sentence), how long you must stay quiet before the reply fires anyway — a mid-sentence thinking pause shorter than this is safe. SoulX engine only.</span>
+          <span class="block-hint">After the model judges &lt;|user_incomplete|&gt; (unfinished sentence), how long you must stay quiet before the reply fires anyway — a mid-sentence thinking pause shorter than this is safe.</span>
         </div>
         <div class="field">
           <label for="turnGraceMs">Complete grace window <span id="turnGraceMsVal" class="val">900 ms</span></label>
           <input id="turnGraceMs" type="range" min="0" max="3000" step="100" value="900">
-          <span class="block-hint">A &lt;|user_complete|&gt; turn holds the reply this long before speaking — resume speaking inside the window to cancel it. 0 disables (not recommended). SoulX engine only.</span>
+          <span class="block-hint">A &lt;|user_complete|&gt; turn holds the reply this long before speaking — resume speaking inside the window to cancel it. 0 disables (not recommended).</span>
         </div>
         <div class="field">
           <label for="playbackGuard" class="toggle-row">
             <input id="playbackGuard" type="checkbox" checked>
             <span>Playback echo guard</span>
           </label>
-          <span class="block-hint">While the assistant is generating or speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo/blip phantom turns are dropped — speaker echo, AEC residue or breath noise then cannot chop the reply or hijack your sentence. Off = raw zero-hysteresis behavior (any single sound interrupts). SoulX engine only.</span>
+          <span class="block-hint">While the assistant is generating or speaking, a barge-in needs sustained voice (3+ chunks in 1.6 s) and echo/blip phantom turns are dropped — speaker echo, AEC residue or breath noise then cannot chop the reply or hijack your sentence. Off = raw zero-hysteresis behavior (any single sound interrupts).</span>
         </div>
         <div class="field">
           <label for="deliveryBargeinChunks">Result-report barge-in chunks <span id="deliveryBargeinChunksVal" class="val">5</span></label>
           <input id="deliveryBargeinChunks" type="range" min="1" max="20" step="1" value="5">
-          <span class="block-hint">While the assistant is reporting a background task's result, a barge-in needs at least this many voice chunks (and the span below) before it may cut the report — a quick "嗯，好的" backchannel then rides along instead of chopping the result. 1 ≈ off. Applies to both the chunk-level barge-in and the turn-commit path. SoulX engine only.</span>
+          <span class="block-hint">While the assistant is reporting a background task's result, a barge-in needs at least this many voice chunks (and the span below) before it may cut the report — a quick "嗯，好的" backchannel then rides along instead of chopping the result. 1 ≈ off. Applies to both the chunk-level barge-in and the turn-commit path.</span>
         </div>
         <div class="field">
           <label for="deliveryBargeinSpanMs">Result-report barge-in span <span id="deliveryBargeinSpanMsVal" class="val">1000 ms</span></label>
           <input id="deliveryBargeinSpanMs" type="range" min="0" max="5000" step="100" value="1000">
-          <span class="block-hint">The first voice chunk must be at least this old when the threshold above is reached — the user has to keep talking for this long to interrupt a result report. 0 = chunks alone decide. SoulX engine only.</span>
+          <span class="block-hint">The first voice chunk must be at least this old when the threshold above is reached — the user has to keep talking for this long to interrupt a result report. 0 = chunks alone decide.</span>
         </div>
         <div class="field">
           <label for="asrCorrect" class="toggle-row">
             <input id="asrCorrect" type="checkbox" checked>
             <span>Whole-turn ASR correction</span>
           </label>
-          <span class="block-hint">At each turn commit the server re-recognizes the whole utterance offline and corrects the live text (bubble + what the LLM hears) — the live rolling-window text is the main source of ASR errors. Costs up to the wait below of extra latency; on timeout or failed correction the live text is kept. SoulX engine only.</span>
+          <span class="block-hint">At each turn commit the server re-recognizes the whole utterance offline and corrects the live text (bubble + what the LLM hears) — the live rolling-window text is the main source of ASR errors. Costs up to the wait below of extra latency; on timeout or failed correction the live text is kept.</span>
         </div>
         <div class="field">
           <label for="asrCorrectWaitMs">ASR correction wait <span id="asrCorrectWaitMsVal" class="val">500 ms</span></label>
           <input id="asrCorrectWaitMs" type="range" min="0" max="2000" step="100" value="500">
-          <span class="block-hint">How long the reply holds for the corrected text before falling back to the live one. Typical correction lands in 100-300 ms; 0 = never wait (correction still updates nothing then). SoulX engine only.</span>
+          <span class="block-hint">How long the reply holds for the corrected text before falling back to the live one. Typical correction lands in 100-300 ms; 0 = never wait (correction still updates nothing then).</span>
         </div>
         <div class="field">
-          <label for="ttsEngine">Engine</label>
-          <select id="ttsEngine" class="input">
-            <option value="voxcpm">VoxCPM2</option>
-            <option value="firered">FireRedTTS</option>
+          <label for="ttsLora">TTS voice (LoRA)</label>
+          <select id="ttsLora" class="input">
+            <option value="step_0000500">Elva · step 500 (default)</option>
+            <option value="step_0000400">Elva · step 400 (brighter)</option>
           </select>
+          <span class="block-hint">VoxCPM2 voice checkpoint — both are the same Elva voice trained at different steps; 400 is slightly brighter/more expressive, 500 is the long-standing default. Switch is live, next utterance uses it.</span>
         </div>
         <div class="field">
           <label for="ttsCfg">Expressiveness (cfg) <span id="ttsCfgVal" class="val">2.0</span></label>
@@ -193,7 +183,7 @@
         <div class="field">
           <label for="ttsSteps">Quality steps <span id="ttsStepsVal" class="val">10</span></label>
           <input id="ttsSteps" type="range" min="4" max="40" step="1" value="10">
-          <span class="block-hint">More steps = higher quality, slower synthesis. (VoxCPM2 only)</span>
+          <span class="block-hint">More steps = higher quality, slower synthesis.</span>
         </div>
       </section>
 
@@ -280,7 +270,7 @@
     </aside>
   </main>
 
-  <script src="script.js?v=20261109a"></script>
+  <script src="script.js?v=20261109b"></script>
 </body>
 
 </html>

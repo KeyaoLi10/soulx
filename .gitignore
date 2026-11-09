@@ -8,6 +8,7 @@ venv/
 venv-voxcpm/
 
 # 模型与缓存（体积巨大，不入库）
+models/
 pretrained_models/
 modelscope_cache/
 

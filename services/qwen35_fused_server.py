@@ -1,4 +1,4 @@
-"""Fused Qwen3.5-9B + FireRedTTS server for SoulX-Duplug dialogue system.
+"""Fused Qwen3.5-9B server for SoulX-Duplug dialogue system.
 
 Wire-compatible replacement for dialogue_system/modules/qwen_llm/llm_server.py
 (the repo's server loads Qwen2.5-7B-Instruct + IndexTTS/CosyVoice, neither of
@@ -6,13 +6,12 @@ which is available on this box: HF is unreachable and the LLM the user wants
 is the local Qwen3.5-9B). Endpoints match what clients/llm_client.py expects:
 
   POST /chat          {"messages": [...]}  -> streaming plain-text chunks
-  POST /chat_indextts {"messages": [...]}  -> streaming raw bytes, each chunk
-                      is b"S"+utf8 text fragment or b"B"+int16 pcm @24k mono
+
+2026-11-09: /chat_indextts 与 FireRedTTS 依赖随 FireRedTTS 整体退役移除
+（web 端只用 /chat；TTS 由独立的 VoxCPM 服务 :8085 负责）。
 
 The LLM is /vepfs-cnbjc4e12c6d7e1f/krisl/models/Qwen3.5-9B (same weights and
-loading recipe as full_duplex/frc_services/llm/qwen35_chat_server.py); TTS is
-the FireRedTTS OpenAI-compatible service on :8081 (24kHz int16 mono WAV
-stream, 44-byte header, edge-trimmed chunks).
+loading recipe as full_duplex/frc_services/llm/qwen35_chat_server.py).
 
 Run (venv-frc-llm, transformers 5.x):
   CUDA_VISIBLE_DEVICES=6 /home/research/krisl/full_duplex/venv-frc-llm/bin/python \
@@ -26,7 +25,6 @@ import re
 import threading
 import time
 
-import requests
 import torch
 import uvicorn
 from fastapi import FastAPI, Request
@@ -36,8 +34,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStream
 MODEL_PATH = os.environ.get(
     "QWEN35_MODEL_PATH", "/vepfs-cnbjc4e12c6d7e1f/krisl/models/Qwen3.5-9B"
 )
-TTS_URL = os.environ.get("FIRERED_TTS_URL", "http://127.0.0.1:8081/v1/audio/speech")
-TTS_VOICE = os.environ.get("FIRERED_TTS_VOICE", "f531")
 
 # generation params mirror dialogue_system/modules/qwen_llm/config.yaml
 # 2026-11-09 0.8→0.9：复读事故实测逐字相同输出发生在 0.8 之下（上下文
@@ -46,30 +42,29 @@ TEMP = 0.9
 TOP_P = 0.95
 MAX_NEW_TOKENS = 512
 
-# same system prompt as the repo's llm_client.py (keep the three in sync;
-# only used when the caller doesn't send one — the app always does)
+# same system prompt as the repo's llm_client.py
+# QwenLLM_stream.SYSTEM_PROMPT (keep the two in sync; only used when the
+# caller doesn't send one — the app always sends the composed prompt:
+# identity from settings + server-side STYLE_PROMPT, 2026-11-09 persona 拆分)
 SYSTEM_PROMPT = (
-    "你是 Elva，一个温柔、自然的语音对话助手，正在通过语音和用户实时聊天。"
-    "请用简短、口语化的自然中文回答，就像真人说话一样；不要输出多余解释，"
-    "不要用列表或 Markdown 格式。"
-    "用户表示同意、附和或只是简单回应时，顺着上文继续说即可。"
-    "说话要像真人：应承、附和、告别这些高频话不要每次都用一模一样的句子，"
-    "开口前看一眼自己刚才说过什么，刚用过的句式就换一个说法——"
-    "重复的固定句式听起来非常机械。"
-    "用户让你停下时，就什么都不要说。"
-    "身份必须始终如一：你的名字是 Elva。被问到“你是谁”时，"
-    "用一两句口语化的中文介绍自己是 Elva。"
-    "你不是小爱同学、不是 Siri、不是小度，也不是任何手机或其他公司自带的"
-    "语音助手——永远不要用这些身份自称或介绍自己。"
+    "你是 Elva，一个温柔、自然的女生，正在通过语音和用户实时聊天。\n"
+    "【说话方式——必须遵守】\n"
+    "你在打电话，不是在写文章：全程用口语化的中文，句子要短，"
+    "一次只说一两句，说完就停，等对方开口。\n"
+    "不要有助手腔：不说“希望这能帮到你”“总的来说”“以下是”这类书面客套话，"
+    "不用列表、编号、Markdown，不念标点、符号和单位缩写。\n"
+    "像真人一样有分寸：用户只是应承、附和或简单回应时，顺着接一两个词就行，"
+    "不要重新展开话题；用户让你停下时，就什么都不要说。\n"
+    "别机械重复：开口前看一眼自己刚才说过什么，刚用过的词和句式就换一个说法，"
+    "“嗯”“好呀”“我去看看”这类高频话不要每次一模一样。\n"
+    "像真人一样诚实：没把握就说“我不太确定”“我查一下”，"
+    "绝不编造具体的数字、名字或事实；不知道的直接说不知道。\n"
+    "数字和日期要念得自然：说“三点五”而不是“3.5”。\n"
+    "身份必须始终如一：以上面的身份为准，被问到“你是谁”时，"
+    "用一两句口语化的中文介绍自己。你不是小爱同学、不是 Siri、不是小度，"
+    "也不是任何手机或其他公司自带的语音助手——永远不要用这些身份自称或"
+    "介绍自己。"
 )
-
-# punctuation that ends a TTS-schedulable segment (same set as the repo's
-# iterative_generate in modules/qwen_llm/llm_server.py)
-SEG_PUNCT = re.compile(r"[，。！？：；,.!?:;\n]")
-# token-like units for the minimum-segment-length check (mirrors split_cn_en)
-TOKEN_RE = re.compile(r"[一-鿿]|[A-Za-z]+|[0-9]+")
-# minimum CJK chars / latin words before a segment is worth synthesizing
-MIN_SEG_CHARS = 3
 
 app = FastAPI()
 TOKENIZER = None
@@ -231,48 +226,13 @@ def _token_stream_prompt(prompt, cancel_event, gen_kwargs, label="agent"):
         GEN_LOCK.release()
 
 
-def _clean_for_tts(text: str) -> str:
-    return text.replace("*", "").replace("`", "").replace("#", "").strip()
+async def _stream_tagged(request: Request, conversation, body):
+    """Yield ("S", utf8-bytes) text chunks as the LLM decodes them.
 
-
-def _tts_pcm_chunks(text: str):
-    """Yield int16 pcm byte chunks for text from the FireRedTTS stream."""
-    text = _clean_for_tts(text)
-    if not text:
-        return
-    try:
-        resp = requests.post(
-            TTS_URL,
-            json={"input": text, "voice": TTS_VOICE, "stream": True},
-            stream=True,
-            timeout=180,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[tts] request failed: {e}", flush=True)
-        return
-    header_skipped = False
-    for chunk in resp.iter_content(chunk_size=None):
-        if not chunk:
-            continue
-        if not header_skipped:
-            # first bytes are the 44-byte WAV header the tts server prepends
-            chunk = chunk[44:]
-            header_skipped = True
-            if not chunk:
-                continue
-        yield chunk
-
-
-async def _stream_tagged(request: Request, conversation, body, tts=True):
-    """Yield ("S", utf8-bytes) text chunks and ("B", pcm-bytes) audio chunks.
-
-    Text chunks stream out as the LLM decodes; each complete
-    punctuation-delimited segment is sent to FireRedTTS and its pcm yielded
-    as soon as it is synthesized. With tts=False (the /chat text endpoint)
-    the TTS step is skipped entirely — the web app synthesizes audio itself,
-    so doing the (discarded) synthesis here only added latency and, when the
-    TTS service was slow, stalled the text stream behind it.
+    Text-only since 2026-11-09 (the fused FireRedTTS path is gone — the web
+    app synthesizes audio itself on the VoxCPM service, so doing the
+    (discarded) synthesis here only added latency and, when the TTS service
+    was slow, stalled the text stream behind it).
     """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -297,7 +257,6 @@ async def _stream_tagged(request: Request, conversation, body, tts=True):
     threading.Thread(target=produce, daemon=True).start()
 
     disconnected = False
-    buffer = ""
     try:
         while True:
             item = await queue.get()
@@ -307,47 +266,13 @@ async def _stream_tagged(request: Request, conversation, body, tts=True):
                 cancel.set()
                 disconnected = True
                 break
-            buffer += item
             yield ("S", item.encode("utf-8"))
-            if not tts:
-                continue
-            # flush every complete punctuation-delimited segment to TTS
-            while True:
-                m = SEG_PUNCT.search(buffer)
-                if not m:
-                    break
-                seg = buffer[: m.end()]
-                buffer = buffer[m.end():]
-                if len(TOKEN_RE.findall(seg)) < MIN_SEG_CHARS:
-                    continue
-                seg = seg.strip()
-                if not seg:
-                    continue
-                # synth off the event loop so other requests keep flowing
-                pcm_list = await loop.run_in_executor(
-                    None, lambda s=seg: list(_tts_pcm_chunks(s))
-                )
-                for pcm in pcm_list:
-                    if await request.is_disconnected():
-                        disconnected = True
-                        break
-                    yield ("B", pcm)
-                if disconnected:
-                    break
-            if disconnected:
-                break
     finally:
         # runs on normal completion AND on GeneratorExit (client gone /
         # response cancelled). Without it an interrupted request kept
         # generating to MAX_NEW_TOKENS server-side while holding GEN_LOCK,
         # delaying every subsequent request behind the zombie.
         cancel.set()
-    if tts and not disconnected and buffer.strip():
-        pcm_list = await loop.run_in_executor(
-            None, lambda: list(_tts_pcm_chunks(buffer))
-        )
-        for pcm in pcm_list:
-            yield ("B", pcm)
 
 
 @app.post("/chat")
@@ -361,26 +286,11 @@ async def chat(request: Request):
     conversation = messages
 
     async def stream():
-        async for tag, payload in _stream_tagged(request, conversation, data, tts=False):
+        async for tag, payload in _stream_tagged(request, conversation, data):
             if tag == "S":  # text only — "B" pcm has no place in a text stream
                 yield payload.decode("utf-8", errors="replace")
 
     return StreamingResponse(stream(), media_type="text/plain")
-
-
-@app.post("/chat_indextts")
-async def chat_indextts(request: Request):
-    data = await request.json()
-    messages = data.get("messages", [])
-    if not messages:
-        return StreamingResponse(iter([]), media_type="text/plain")
-    conversation = messages
-
-    async def byte_stream():
-        async for tag, payload in _stream_tagged(request, conversation, data):
-            yield tag.encode("ascii") + payload
-
-    return StreamingResponse(byte_stream())
 
 
 @app.get("/health")

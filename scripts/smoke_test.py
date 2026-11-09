@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Smoke test for the SoulX-Duplug deployment (run AFTER services are up).
 
-1. FireRedTTS health + a short synthesis
+1. VoxCPM2 TTS health + a short synthesis (both LoRA checkpoints)
 2. fused LLM server /chat (plain text stream)
-3. fused LLM server /chat_indextts (S/B tagged stream with TTS audio)
-4. turn-taking server /turn websocket: feed 2s of speech-like audio and
+3. turn-taking server /turn websocket: feed 2s of speech-like audio and
    check we get valid state responses back
+
+2026-11-09: FireRedTTS / /chat_indextts checks removed along with the
+FireRedTTS retirement (VoxCPM2 is the only TTS).
 
 Usage: python -I smoke_test.py [--llm-url http://localhost:6007]
 """
@@ -21,25 +23,33 @@ import requests
 
 
 def test_tts():
-    print("== FireRedTTS (:8081) ==")
-    r = requests.get("http://127.0.0.1:8081/health", timeout=10)
-    print("health:", r.json())
-    # the tts service only implements stream=True (non-stream returns 500)
-    r = requests.post(
-        "http://127.0.0.1:8081/v1/audio/speech",
-        json={"input": "你好，这是一个语音合成测试。", "voice": "f531", "stream": True},
-        stream=True,
-        timeout=120,
-    )
-    n = 0
-    first = True
-    for chunk in r.iter_content(chunk_size=None):
-        if first:  # 44-byte WAV header sentinel
-            chunk = chunk[44:]
-            first = False
-        n += len(chunk)
-    print("synthesize:", r.status_code, n, "bytes")
-    assert r.status_code == 200 and n > 48000
+    print("== VoxCPM2 TTS (:8085) ==")
+    r = requests.get("http://127.0.0.1:8085/health", timeout=10)
+    health = r.json()
+    print("health:", health)
+    # synthesize on every available LoRA checkpoint (dual-checkpoint mode)
+    loras = health.get("lora")
+    if isinstance(loras, dict):
+        targets = sorted(loras.keys())
+    elif isinstance(loras, list):
+        targets = sorted(loras)
+    else:
+        targets = [None]
+    for lora in targets:
+        body = {"input": "你好，这是一个语音合成测试。"}
+        if lora:
+            body["lora"] = lora
+        r = requests.post(
+            "http://127.0.0.1:8085/synthesize",
+            json=body,
+            stream=True,
+            timeout=180,
+        )
+        n = 0
+        for chunk in r.iter_content(chunk_size=None):
+            n += len(chunk)
+        print(f"synthesize lora={lora}:", r.status_code, n, "bytes")
+        assert r.status_code == 200 and n > 48000
 
 
 def test_chat(llm):
@@ -54,28 +64,6 @@ def test_chat(llm):
         text += chunk.decode("utf-8", errors="replace")  # boundaries split mb chars
     print("reply:", text.strip()[:200])
     assert len(text.strip()) > 5
-
-
-def test_chat_indextts(llm):
-    print("== LLM /chat_indextts ==")
-    msgs = [
-        {"role": "user", "content": "请用两句话介绍一下今天的天气会怎么样。"},
-    ]
-    r = requests.post(
-        f"{llm}/chat_indextts", json={"messages": msgs}, stream=True, timeout=180
-    )
-    text, audio = "", b""
-    for chunk in r.iter_content(chunk_size=None):
-        if not chunk:
-            continue
-        tag, payload = chunk[:1], chunk[1:]
-        if tag == b"S":
-            text += payload.decode("utf-8", errors="replace")
-        elif tag == b"B":
-            audio += payload
-    print(f"text: {text.strip()[:200]}")
-    print(f"audio: {len(audio)} bytes ({len(audio)/48000:.2f}s @24k int16)")
-    assert len(text.strip()) > 5 and len(audio) > 48000
 
 
 def test_turn():
@@ -122,8 +110,6 @@ if __name__ == "__main__":
         test_tts()
     if "chat" not in args.skip:
         test_chat(args.llm_url)
-    if "fused" not in args.skip:
-        test_chat_indextts(args.llm_url)
     if "turn" not in args.skip:
         test_turn()
     print("\nALL SMOKE TESTS PASSED")

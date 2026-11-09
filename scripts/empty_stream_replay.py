@@ -68,7 +68,10 @@ ns = {
     # deliver-path stubs (overwritten per test below)
     "_commit_pending_message": lambda session, cid: None,
     "TTS_CLIENTS": {},
-    "DEFAULT_SETTINGS": {"tts_engine": "mock"},
+    # 2026-11-09: server-side style prompt composition (llm_client import
+    # that the extracted app code references)
+    "compose_system_prompt": lambda ident=None: (ident or "").strip(),
+    "DEFAULT_SETTINGS": {"tts_lora": "step_0000500"},
 }
 exec(compile(code, str(APP), "exec"), ns)
 exec(compile(ast.get_source_segment(src, fn_begin), str(APP), "exec"), ns)
@@ -353,7 +356,7 @@ class DeliverSession(types.SimpleNamespace):
 def mk_deliver_session():
     s = DeliverSession(**vars(mk_session()))
     s.stop_event = threading.Event()
-    s.settings = {"tts_engine": "mock", "tts_cfg": 2.0, "tts_timesteps": 10}
+    s.settings = {"tts_lora": "step_0000500", "tts_cfg": 2.0, "tts_timesteps": 10}
     s.gen_serial = 0
     s.gen_in_progress = False
     return s
@@ -366,7 +369,8 @@ def run_deliver(gen_factory):
     m = fresh_llm()
     m.generate_with_history = lambda cid, stop_event=None, **k: gen_factory(stop_event)
     ns["llm"] = m
-    ns["TTS_CLIENTS"] = {"mock": MockTTS()}
+    # 2026-11-09: single-track TTS — app looks up TTS_CLIENTS["voxcpm"]
+    ns["TTS_CLIENTS"] = {"voxcpm": MockTTS()}
     events.clear()
     entry = {"task_id": "T1", "goal": "查北京天气", "result": "晴，17度",
              "error": None, "attempts": 0}

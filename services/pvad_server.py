@@ -1,9 +1,10 @@
 """PVAD (personalized VAD) microservice for the SoulX web dialogue app.
 
-Wraps FireRedChat's fireredchat-pvad model (ONNX + ECAPA speaker embedding)
-as an HTTP sidecar. Runs from full_duplex/venv-frc — the only env with the
-livekit-agents fork + speechbrain + onnxruntime the plugin needs (same
-cross-venv pattern as ultraVAD running from eot_bench/venv). CPU only.
+Wraps the personal-VAD model (ONNX + ECAPA speaker embedding) as an HTTP
+sidecar. 2026-11-09 整合：处理器逻辑与权重都已收进本仓库
+（services/pvad_proc.py + models/pvad/，原 FireRedChat livekit 插件不再
+被 import）；运行环境仍用 full_duplex/venv-frc——本机唯一带
+onnxruntime + speechbrain 的解释器（CPU only）。
 
 Purpose in the SoulX architecture: an *advisory* "is this the main speaker?"
 signal. The turn controller (SoulX-Duplug :8000) keeps consuming the raw mic
@@ -46,8 +47,10 @@ Usage (see scripts/start_services.sh, tmux window "pvad"):
 
 import argparse
 import base64
+import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -55,6 +58,8 @@ import torchaudio.transforms as T
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 SAMPLE_RATE = 16000
 FRAME = 160                 # 10 ms @ 16 kHz — VadProcessor's fixed window
@@ -76,13 +81,13 @@ app = FastAPI(title="pvad")
 
 
 def load_model():
-    """Load the pvad ONNX + ECAPA extractor at startup (from the plugin's
-    in-tree resources; weights also mirrored on /mnt/disk3)."""
+    """Load the pvad ONNX + ECAPA extractor at startup (in-repo
+    services/pvad_proc.py + models/pvad/; 2026-11-09 整合)."""
     global PROCESSOR
-    from livekit.plugins.fireredchat_pvad.vad import VadProcessor
+    from pvad_proc import PVADProcessor
 
     t0 = time.time()
-    PROCESSOR = VadProcessor()
+    PROCESSOR = PVADProcessor()
     print(
         f"[pvad] model loaded (onnx + ecapa, {time.time()-t0:.1f}s)", flush=True
     )
