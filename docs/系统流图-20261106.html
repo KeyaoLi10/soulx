@@ -118,7 +118,7 @@ td s{color:var(--muted)}
 <header class="masthead">
   <h1>SoulX 全双工语音对话系统 · 全链路流图</h1>
   <div class="sub">
-    截至 <b>2026-11-09（修订 v3）</b> · 分支 <b>dev</b>（<span class="mono">34cb8f4</span>，含双路并行 / 路由提速 / 单一交付出口 / 渐进式披露等 19 轮实机迭代）·
+    截至 <b>2026-11-09（修订 v3）</b> · 分支 <b>dev</b>（<span class="mono">eaaeaab</span>，含双路并行 / 路由提速 / 单一交付出口 / 渐进式披露 / 窄版代播记账等 20 轮实机迭代）·
     范围：<b>主线语音路径 + 新版 Agent Runtime</b>（可替换的轮次引擎备选路径不在本文范围）<br>
     本文覆盖：上行音频链路（含 pvad 流门控 / 影子分离）→ 轮次判别与五层防御 → 话轮管线与统一语音出口 →
     <b>Agent Runtime 控制平面</b>（双路并行仲裁 / 全景 / 时序 / 五道守卫 / 任务与交付状态机 / 持久层）→ 服务矩阵与关键参数。
@@ -142,7 +142,7 @@ td s{color:var(--muted)}
   <a href="#s11">11 · 服务矩阵与部署</a>
   <a href="#s12">12 · 关键参数速查</a>
   <a href="#s13">13 · 设计不变量</a>
-  <a href="#s14">14 · 验证状态与实测记录</a>
+  <a href="#s14">14 · 验证状态与残留风险</a>
 </nav>
 
 <div class="legend">
@@ -696,7 +696,7 @@ run 围栏调度 · 三态交付 + 单一出口 + 重播重入），
   <text class="bs" x="376" y="988">播完 → pending_message 挂起（下一轮话轮提交时才写进历史）</text>
   <text class="bs" x="376" y="1005">stop_event 命中：有音频=打断，无音频=未出声</text>
   <rect class="bx2" x="850" y="912" width="240" height="100" rx="7"/>
-  <text class="bs" x="862" y="934">回执话术 = receipt_text 受控模板（§7 表）；</text>
+  <text class="bs" x="862" y="934">回执话术 = receipt_text 受控模板（§8.2 表）；</text>
   <text class="bs" x="862" y="951">逐条上口，打断即终态，本轮剩余回执</text>
   <text class="bs" x="862" y="968">不再上口；模板外的内容不进 TTS，</text>
   <text class="bs" x="862" y="985">模型不参与回执措辞</text>
@@ -947,10 +947,10 @@ Agent Runtime 是系统的任务编排层，回答四个问题：<b>用户说了
   <rect class="bx" x="290" y="60" width="250" height="140" rx="7"/>
   <text class="bt" x="302" y="84">路由器 router.py</text>
   <text class="bs" x="302" y="106">· route_turn 单工具 · 8 few-shot</text>
-  <text class="bs" x="302" y="126">· 五道守卫：格式 / 接地 / 吞句 /</text>
-  <text class="bs" x="302" y="146">　取消目标 / get_task 目标（§8）</text>
-  <text class="bs" x="302" y="166">· 传输故障 = 终态，不重试</text>
-  <text class="bs" x="302" y="186">· 修复轮 ≤1（携纠错提示）</text>
+  <text class="bs" x="302" y="126">· 历史瘦身：只喂 user 侧原话</text>
+  <text class="bs" x="302" y="146">· 五道守卫：格式 / 接地 / 吞句 /</text>
+  <text class="bs" x="302" y="166">　取消目标 / get_task 目标（§8）</text>
+  <text class="bs" x="302" y="186">· 传输故障=终态 · 修复轮 ≤1</text>
 
   <rect class="bx" x="590" y="60" width="170" height="80" rx="7"/>
   <text class="bt2" x="602" y="82">路由脑 :6009 · GPU6</text>
@@ -1130,9 +1130,11 @@ UI（task_update 面板），互不替代。
 <h2 id="s8"><span class="no">§8</span>路由器与五道守卫 + 回执话术模板</h2>
 <p>
 路由器（<code>agent/router.py</code>）是控制平面唯一的决策入口。每次话轮，它把
-<b>系统提示 + 8 条 few-shot + 截断历史 + 快照渲染</b>发给路由脑 :6009，要求以一次
+<b>系统提示 + 8 条 few-shot + 截断历史（只喂 user 侧真人原话）+ 快照渲染</b>发给路由脑 :6009，要求以一次
 <code>route_turn</code> 工具调用返回 <code>plan_json</code>（few-shot 从 16 对砍到 8 对是路由提速三件套之一：
-prompt 3.5k → 1.8k token，被砍 8 例的语义全在系统提示硬规则里）。主循环是
+prompt 3.5k → 1.8k token，被砍 8 例的语义全在系统提示硬规则里）。历史瘦身是 2026-11-09
+讲笑话事故的根修之一：assistant 应承与 user 侧「[系统提示：…]」结果 note 全文会让
+「任务形轮次」先验压过硬规则——现在只保留用户自己说过的话，指代消解靠用户原话 + 快照 label。主循环是
 <code>for i in range(1 + repair_attempts)</code>（修复轮 ≤1）：每轮先取计划
 （优先读 route_turn 工具调用参数，文本中的裸 JSON 只作兜底），再依次过五道守卫；
 守卫不过就把纠错提示追加为 user 消息重跑一轮（修复原因上日志 <code>[router] repair 1/1 after: …</code>）。
@@ -1158,8 +1160,11 @@ prompt 3.5k → 1.8k token，被砍 8 例的语义全在系统提示硬规则里
 （含取消词且去掉取消词 / 指示词 / 语气词后无剩余，如「算了」「那个先取消」）；
 都不满足 → 修复轮 <code>_CANCEL_NOTE</code> → 仍败终态拒绝。scope=all_active 只要求原文含取消词。</li>
 <li><b>get_task 目标守卫 _get_task_target_ungrounded</b>：泛泛追问（「查了吗」「怎么样了」）
-不该指向已完整播报的旧任务。同时满足——label 不命中 ∧ 任务已了结且已播报 / 已取消播报 ∧
-本轮无重播意图（<code>_REPLAY_RE</code>「再讲一遍」类）→ 修复轮 <code>_GET_NOTE</code> → 仍败终态拒绝；
+不该指向已完整播报的旧任务。同时满足——label 不命中 ∧ 任务已了结 ∧
+本轮无重播意图（<code>_REPLAY_RE</code>「再讲一遍」类）→ 修复轮 <code>_GET_NOTE</code> → 仍败终态拒绝。
+「已了结」= 终态且结果已完整播报 / 已取消播报 / 播报被打断——interrupted_partial 是
+"用户已听过一部分"的开放环，与 delivered / suppressed 同列（2026-11-09 补全：此前它被放行，
+「你数到哪了」错锚被打断的笑话任务触发错误重排；interrupted_before_audio 一字未出声不标）；
 running / 未播出的目标放行（泛泛追问的天然落点）。</li>
 </ol>
 
@@ -1172,7 +1177,7 @@ running / 未播出的目标放行（泛泛追问的天然落点）。</li>
 
   <rect class="bx" x="450" y="24" width="240" height="52" rx="7"/>
   <text class="bt" x="570" y="45" text-anchor="middle">路由入口 router.route()</text>
-  <text class="bs" x="570" y="64" text-anchor="middle">系统提示 + 8 few-shot + 历史 + 快照</text>
+  <text class="bs" x="570" y="64" text-anchor="middle">系统提示 + 8 few-shot + user 原话历史 + 快照</text>
 
   <rect class="bx" x="450" y="108" width="240" height="60" rx="7"/>
   <text class="bt" x="570" y="130" text-anchor="middle">路由脑 :6009 /agent_chat_v2</text>
@@ -1204,7 +1209,7 @@ running / 未播出的目标放行（泛泛追问的天然落点）。</li>
 
   <polygon class="bx2" points="570,912 705,964 570,1016 435,964"/>
   <text class="bi" x="570" y="957" text-anchor="middle">⑤ get_task 目标守卫</text>
-  <text class="bs" x="570" y="975" text-anchor="middle">已了结且已播报 ∧ 无重播词 → 拦</text>
+  <text class="bs" x="570" y="975" text-anchor="middle">已了结（含被打断）∧ 无重播词 → 拦</text>
 
   <rect class="bx-v2" x="450" y="1050" width="240" height="72" rx="7"/>
   <text class="bt" x="570" y="1072" text-anchor="middle" fill="var(--v2)">Plan 提交</text>
@@ -1249,7 +1254,7 @@ running / 未播出的目标放行（泛泛追问的天然落点）。</li>
   <rect class="bx2" x="60" y="1160" width="1040" height="76" rx="7"/>
   <text class="bi" x="72" y="1184">实测背景：五道守卫各自来自一起实机事故——传输截断（404 复读）→ 终态不修复；嵌套 evidence.quote 被静默丢弃 → 接地守卫</text>
   <text class="bi" x="72" y="1204">真正生效；「等一下……查湖人比赛」→ 吞句守卫；「你再重新数到十」错取消 [T2 湖人, T3 笑话] → 取消目标守卫；</text>
-  <text class="bi" x="72" y="1224">「哎，你去查了吗」错锚已播报的天气任务全文重播 → get_task 目标守卫。路由实测（:6009 专用实例）：gen 3.5–4.3 s，queue_wait=0。</text>
+  <text class="bi" x="72" y="1224">「哎，你去查了吗」错锚已播报的天气任务全文重播 → get_task 目标守卫（interrupted 接地 2026-11-09 同轮补全；路由历史同轮瘦身为只喂 user 原话）。路由实测（:6009 专用实例）：gen 3.5–4.3 s，queue_wait=0。</text>
 
   <path class="ar ar-v" d="M570,76 V108" marker-end="url(#d9v)"/>
   <path class="ar ar-v" d="M570,168 V200" marker-end="url(#d9v)"/>
@@ -1289,6 +1294,34 @@ running / 未播出的目标放行（泛泛追问的天然落点）。</li>
 结构化兜底——先验改不动，就在出口把关。
 </figcaption>
 </figure>
+
+<h3 id="s8-1">§8.1 路由输入：快照与闲聊路的渐进式披露</h3>
+<p>
+路由脑每次决策的输入快照由 store 生成：<b>活跃任务 + 最近 10 条终态任务</b>，
+每条带 task_id / label / goal / revision / 执行状态，交付状态标注（已播报 /
+已取消播报 / 播报被打断——仅 interrupted_partial，before_audio 一字未出声不标）。不变量 ④（§13）的"引用封闭"就落在这里——
+计划里的 task_id 只能出自这份快照，store 侧拒 unknown_task。
+</p>
+<p>
+同一份任务面板数据经 <code>render_chitchat_context</code>（context.py）喂给闲聊路，
+但信息面刻意更窄——<b>渐进式披露（2026-11-09 根修）</b>：闲聊路只见
+<b>状态摘要 + 用户实际听到部分</b>（heard，截 120 字），执行进度、结果原文
+一概不注入（单一出口，§9）；播报被打断（interrupted）不再设计"再说一声"式
+吊话术，面板如实标注"结果播报被打断（用户听到了：…）"。上下文过重本身就是
+事故源：旧版注入进度 + 结果原文 + 12 条口播纪律 + 示例句，纪律没一条拦住
+"讲笑话不直接讲 / 反复吊旧任务"，反而成了复读的锚定源。现行模板只有
+【任务面板】+ 三条不变量：
+</p>
+<ol>
+<li>凡"现在 / 今天"的数据，面板没有已完成结果就只能应承「我去查一下」，
+绝不给具体队名 / 比分 / 数字——湖人幻觉（1.1 s 编出"森林狼"）的根修；</li>
+<li>结果播报归后台，问起按面板状态答——结果原文闲聊路根本拿不到；</li>
+<li>像朋友聊天，别复读句式——开口前看自己最近说过的话，已说过的不重复。</li>
+</ol>
+<p>
+模板零示例句（反锚定）：示例句在温度 0.9 下会被逐字复读。慢脑快照同理走
+user_text 原文引用，不只传快脑压缩摘要（§10 tools.py）。
+</p>
 
 <h3 id="s8-2">§8.2 受控回执话术模板（receipt_text）</h3>
 <p>
@@ -1499,3 +1532,257 @@ all_active 掐会话当前在播。面板渲染「结果已取消播报」（绝
 complete_outbox 前（e2e 取消竞态），同态幂等后多写者收敛合法。
 </figcaption>
 </figure>
+
+<!-- ================================================================ 10 -->
+<h2 id="s10"><span class="no">§10</span>模块树与 SQLite 持久层</h2>
+<p>
+Agent Runtime V2 全部落在 <code>repo/dialogue_system/agent/</code>（13 个文件，
+约 6.7k 行，纯 stdlib + 已有语音栈，零新依赖），语音前端 <code>app.py</code> 只通过
+FrontendAdapter 的注入点接入。行数是量级参考不是质量指标——最大的是持久层
+store.py 与工具注册表 tools.py。
+</p>
+
+<figure>
+<svg viewBox="0 0 1240 1040" role="img" aria-label="Agent Runtime 模块树：上方 frontend_adapter 双路 worker，下方三列分别是控制平面（router、contracts、context）、执行平面（scheduler、slow_brain、tools、bdl）、交付与状态（delivery、store、runtime），底部 SQLite 十二张表与提交时间线">
+  <defs>
+    <marker id="d11v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
+    <marker id="d11t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+  </defs>
+
+  <rect class="bx-v2" x="60" y="16" width="1040" height="72" rx="7"/>
+  <text class="bt" x="76" y="40" fill="var(--v2)">frontend_adapter.py（676 行）— 话轮 worker · 双路并行</text>
+  <text class="bs" x="76" y="60" fill="var(--v2)">_ACK_RE 应答吸收（3 条件）· _CONT_MERGE_WINDOW_S=8s 续说合并 / land_pending · _LAND_WAIT_INFLIGHT_S=5s</text>
+  <text class="bs" x="76" y="78" fill="var(--v2)">闲聊路线程 + 回执静音仲裁（QUIET_IF_VOICED）· UI 泵 1s diff · finally 释放 gen（吸收轮也释放）</text>
+
+  <rect class="grp" x="60" y="120" width="330" height="330" rx="9"/>
+  <text class="lab-v" x="76" y="142">控制平面（决策）</text>
+  <rect class="bx" x="76" y="152" width="298" height="88" rx="6"/>
+  <text class="bt" x="88" y="172">router.py（551）</text>
+  <text class="bs" x="88" y="192">路由编排 · 8 few-shot · 五道守卫（§8）</text>
+  <text class="bs" x="88" y="210">修复轮 ≤1 · 传输故障=终态 · user 侧历史瘦身</text>
+  <text class="bs" x="88" y="228">快照渲染 · _REPLAY_RE / _ACK_RE 引用</text>
+  <rect class="bx" x="76" y="250" width="298" height="88" rx="6"/>
+  <text class="bt" x="88" y="270">contracts.py（542）</text>
+  <text class="bs" x="88" y="290">9 种操作 discriminated union</text>
+  <text class="bs" x="88" y="308">parse_plan 白名单校验 · receipt_text 模板</text>
+  <text class="bs" x="88" y="326">SpeechEnvelope.valid_for（§8.2/§9）</text>
+  <rect class="bx" x="76" y="348" width="298" height="88" rx="6"/>
+  <text class="bt" x="88" y="368">context.py（215）</text>
+  <text class="bs" x="88" y="388">render_chitchat_context 渐进式披露</text>
+  <text class="bs" x="88" y="406">模板 3 不变量 · 无示例句（反锚定）</text>
+  <text class="bs" x="88" y="424">_HEARD_CHARS=120 · 结果原文永不注入</text>
+
+  <rect class="grp" x="415" y="120" width="330" height="330" rx="9"/>
+  <text class="lab-t" x="431" y="142">执行平面（慢脑）</text>
+  <rect class="bx" x="431" y="152" width="298" height="66" rx="6"/>
+  <text class="bt" x="443" y="172">scheduler.py（334）</text>
+  <text class="bs" x="443" y="192">有界队列 · run lease 围栏 · 依赖 / 取消</text>
+  <text class="bs" x="443" y="210">完成路径 voiced_by_lane 三条件判定（§9）</text>
+  <rect class="bx" x="431" y="228" width="298" height="66" rx="6"/>
+  <text class="bt" x="443" y="248">slow_brain.py（563）</text>
+  <text class="bs" x="443" y="268">make_v2_runner · 工具循环 budget_steps=4</text>
+  <text class="bs" x="443" y="286">空结果→failed(empty) · needs_input 绑 question_id</text>
+  <rect class="bx" x="431" y="304" width="298" height="66" rx="6"/>
+  <text class="bt" x="443" y="324">tools.py（1032）</text>
+  <text class="bs" x="443" y="344">工具注册表 · 天气 / 搜索 / 时间 / 计数</text>
+  <text class="bs" x="443" y="362">快照注入（user_text 原文不只摘要）</text>
+  <rect class="bx" x="431" y="380" width="298" height="66" rx="6"/>
+  <text class="bt" x="443" y="400">bdl.py（218）</text>
+  <text class="bs" x="443" y="420">balldontlie sports_games（NBA / NFL / MLB）</text>
+  <text class="bs" x="443" y="438">mihomo 代理 · API key 平文文件（不进库）</text>
+
+  <rect class="grp" x="770" y="120" width="330" height="330" rx="9"/>
+  <text class="lab-c" x="786" y="142">交付与状态</text>
+  <rect class="bx" x="786" y="152" width="298" height="66" rx="6"/>
+  <text class="bt" x="798" y="172">delivery.py（291）</text>
+  <text class="bs" x="798" y="192">交付泵 · speak_fn 三态证据（§9）</text>
+  <text class="bs" x="798" y="210">deliver 租约 300s · stop_speaking 掐在途播报</text>
+  <rect class="bx" x="786" y="228" width="298" height="88" rx="6"/>
+  <text class="bt" x="798" y="248">store.py（1466）</text>
+  <text class="bs" x="798" y="268">SQLite 12 表 · outbox · 幂等（operation_id）</text>
+  <text class="bs" x="798" y="286">record_delivery_heard · cancel_intent 抑制标记</text>
+  <text class="bs" x="798" y="304">task_panel_rows（heard/interrupted/suppressed）</text>
+  <rect class="bx" x="786" y="326" width="298" height="88" rx="6"/>
+  <text class="bt" x="798" y="346">runtime.py（857）</text>
+  <text class="bs" x="798" y="366">AgentRuntimeV2 · submit_request(request_seq)</text>
+  <text class="bs" x="798" y="384">结果单一出口 · 取消掐音 _cut_speech_for_cancels</text>
+  <text class="bs" x="798" y="402">get_task 重播重入 · cancel_intent 清回</text>
+
+  <rect class="bx2" x="60" y="478" width="1040" height="120" rx="9"/>
+  <text class="bi" x="76" y="502">SQLite 持久层（agent.db · 12 表 · 单写多读，_tx 事务 + _lock）</text>
+  <text class="bs" x="76" y="526">控制侧：sessions · requests（text 原文，_request_wants_replay 查它） · operations（operation_id 幂等去重） · route_log（plan_json 审计）</text>
+  <text class="bs" x="76" y="548">任务侧：tasks（cancel_intent） · task_revisions（修订链） · runs（lease_token / lease_expires_at） · tool_calls</text>
+  <text class="bs" x="76" y="570">交付侧：events（progress / completed / delivery_heard / delivery_suppressed / creation_voiced …） · deliveries（10 态状态机） · outbox（at-least-once） · meta</text>
+
+  <text class="bi" x="60" y="640">提交时间线（本图修订 v2 861c8ed 之后的 20 轮实机迭代 →）</text>
+  <line class="thin ar-t" x1="60" y1="668" x2="1192" y2="668" marker-end="url(#d11t)"/>
+  <circle cx="86" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="86" y="692" text-anchor="middle">a343176</text>
+  <text class="bs" x="86" y="710" text-anchor="middle">双路并行</text>
+  <circle cx="170" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="170" y="692" text-anchor="middle">5b1851d</text>
+  <text class="bs" x="170" y="710" text-anchor="middle">路由提速三件套</text>
+  <circle cx="254" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="254" y="692" text-anchor="middle">36b94c4</text>
+  <text class="bs" x="254" y="710" text-anchor="middle">改口抑制穿越</text>
+  <circle cx="338" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="338" y="692" text-anchor="middle">99375c7</text>
+  <text class="bs" x="338" y="710" text-anchor="middle">闲聊最高纪律</text>
+  <circle cx="422" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="422" y="692" text-anchor="middle">57be3ce</text>
+  <text class="bs" x="422" y="710" text-anchor="middle">单一出口</text>
+  <circle cx="506" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="506" y="692" text-anchor="middle">85a2bf3</text>
+  <text class="bs" x="506" y="710" text-anchor="middle">应答吸收+禁令</text>
+  <circle cx="590" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="590" y="692" text-anchor="middle">6cebeac</text>
+  <text class="bs" x="590" y="710" text-anchor="middle">幻影气泡四环链</text>
+  <circle cx="674" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="674" y="692" text-anchor="middle">162a48a</text>
+  <text class="bs" x="674" y="710" text-anchor="middle">播报独立打断保护</text>
+  <circle cx="758" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="758" y="692" text-anchor="middle">513272d</text>
+  <text class="bs" x="758" y="710" text-anchor="middle">长间隔落地+断流</text>
+  <circle cx="842" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="842" y="692" text-anchor="middle">439f049</text>
+  <text class="bs" x="842" y="710" text-anchor="middle">hold+可调持久化</text>
+  <circle cx="926" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="926" y="692" text-anchor="middle">c462cf8</text>
+  <text class="bs" x="926" y="710" text-anchor="middle">balldontlie 接入</text>
+  <circle cx="1010" cy="668" r="5" class="mk-t"/>
+  <text class="bs" x="1010" y="692" text-anchor="middle">2bcf90e</text>
+  <text class="bs" x="1010" y="710" text-anchor="middle">查询蒸发+取消竞态</text>
+  <circle cx="1090" cy="668" r="5" class="mk-v"/>
+  <text class="bs" x="1090" y="692" text-anchor="middle">34cb8f4</text>
+  <text class="bs" x="1090" y="710" text-anchor="middle">渐进式披露</text>
+  <circle cx="1160" cy="668" r="5" class="mk-v"/>
+  <text class="bs" x="1160" y="692" text-anchor="middle">eaaeaab</text>
+  <text class="bs" x="1160" y="710" text-anchor="middle">窄版代播</text>
+
+  <rect class="bx2" x="60" y="740" width="1100" height="264" rx="9"/>
+  <text class="bi" x="76" y="766">这一程迭代的主线：从"两脑分工"走到"双路并行"，再把结果播报收归单一出口</text>
+  <text class="bs" x="76" y="792">· 双路并行（a343176）：用户话同时进闲聊路与路由路——开口 ~2.5s，吞句事故结构性消灭；仲裁规则三不变量（§5）</text>
+  <text class="bs" x="76" y="816">· 路由提速（5b1851d → 85a2bf3 挪 GPU6）：few-shot 16→8、端点可配置、:6009 专用实例；gen 3.5–4.3s，queue_wait=0</text>
+  <text class="bs" x="76" y="840">· 单一出口（57be3ce）：结果播报只走交付泵，闲聊路上下文不给结果原文——复读从机制上死掉，代之以状态摘要</text>
+  <text class="bs" x="76" y="864">· 交付健壮性（2bcf90e）：查询蒸发根修（窗口外不杀在途路由 + land_wait_prev 有界等待）、重播语义分裂、取消掐音、租约 300s</text>
+  <text class="bs" x="76" y="888">· 打断保护（162a48a + 439f049）：慢脑播报期间 barge-in 阈值独立加强（≥5 块且 ≥1s，前端可调），commit 路径补 hold 语义</text>
+  <text class="bs" x="76" y="912">· 模式钉死（552de54）：env AGENT_RUNTIME_MODE 钉死优先于前端回推，首连不回推设置——会话被静默翻回旧版的事故根修</text>
+  <text class="bs" x="76" y="936">· 渐进式披露（34cb8f4）：闲聊路只见状态摘要+用户听到部分，模板压到 3 条不变量、零示例句——上下文过重本身就是事故源</text>
+  <text class="bs" x="76" y="960">· balldontlie（c462cf8 → fde197d）：sports_games 查询工具（NBA/NFL/MLB，mihomo 代理），webhook 推送试用后移除只留查询</text>
+  <text class="bs" x="76" y="984">· 窄版代播（eaaeaab）：路由历史瘦身（只喂 user 原话）+ get_task interrupted 接地补全 + 创建轮零工具结果视同已播报（§9）</text>
+
+  <path class="ar ar-v" d="M580,88 V120" marker-end="url(#d11v)"/>
+  <path class="ar ar-v thin" d="M225,450 V478" marker-end="url(#d11v)"/>
+  <path class="ar ar-v thin" d="M580,450 V478" marker-end="url(#d11v)"/>
+  <path class="ar ar-v thin" d="M935,450 V478" marker-end="url(#d11v)"/>
+</svg>
+<figcaption>
+<b>图 11 · 模块树与持久层。</b>控制平面 / 执行平面 / 交付与状态三列对应 §6 全景的三条泳道；
+SQLite 是唯一的共享状态——所有模块经 store 读写，跨线程并发由 _tx 事务 + _lock 收口。
+底部时间线即本图修订 v2 之后的 20 轮迭代主线（含中间小修），每轮的细节见
+<b>docs/修改日志.md</b> 对应条目。
+</figcaption>
+</figure>
+
+<!-- ================================================================ 11 -->
+<h2 id="s11"><span class="no">§11</span>服务矩阵与部署要点</h2>
+<table>
+<tr><th>服务</th><th>端口</th><th>GPU</th><th>tmux 窗口</th><th>职责</th></tr>
+<tr><td>web 主服务（语音前端 + FrontendAdapter + AgentRuntimeV2）</td><td>:8090</td><td>—</td><td>soulx:3</td><td>WebSocket 语音链路、双路 worker、交付泵、任务面板 UI 泵</td></tr>
+<tr><td>路由脑（Qwen3.5-9B 专用实例）</td><td>:6009</td><td>GPU6</td><td>soulx:11</td><td>/agent_chat_v2 · greedy（温度 0）· 路由独占，不与生成抢 GEN_LOCK</td></tr>
+<tr><td>闲聊 / 表达脑</td><td>:6007</td><td>GPU3</td><td>soulx:1</td><td>/chat · 温度 0.9 · 闲聊路 chitchat_fn + 表达轮兜底</td></tr>
+<tr><td>慢脑</td><td>:6008</td><td>GPU1</td><td>soulx:7</td><td>/chat · V2 慢脑 runner 的工具循环生成</td></tr>
+<tr><td>轮次检测（turn）</td><td>:8000</td><td>GPU5</td><td>soulx:2</td><td>话轮边界模型（语音前端第一公民，V2 不碰）</td></tr>
+<tr><td>voxtts</td><td>:8085</td><td>GPU7</td><td>soulx:5</td><td>语音合成</td></tr>
+<tr><td>pvad</td><td>:8086</td><td>CPU</td><td>soulx:6</td><td>个人 VAD（能量守卫上游）</td></tr>
+<tr><td>tse</td><td>:8087</td><td>GPU7</td><td>soulx:10</td><td>目标说话人提取</td></tr>
+</table>
+<p>
+<b>部署要点（三条都是实机事故换来的）</b>：
+① 重启 web 必须<b>内联</b>环境变量
+<code>AGENT_RUNTIME_MODE=enforce AGENT_CONTROL_ENDPOINT=http://localhost:6009/agent_chat_v2</code>——
+丢了后者会静默回退 :6007（还能跑但不提速），丢了前者会话可能被前端回推翻回旧版；
+② 前端设置只在 <code>update_config</code> 带 <code>persist:true</code> 时落盘
+<code>checkpoints/ui_settings_default.json</code>（测试脚本不污染），首连不回推全量设置
+（connect_ack 后由 settingsSyncedByAck 拦截），env 钉死恒优先于 UI 回推；
+③ GPU6 / GPU3 是公共空卡，邻居回驻则路由延迟回升（:6009 曾在 GPU2 上从 2.3 s 涨到 5–7 s 后挪卡）。
+</p>
+
+<!-- ================================================================ 12 -->
+<h2 id="s12"><span class="no">§12</span>关键参数速查</h2>
+<table>
+<tr><th>参数</th><th>值</th><th>语义 / 出处</th></tr>
+<tr><td>路由 few-shot</td><td>8 对（prompt ≈1.8k token）</td><td>从 16 对砍半，被砍语义进系统提示硬规则（§8）</td></tr>
+<tr><td>路由实测延迟</td><td>gen 3.5–4.3 s · queue_wait=0</td><td>:6009 专用实例；修复轮触发时 attempts=2 时间翻倍</td></tr>
+<tr><td>温度</td><td>路由 greedy(0) / 闲聊·表达 0.9</td><td>路由要确定性，闲聊要多样；逐字复读事故后 0.8→0.9</td></tr>
+<tr><td>_CONT_MERGE_WINDOW_S</td><td>8.0 s</td><td>续说合并窗口；窗口内合并重路由，窗口外独立话轮 land（§7）</td></tr>
+<tr><td>_LAND_WAIT_INFLIGHT_S</td><td>5.0 s</td><td>窗口外新话轮等旧路由返回的有界等待（查询蒸发根修）</td></tr>
+<tr><td>GRACE_POLL_S / UI_POLL_S</td><td>0.05 s / 1.0 s</td><td>worker grace 轮询 / 任务面板 diff 推送</td></tr>
+<tr><td>普通打断判定</td><td>3 chunk / 1.6 s</td><td>语音前端既有迟滞，V2 不动（§4）</td></tr>
+<tr><td>播报打断判定</td><td>≥5 nonidle 块 ∧ 首块距今 ≥1 s</td><td>慢脑播报独立加强；前端可调 chunks 1–20 / span 0–5000 ms（§4）</td></tr>
+<tr><td>交付租约</td><td>deliver 300 s（其余 30 s）</td><td>覆盖 1–2 分钟长播报；默认 30 s 中途过期曾致 attempts=58 崩溃循环（§9）</td></tr>
+<tr><td>静默重试 / 等话权</td><td>3 次 / 2 s</td><td>speak_fn 返回 None 的重试上限；不可送达有界等待后归还 outbox</td></tr>
+<tr><td>_ACK_RE 应答吸收</td><td>纯应答词 ∧（上轮活着 ∨ 计划挂起 ∨ 面板有任务）</td><td>「嗯 / 好的 / 对 / 是 / 行…」整句纯应答才吸收；「停」绝不在表（§5）</td></tr>
+<tr><td>吞句阈值</td><td>16 字</td><td>stop-only 且引用外原文超 16 字判吞句（事故句剩 30 字，填充词 &lt;10 字）</td></tr>
+<tr><td>_HEARD_CHARS</td><td>120 字</td><td>面板「用户听到部分」截断；delivery_heard 事件记 400 字</td></tr>
+<tr><td>每批操作 / quote / label</td><td>≤8 / ≤200 字 / ≤40 字</td><td>parse_plan 白名单上限（§8）</td></tr>
+<tr><td>慢脑预算</td><td>budget_steps=4 · timeout 480 s</td><td>工具循环步数与超时（TaskExecutionSnapshot）</td></tr>
+</table>
+
+<!-- ================================================================ 13 -->
+<h2 id="s13"><span class="no">§13</span>设计不变量</h2>
+<ol>
+<li><b>语音前端第一公民</b>：Agent Runtime 全部经 FrontendAdapter 只读注入——grace 阈值取同一份
+turn_grace_ms，不另起计时器；speak 桥复用同一条 _run_speech_pipeline。</li>
+<li><b>结构不合法绝不能执行</b>：parse_plan 白名单校验，任何不合法丢弃整批——要么整批提交，要么整批丢弃，没有半执行状态。</li>
+<li><b>幂等</b>：operation_id = request_id + plan 版本 + op 序号，重放同一计划得到同一 ID，store 据此去重。</li>
+<li><b>引用封闭</b>：快脑只能引用快照中的 task_id 或本批 local_ref；quote 归一化后必须是本轮原文子串（留空=不声明锚定）。</li>
+<li><b>传输故障=终态</b>：HTTP 错误 / 流截断 / finish_reason≠stop 没有修复资格——连计划都拿不到，重试无意义。</li>
+<li><b>事件只放已发生的事实</b>：进度来自真实工具步骤，不由模型声称「查了一半」。</li>
+<li><b>一个会话一次只有一个声音</b>：发言 owner 按 session 串行；打断即终态，本轮剩余回执不再上口。</li>
+<li><b>开口前核验信封</b>：每次开口按 SpeechEnvelope + 任务快照核验——改口 / 取消 / 旧修订的结果不播。</li>
+<li><b>speak_fn 三态对齐</b>：True / False / None 与语音前端返回约定逐条对齐，交付层不发明新语义。</li>
+<li><b>结果播报单一出口</b>：唯一出口是交付泵；闲聊路上下文永不注入结果原文，「再讲一遍」只能由泵兑现。</li>
+<li><b>吸收轮也要释放 gen</b>：任何早退路径（吸收 / 作废 / 崩溃）都必须走 finally 释放生成标志——14.5 s 无声事故的根。</li>
+<li><b>取消不是失败</b>：route_stop 断流后 worker 绝不说 ROUTER_FAIL_TEXT；被取代的话轮静默退场。</li>
+<li><b>面板不吊人</b>：suppressed / interrupted 不渲染「结果待播报」式的永不兑现承诺——闲聊路拿死承诺会无限复读。</li>
+</ol>
+
+<!-- ================================================================ 14 -->
+<h2 id="s14"><span class="no">§14</span>验证状态与残留风险</h2>
+<p>
+<b>离线回归（全绿）</b>：九套件（agent_store / agent_router B1–B34+C10/C11 / agent_sched /
+agent_adapter 场景 1–35 系列 / agent_runtime / agent_e2e / agent_bdl / agent_tools /
+agent_v2_proto）+ settings_pin 7 + delivery_bargein_replay 16
++ 语音回放四件（selftalk 12 / empty_stream 15 / smoke 17 / pvad_stream）
++ 前端 phantom_partial_replay（假 WS 按日志重放）。最新一轮新增覆盖：B14b 路由历史瘦身、
+B34 系列 interrupted 接地、C11 系列快照标志、voiced-by-lane 块（store / sched 场景 11）、
+adapter 场景 35（端到端笑话事故回归）。实机：路由 :6009 gen 3.5–4.3 s、
+queue_wait=0；八端口全部在监听（§11）。
+</p>
+<p>
+<b>排查速查</b>（详见 docs/修改日志.md 各条目「查法」）：
+</p>
+<table>
+<tr><th>症状</th><th>先看什么</th></tr>
+<tr><td>任务没发起 / V2 像没跑</td><td>web 窗口有无「[v2] route ok」（无 = 会话被翻回旧版，查 §11 部署要点①）；requests 表 registered 堆积 = 路由被反复作废（查 land_wait / stale drop）</td></tr>
+<tr><td>路由慢</td><td>grep soulx:11 窗口「gen:」三行——queue_wait 是排队（邻居抢卡 / GEN_LOCK），gen_s 是生成本身</td></tr>
+<tr><td>整轮无声</td><td>route_log 的 plan_json（reply_mode 是不是 receipts 且零回执）；gen 卡 True 的信号 = 交付异常延迟 + 静止期「in-flight blip dropped (generating)」</td></tr>
+<tr><td>结果没播 / 重复播</td><td>events 表 delivery_suppressed / delivery_heard 时间 vs deliveries 行状态；重复交付 grep「illegal delivery」「complete_outbox token mismatch」</td></tr>
+<tr><td>短应答掐死播报</td><td>grep「turn held during result delivery」（hold 生效）/「delivery barge-in confirmed」（真打断）</td></tr>
+</table>
+<p>
+<b>残留风险（已知未修）</b>：① 交付泵单线程：speak_fn 占住期间，排队路径的
+stop_speech 要等本轮播完（跨线程 stop_speaking 已接，但队列路径仍串行）；
+② GPU6 / GPU3 为公共卡，邻居回驻则路由延迟回升（历史上发生过一次，挪卡解决）；
+③ 温度 0 下 few-shot 先验与硬规则的张力仍靠守卫在出口兜底（错取消 / 错锚定
+两轮事故同根）——先验改不动，守卫清单随事故生长。
+</p>
+
+<footer>
+<div class="ft">修订 v3 · 2026-11-09 · dev@eaaeaab —— 覆盖 v2（861c8ed）之后 20 轮实机迭代：双路并行 / 路由提速 / 单一交付出口 / 交付健壮性 / 播报独立打断保护 / 模式钉死 / 渐进式披露 / 窄版代播记账。</div>
+<div class="ft">配套文档：docs/修改日志.md（每轮迭代的完整事故链与查法）· docs/事故复盘-20261109-查询蒸发与播报复读.html</div>
+</footer>
+</div><!-- /wrap -->
+</body>
+</html>
