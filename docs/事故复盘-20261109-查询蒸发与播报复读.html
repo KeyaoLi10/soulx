@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>11月9日测试事故复盘</title>
+<style>
+/* ============ 设计令牌（沿用 系统流图-20261106.html 的体系） ============ */
+:root{
+  --bg:#f6f5f1; --surface:#ffffff; --surface2:#efede7;
+  --ink:#20242c; --muted:#5d6673; --line:#dcd8cf; --line2:#c2bcae;
+  --audio:#b45309; --flow:#1c5fd0; --ctrl:#067a55; --v2:#7434d3; --warn:#b4231f;
+  --code-bg:#eceae3;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14161b; --surface:#1e2128; --surface2:#181b20;
+    --ink:#e9e6df; --muted:#98a1af; --line:#333845; --line2:#4a5265;
+    --audio:#f0a848; --flow:#6fa5ff; --ctrl:#46d68a; --v2:#b497f5; --warn:#f0756f;
+    --code-bg:#181b20;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14161b; --surface:#1e2128; --surface2:#181b20;
+  --ink:#e9e6df; --muted:#98a1af; --line:#333845; --line2:#4a5265;
+  --audio:#f0a848; --flow:#6fa5ff; --ctrl:#46d68a; --v2:#b497f5; --warn:#f0756f;
+  --code-bg:#181b20;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink);
+  font:15px/1.8 -apple-system,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  padding:28px 24px 72px;
+}
+.wrap{max-width:1140px;margin:0 auto}
+header.masthead{border-bottom:2px solid var(--line2);padding-bottom:18px;margin-bottom:6px}
+.masthead h1{font-size:27px;margin:0 0 8px;letter-spacing:.5px}
+.masthead .sub{color:var(--muted);font-size:13.5px;line-height:1.7}
+.masthead .sub b{color:var(--ink);font-weight:600}
+h2{font-size:21px;margin:56px 0 8px;padding-top:14px;border-top:1px solid var(--line)}
+h2:first-of-type{margin-top:28px}
+h2 .no{color:var(--muted);font-weight:600;margin-right:10px;font-size:14px;letter-spacing:2px}
+h3{font-size:16.5px;margin:32px 0 6px}
+p{margin:8px 0}
+.lead{font-size:15.5px}
+ul,ol{padding-left:1.6em;margin:8px 0}
+li{margin:4px 0}
+code,.mono{font-family:"SF Mono","JetBrains Mono",ui-monospace,Consolas,Menlo,monospace;font-size:.86em;
+  background:var(--code-bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+em{font-style:normal;color:var(--muted)}
+figure{margin:26px 0;padding:18px 18px 14px;background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
+figcaption{font-size:13px;color:var(--muted);margin-top:12px;line-height:1.65;border-top:1px dashed var(--line);padding-top:10px}
+figcaption b{color:var(--ink)}
+figure svg{max-width:100%;height:auto;display:block;margin:0 auto}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px}
+th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top;line-height:1.6}
+th{background:var(--surface2);font-weight:600;white-space:nowrap}
+td s{color:var(--muted)}
+.toc{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 22px;margin:22px 0;columns:2;column-gap:36px}
+.toc a{color:var(--flow);text-decoration:none;display:block;padding:2px 0;font-size:14px;break-inside:avoid}
+.toc a:hover{text-decoration:underline}
+.toc .toc-title{column-span:all;font-weight:600;font-size:15px;margin-bottom:6px;color:var(--muted);letter-spacing:1px}
+.note{background:var(--surface);border-left:4px solid var(--v2);border-radius:0 8px 8px 0;padding:12px 16px;margin:16px 0;font-size:14px}
+.note.warn{border-left-color:var(--warn)}
+.note.good{border-left-color:var(--ctrl)}
+.q{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:16px 0;font-size:14.5px}
+.q .qq{color:var(--muted);font-size:13px;margin-bottom:6px}
+/* ============ SVG 通用样式（箭头颜色 = 含义编码，全页统一） ============ */
+.bx{fill:var(--surface);stroke:var(--line2);stroke-width:1.3}
+.bx2{fill:var(--surface2);stroke:var(--line2);stroke-width:1.1}
+.grp{fill:none;stroke:var(--line2);stroke-width:1.2;stroke-dasharray:6 5}
+.bx-v2{fill:var(--surface);stroke:var(--v2);stroke-width:1.8}
+.bx-warn{fill:var(--surface);stroke:var(--warn);stroke-width:1.5}
+.bt{font-size:13px;font-weight:600;fill:var(--ink)}
+.bt2{font-size:12px;font-weight:600;fill:var(--ink)}
+.bs{font-size:11px;fill:var(--muted)}
+.bs2{font-size:10.5px;fill:var(--muted)}
+.bi{font-size:11px;fill:var(--ink)}
+.lab{font-size:11px;fill:var(--muted)}
+.lab-a{font-size:11px;fill:var(--audio);font-weight:600}
+.lab-t{font-size:11px;fill:var(--flow);font-weight:600}
+.lab-c{font-size:11px;fill:var(--ctrl);font-weight:600}
+.lab-v{font-size:11px;fill:var(--v2);font-weight:600}
+.lab-w{font-size:11px;fill:var(--warn);font-weight:600}
+.st{fill:var(--surface);stroke:var(--ctrl);stroke-width:2}
+.ar{fill:none;stroke-width:1.7}
+.ar-a{stroke:var(--audio)} .ar-t{stroke:var(--flow)} .ar-c{stroke:var(--ctrl)}
+.ar-v{stroke:var(--v2)}   .ar-w{stroke:var(--warn)} .ar-n{stroke:var(--muted)}
+.dash{stroke-dasharray:5 4}
+.thin{stroke-width:1.2}
+.mk-a{fill:var(--audio)} .mk-t{fill:var(--flow)} .mk-c{fill:var(--ctrl)}
+.mk-v{fill:var(--v2)} .mk-w{fill:var(--warn)} .mk-n{fill:var(--muted)}
+.life{stroke:var(--line2);stroke-width:1;stroke-dasharray:4 5}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <h1>11月9日测试事故复盘：查询蒸发 与「结果马上就到」复读</h1>
+  <div class="sub">
+    测试会话 <b>4e5c17b5</b>（2026-11-09 10:31 – 10:36）·
+    三个现象：<b>①问C罗的事，问了三遍才真的去查</b> ·
+    <b>②「你去查了吗」之后重播了北京天气</b> ·
+    <b>③反复复读「结果马上就到，你稍等哈」</b><br>
+    本文用流程图把每一步讲清楚。所有结论都对应到当天的日志和数据库记录（见文末证据索引）。
+  </div>
+</header>
+
+<div class="note">
+<b>先解释一个名词困惑：</b>我之前的分析里说的「晚十」「晚十一」，是
+<code>docs/修改日志.md</code> 里按日期给<b>每晚修复批次</b>起的内部编号（「晚」= 当晚第 N 轮修复），
+不是系统的部件名字。本文一律不用编号，直接讲机制。
+</div>
+
+<nav class="toc">
+  <div class="toc-title">目录</div>
+  <a href="#s0">〇、先说结论（三句话）</a>
+  <a href="#s1">一、系统是怎么听你说话的（背景知识）</a>
+  <a href="#s2">二、问题一：问C罗，问了三遍才去查</a>
+  <a href="#s3">三、问题二：「结果马上就到」复读机</a>
+  <a href="#s4">四、两个问题的共同本质</a>
+  <a href="#s5">五、修复方向（讨论稿，尚未动代码）</a>
+  <a href="#s6">附、证据索引</a>
+</nav>
+
+<!-- ================================================================ -->
+<h2 id="s0"><span class="no">〇</span>先说结论（三句话）</h2>
+
+<div class="q"><div class="qq">现象①：问C罗的事，一开始没去查，反复问了几次才查</div>
+你的第一句话的「查询指令」在路上被系统自己掐断了——新一句话到来时，系统<b>先掐断上一句还在处理中的指令，然后才判断</b>这是不是新话题。而这次判断恰好慢了一倍（原因见下），你的下一句话来得比它快，查询就凭空蒸发了。
+</div>
+
+<div class="q"><div class="qq">现象②：「哎，你去查了吗？」之后重播了北京天气</div>
+C罗的任务根本没建成（现象①蒸发了），所以「你去查了吗」只能从<b>已有的旧任务</b>里挑一个来「查询」——挑到了最早的北京天气任务；而「查询任务」这个动作的含义是「把结果再播一遍」，于是天气又来了一遍。
+</div>
+
+<div class="q"><div class="qq">现象③：反复复读「结果马上就到，你稍等哈」</div>
+比赛结果任务（热火 vs 国王）的播报被你打断后，进入了一个<b>「永远不会自动重播」的终态</b>；但另一边的任务清单却把它显示成「结果待播报」，闲聊模型的提示词又要求「待播报的任务要告诉用户马上就到」——一边永远不播，一边每轮都承诺，复读就停不下来。<b>你的猜测方向是对的：确实是打断引起的，但不是「等着重播」，而是「永远不会播，可系统每轮还承诺会播」。</b>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s1"><span class="no">一</span>系统是怎么听你说话的（背景知识）</h2>
+
+<p>要看懂后面的事故，需要先认识五个角色。它们全是现有系统里的部件，这里只用大白话描述各自的职责：</p>
+
+<table>
+  <tr><th>角色</th><th>大白话职责</th><th>速度</th></tr>
+  <tr><td><b>话轮定稿</b>（语音识别收尾）</td><td>判断你「一句话说完了」，把这段语音定稿成一句文字。后文说的「一句话 / 话轮」都指定稿后的完整句。</td><td>即时</td></tr>
+  <tr><td><b>闲聊模型</b>（闲聊路）</td><td>一直在场的「陪聊」。不查任何资料，只负责几秒内口头回应你，让对话不断档。</td><td>快（秒级）</td></tr>
+  <tr><td><b>路由器</b>（快脑）</td><td>只判断「这句话要干什么」，不负责回答内容。三种结论：①新建任务去查；②查询/操作已有任务；③纯闲聊、无动作。</td><td>中（2–10 秒）</td></tr>
+  <tr><td><b>任务执行</b>（慢脑）</td><td>拿到任务后真正联网查资料、算结果，可能要几十秒。查完把结果交给播报泵。</td><td>慢（几十秒）</td></tr>
+  <tr><td><b>播报泵</b></td><td>把任务结果排队转成语音说给你听；你随时可以插话打断它。</td><td>—</td></tr>
+  <tr><td><b>任务面板</b></td><td>所有任务的当前状态清单（进行中 / 已完成 / 结果待播报…）。<b>每一轮</b>闲聊生成时都会把这份清单塞给闲聊模型看。</td><td>—</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 1100 470" role="img" aria-label="主流程：一句话定稿后同时进入闲聊路和任务路，任务结果经播报泵说给用户听">
+  <defs>
+    <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-a"/></marker>
+    <marker id="f1t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+    <marker id="f1c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-c"/></marker>
+    <marker id="f1v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
+  </defs>
+  <!-- 任务面板 → 闲聊模型 的虚线 -->
+  <path class="ar ar-n dash" d="M380,92 H450" marker-end="url(#f1a)"/>
+  <text class="lab" x="415" y="84" text-anchor="middle">每轮注入任务状态</text>
+  <!-- 闲聊模型 → 你（上方语音回流） -->
+  <path class="ar ar-a" d="M550,80 V46 H95 V190" marker-end="url(#f1a)"/>
+  <text class="lab-a" x="320" y="38" text-anchor="middle">口头回应（说给你听）</text>
+  <!-- 你 → 话轮定稿 -->
+  <path class="ar ar-a" d="M150,226 H210" marker-end="url(#f1a)"/>
+  <!-- 话轮定稿 → 闲聊模型 / 路由器 -->
+  <path class="ar ar-t" d="M380,214 H410 V112 H450" marker-end="url(#f1t)"/>
+  <path class="ar ar-t" d="M380,238 H410 V298 H450" marker-end="url(#f1t)"/>
+  <!-- 路由器 → 路由结果 -->
+  <path class="ar ar-v" d="M650,298 H720" marker-end="url(#f1v)"/>
+  <!-- ① → 任务执行 -->
+  <path class="ar ar-v" d="M900,226 H950" marker-end="url(#f1v)"/>
+  <text class="lab-v" x="925" y="218" text-anchor="middle">新建</text>
+  <!-- ② → 播报泵（查询触发重播） -->
+  <path class="ar ar-t dash" d="M900,262 H930 V322 H950" marker-end="url(#f1t)"/>
+  <!-- 任务执行 → 播报泵 -->
+  <path class="ar ar-c" d="M1015,260 V290" marker-end="url(#f1c)"/>
+  <text class="lab-c" x="1023" y="280" text-anchor="start">查到结果</text>
+  <!-- 播报泵 → 你（下方语音回流） -->
+  <path class="ar ar-a" d="M950,322 H920 V420 H95 V260" marker-end="url(#f1a)"/>
+  <text class="lab-a" x="500" y="412" text-anchor="middle">把结果说给你听（随时可打断）</text>
+
+  <rect class="bx" x="30" y="190" width="120" height="70" rx="8"/>
+  <text class="bt" x="95" y="216" text-anchor="middle">你</text>
+  <text class="bs" x="95" y="234" text-anchor="middle">说话 · 收听</text>
+  <text class="bs" x="95" y="248" text-anchor="middle">随时可打断</text>
+
+  <rect class="bx2" x="210" y="60" width="170" height="64" rx="8"/>
+  <text class="bt2" x="295" y="84" text-anchor="middle">任务面板</text>
+  <text class="bs" x="295" y="102" text-anchor="middle">全部任务的当前状态</text>
+  <text class="bs" x="295" y="116" text-anchor="middle">（进行中/完成/待播报…）</text>
+
+  <rect class="bx" x="210" y="194" width="170" height="64" rx="8"/>
+  <text class="bt" x="295" y="218" text-anchor="middle">话轮定稿</text>
+  <text class="bs" x="295" y="236" text-anchor="middle">语音识别判定你说完</text>
+  <text class="bs" x="295" y="250" text-anchor="middle">了一句完整的话</text>
+
+  <rect class="bx" x="450" y="80" width="200" height="64" rx="8"/>
+  <text class="bt" x="550" y="104" text-anchor="middle">闲聊模型（快）</text>
+  <text class="bs" x="550" y="122" text-anchor="middle">几秒内口头回应你</text>
+  <text class="bs" x="550" y="136" text-anchor="middle">不查任何资料</text>
+
+  <rect class="bx-v2" x="450" y="266" width="200" height="64" rx="8"/>
+  <text class="bt" x="550" y="290" text-anchor="middle">路由器（快脑）</text>
+  <text class="bs" x="550" y="308" text-anchor="middle">只判断这句话要干什么</text>
+  <text class="bs" x="550" y="322" text-anchor="middle">不负责回答内容</text>
+
+  <text class="lab" x="810" y="192" text-anchor="middle">路由结论（三选一）</text>
+  <rect class="bx" x="720" y="200" width="180" height="150" rx="8"/>
+  <text class="bi" x="810" y="226" text-anchor="middle">① 新建任务</text>
+  <text class="bi" x="810" y="248" text-anchor="middle">② 查询 / 操作</text>
+  <text class="bi" x="810" y="264" text-anchor="middle">　已有任务</text>
+  <text class="bi" x="810" y="286" text-anchor="middle">③ 纯闲聊</text>
+  <text class="bs" x="810" y="302" text-anchor="middle">（无动作，交给</text>
+  <text class="bs" x="810" y="316" text-anchor="middle">　闲聊路应付）</text>
+
+  <rect class="bx" x="950" y="196" width="130" height="64" rx="8"/>
+  <text class="bt" x="1015" y="220" text-anchor="middle">任务执行</text>
+  <text class="bs" x="1015" y="238" text-anchor="middle">（慢脑）联网查</text>
+  <text class="bs" x="1015" y="252" text-anchor="middle">可能要几十秒</text>
+
+  <rect class="bx" x="950" y="290" width="130" height="64" rx="8"/>
+  <text class="bt" x="1015" y="314" text-anchor="middle">播报泵</text>
+  <text class="bs" x="1015" y="332" text-anchor="middle">把结果排队</text>
+  <text class="bs" x="1015" y="346" text-anchor="middle">说给你听</text>
+</svg>
+<figcaption><b>图 1 · 主流程。</b>每句定稿的话同时走两条路：闲聊路立刻口头回应；任务路由路由器判断意图，需要查资料的走「新建任务 → 慢脑执行 → 播报泵」。任务面板每轮都把任务状态清单注入闲聊模型——这个细节是问题二的温床。</figcaption>
+</figure>
+
+<h3>1.1 关键机制一：接地检查（防张冠李戴的代价）</h3>
+<p>路由器每次输出结论时，必须附带一句「引用」——从<b>你当前这句话里</b>摘出的原话，证明它没听错。系统会检查这句引用是否真的出现在当前话轮里：不在（比如模型从<b>前面几句历史</b>里抄了一句），检查不通过，整轮重来（约多花 5 秒），最多重试一次。</p>
+<p>这个机制的出发点是好的——防止模型把你前天说的话安到今天头上。但它有个没料到的副作用：<b>凡是「指代前文」的话（『你快去查吧』『那个事你去查了吗』），字面上引用不了当前句里的原文，检查天然过不了。</b>其实规则里留了活口——引用留空可以直接通过——但路由器的提示词和示例没告诉它这一点，模型不知道可以留空。</p>
+
+<h3>1.2 关键机制二：新旧话轮的「交接班」（问题一的导火索）</h3>
+<p>新的一句话定稿时，系统要做交接班，顺序是这样的：</p>
+
+<figure>
+<svg viewBox="0 0 1020 500" role="img" aria-label="交接班流程：先无条件掐断在途路由，再判断两句间隔是否超过8秒；超过8秒时想落地已返回的计划，但被掐断的路由从未返回">
+  <defs>
+    <marker id="f2w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+    <marker id="f2t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+    <marker id="f2n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-n"/></marker>
+  </defs>
+  <path class="ar ar-t" d="M210,65 H280" marker-end="url(#f2t)"/>
+  <path class="ar ar-w" d="M510,65 H590" marker-end="url(#f2w)"/>
+  <text class="lab-w" x="550" y="57" text-anchor="middle">在跑</text>
+  <path class="ar ar-t" d="M395,90 V170" marker-end="url(#f2t)"/>
+  <text class="lab-t" x="403" y="135" text-anchor="start">不在跑</text>
+  <path class="ar ar-t" d="M510,182 H590" marker-end="url(#f2t)"/>
+  <text class="lab-t" x="550" y="174" text-anchor="middle">≤ 8 秒</text>
+  <path class="ar ar-t" d="M510,205 H565 V292 H590" marker-end="url(#f2t)"/>
+  <text class="lab-t" x="573" y="252" text-anchor="start">＞ 8 秒</text>
+
+  <rect class="bx" x="40" y="40" width="170" height="50" rx="8"/>
+  <text class="bt2" x="125" y="70" text-anchor="middle">新的一句话定稿</text>
+
+  <rect class="bx2" x="280" y="40" width="230" height="50" rx="8"/>
+  <text class="bi" x="395" y="62" text-anchor="middle">判断一：上一句的路由</text>
+  <text class="bi" x="395" y="78" text-anchor="middle">还在跑吗？</text>
+
+  <rect class="bx-warn" x="590" y="40" width="190" height="50" rx="8"/>
+  <text class="bi" x="685" y="62" text-anchor="middle">立即掐断它 ✕</text>
+  <text class="bs" x="685" y="78" text-anchor="middle">（不管下一句是什么话题）</text>
+  <text class="lab-w" x="685" y="112" text-anchor="middle">问题一的导火索：先掐断，后判断</text>
+
+  <rect class="bx2" x="280" y="170" width="230" height="50" rx="8"/>
+  <text class="bi" x="395" y="192" text-anchor="middle">判断二：两句间隔</text>
+  <text class="bi" x="395" y="208" text-anchor="middle">多长时间？</text>
+
+  <rect class="bx" x="590" y="150" width="250" height="64" rx="8"/>
+  <text class="bi" x="715" y="174" text-anchor="middle">≤ 8 秒：视为同一话题</text>
+  <text class="bs" x="715" y="192" text-anchor="middle">丢弃未落地的计划，两句合并</text>
+  <text class="bs" x="715" y="206" text-anchor="middle">后重新路由</text>
+
+  <rect class="bx" x="590" y="260" width="250" height="64" rx="8"/>
+  <text class="bi" x="715" y="284" text-anchor="middle">＞ 8 秒：视为新话题</text>
+  <text class="bs" x="715" y="302" text-anchor="middle">把上一句【已返回】的计划</text>
+  <text class="bs" x="715" y="316" text-anchor="middle">落地执行</text>
+  <text class="lab-w" x="715" y="348" text-anchor="middle">但刚被掐断的路由从未返回 →</text>
+  <text class="lab-w" x="715" y="364" text-anchor="middle">无东西可落地 → 查询凭空消失</text>
+
+  <rect class="bx2" x="80" y="400" width="430" height="72" rx="8"/>
+  <text class="bs" x="295" y="424" text-anchor="middle">「落地」只能回收已经拿到结果的计划；</text>
+  <text class="bs" x="295" y="442" text-anchor="middle">还在路上的路由一旦被掐断，</text>
+  <text class="bs" x="295" y="458" text-anchor="middle">它承载的查询就什么都没了。</text>
+</svg>
+<figcaption><b>图 2 · 交接班的执行顺序。</b>「掐断在途路由」发生在<b>所有判断之前</b>。对 ≤ 8 秒的合并场景这是对的（同一话题，反正要合并重路由）；但对 ＞ 8 秒的新话题场景，它会把上一句还没跑完的查询直接杀死——而后面「落地」步骤只救得了<b>已经返回结果</b>的计划，救不了还在路上的。当天 C罗 的查询就是这么蒸发的。</figcaption>
+</figure>
+
+<!-- ================================================================ -->
+<h2 id="s2"><span class="no">二</span>问题一：问C罗，问了三遍才去查</h2>
+
+<h3>2.1 实际发生了什么（逐条时间线）</h3>
+<table>
+  <tr><th>时间</th><th>你说的话</th><th>系统内部在干什么</th><th>结果</th></tr>
+  <tr><td>10:34:19</td><td>「帮我查一下……听说C罗从国家队退役了，不知道是不是真的」</td><td>路由器开始判读这句话（第 1 次尝试）</td><td>—</td></tr>
+  <tr><td>10:34:25</td><td></td><td>第 1 次输出引用了<b>上一句</b>的『你先不要说了嗯』（从历史里抄的）→ 接地检查不通过，整轮重来</td><td><b>慢 5 秒</b></td></tr>
+  <tr><td>10:34:29</td><td>「嗯，好呀，你快去查吧。」<br><em>（距上句 9.3 秒，已超过 8 秒窗口）</em></td><td>交接班：C罗的路由还在跑 → <b>直接掐断</b>（图 2 的第一个红框）</td><td><b>✕ 查询蒸发，10.5 秒白跑</b></td></tr>
+  <tr><td>10:34:35</td><td></td><td>轮到『你快去查吧』自己被路由：第 1 次引用了 C罗 原话（在历史里）→ 不通过 → 重来</td><td>又慢 5 秒</td></tr>
+  <tr><td>10:34:37</td><td></td><td>第 2 次干脆输出「无操作」（纯闲聊）</td><td><b>✕ 还是没有任务</b></td></tr>
+  <tr><td>10:34:45</td><td>「哎，你去查了吗？」</td><td>路由理解为「查询任务」，但 C罗 任务不存在，只能从现有任务里挑 → 挑了 <b>T1 北京天气</b>，触发重播</td><td>✕ 答非所问</td></tr>
+  <tr><td>10:35:01</td><td>「这个你已经说过了」（打断天气重播）</td><td>天气播报停止</td><td>—</td></tr>
+  <tr><td>10:35:18</td><td>「那个刚刚那个C罗国家队退役的事，你去查了吗？」<br><em>（把整件事原话复述了一遍）</em></td><td>引用『那个刚刚那个c罗国家队退役的事……』能在<b>本句</b>里找到 → 检查通过 → 新建任务 T4『C罗退役』</td><td><b>✓ 第 3 次终于成功</b></td></tr>
+  <tr><td>10:35:31</td><td></td><td>T4 查询完成</td><td>—</td></tr>
+  <tr><td>10:35:53</td><td></td><td>T4 结果播报（C罗确实于 11 月 5 日宣布从国家队退役）</td><td>✓</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 1080 600" role="img" aria-label="C罗查询时序图：三次尝试，前两次分别被交接班掐断和接地检查自我放弃，第三次整句复述成功">
+  <defs>
+    <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-a"/></marker>
+    <marker id="f3v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-v"/></marker>
+    <marker id="f3w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+    <marker id="f3c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-c"/></marker>
+  </defs>
+  <!-- 泳道表头与生命线 -->
+  <rect class="bx" x="60" y="16" width="200" height="34" rx="8"/>
+  <text class="bt2" x="160" y="38" text-anchor="middle">你</text>
+  <rect class="bx-v2" x="340" y="16" width="260" height="34" rx="8"/>
+  <text class="bt2" x="470" y="38" text-anchor="middle">路由器（快脑）</text>
+  <rect class="bx" x="680" y="16" width="260" height="34" rx="8"/>
+  <text class="bt2" x="810" y="38" text-anchor="middle">任务与播报</text>
+  <line class="life" x1="160" y1="50" x2="160" y2="590"/>
+  <line class="life" x1="470" y1="50" x2="470" y2="590"/>
+  <line class="life" x1="810" y1="50" x2="810" y2="590"/>
+
+  <!-- 时间刻度 -->
+  <text class="bs2" x="45" y="92" text-anchor="end">10:34:19</text>
+  <text class="bs2" x="45" y="144" text-anchor="end">10:34:25</text>
+  <text class="bs2" x="45" y="212" text-anchor="end">10:34:29</text>
+  <text class="bs2" x="45" y="268" text-anchor="end">10:34:30</text>
+  <text class="bs2" x="45" y="337" text-anchor="end">10:34:35</text>
+  <text class="bs2" x="45" y="402" text-anchor="end">10:34:45</text>
+  <text class="bs2" x="45" y="477" text-anchor="end">10:35:01</text>
+  <text class="bs2" x="45" y="541" text-anchor="end">10:35:18</text>
+
+  <!-- ① 10:34:19 -->
+  <rect class="bx" x="70" y="68" width="180" height="40" rx="8"/>
+  <text class="bi" x="160" y="86" text-anchor="middle">帮我查一下……C罗从国家队</text>
+  <text class="bi" x="160" y="100" text-anchor="middle">退役了，是不是真的</text>
+  <path class="ar ar-a" d="M250,88 H360" marker-end="url(#f3a)"/>
+  <rect class="bx2" x="360" y="68" width="220" height="40" rx="8"/>
+  <text class="bi" x="470" y="86" text-anchor="middle">开始判读（第 1 次尝试）</text>
+  <text class="bs" x="470" y="100" text-anchor="middle">约需 5 秒</text>
+
+  <!-- ② 10:34:25 接地失败 -->
+  <rect class="bx-warn" x="360" y="118" width="220" height="52" rx="8"/>
+  <text class="bi" x="470" y="138" text-anchor="middle">第 1 次引用了上一句的</text>
+  <text class="bi" x="470" y="154" text-anchor="middle">『你先不要说了嗯』→ 检查不通过</text>
+  <text class="bs" x="470" y="166" text-anchor="middle">整轮重来（再花 5 秒）</text>
+
+  <!-- ③ 10:34:29 你快去查吧 -->
+  <rect class="bx" x="70" y="188" width="180" height="40" rx="8"/>
+  <text class="bi" x="160" y="206" text-anchor="middle">嗯，好呀，你快去查吧。</text>
+  <text class="bs" x="160" y="220" text-anchor="middle">（距上句 9.3 秒）</text>
+  <path class="ar ar-a" d="M250,208 H360" marker-end="url(#f3a)"/>
+
+  <!-- ④ 10:34:30 掐断 -->
+  <rect class="bx-warn" x="360" y="238" width="220" height="52" rx="8"/>
+  <text class="bi" x="470" y="258" text-anchor="middle">✕ 在途路由被新话轮掐断</text>
+  <text class="bi" x="470" y="274" text-anchor="middle">（10.5 秒白跑）</text>
+  <text class="bs" x="470" y="286" text-anchor="middle">C罗任务没有建成</text>
+
+  <!-- ⑤ 10:34:35 你快去查吧 的路由 -->
+  <rect class="bx-warn" x="360" y="305" width="220" height="64" rx="8"/>
+  <text class="bi" x="470" y="325" text-anchor="middle">处理『你快去查吧』：第 1 次引用了</text>
+  <text class="bi" x="470" y="341" text-anchor="middle">C罗原话（在历史里）→ 不通过</text>
+  <text class="bi" x="470" y="355" text-anchor="middle">第 2 次干脆输出『无操作』✕</text>
+  <text class="bs" x="470" y="367" text-anchor="middle">（纯闲聊，什么都没做）</text>
+
+  <!-- ⑥ 10:34:45 你去查了吗 -->
+  <rect class="bx" x="70" y="378" width="180" height="40" rx="8"/>
+  <text class="bi" x="160" y="396" text-anchor="middle">哎，你去查了吗？</text>
+  <text class="bs" x="160" y="410" text-anchor="middle">（你其实想问C罗）</text>
+  <path class="ar ar-a" d="M250,398 H360" marker-end="url(#f3a)"/>
+  <rect class="bx-warn" x="360" y="378" width="220" height="52" rx="8"/>
+  <text class="bi" x="470" y="398" text-anchor="middle">理解为『查询任务』，从现有</text>
+  <text class="bi" x="470" y="414" text-anchor="middle">任务里挑了 T1 北京天气</text>
+  <text class="bi" x="470" y="426" text-anchor="middle">→ 触发重播 ✕</text>
+  <path class="ar ar-w" d="M580,404 H690" marker-end="url(#f3w)"/>
+  <rect class="bx-warn" x="690" y="388" width="240" height="44" rx="8"/>
+  <text class="bi" x="810" y="406" text-anchor="middle">10:34:52 北京天气又播了一遍</text>
+  <text class="bs" x="810" y="422" text-anchor="middle">（答非所问）</text>
+
+  <!-- ⑦ 10:35:01 打断天气 -->
+  <rect class="bx" x="70" y="453" width="180" height="40" rx="8"/>
+  <text class="bi" x="160" y="471" text-anchor="middle">这个你已经说过了</text>
+  <text class="bs" x="160" y="485" text-anchor="middle">（打断天气重播）</text>
+  <path class="ar ar-w dash" d="M250,473 H810 V432" marker-end="url(#f3w)"/>
+  <text class="lab-w" x="520" y="465" text-anchor="middle">打断</text>
+
+  <!-- ⑧ 10:35:18 第三次成功 -->
+  <rect class="bx" x="70" y="513" width="180" height="44" rx="8"/>
+  <text class="bi" x="160" y="531" text-anchor="middle">那个刚刚那个C罗国家队</text>
+  <text class="bi" x="160" y="545" text-anchor="middle">退役的事，你去查了吗？</text>
+  <text class="bs" x="160" y="555" text-anchor="middle">（整句复述了一遍）</text>
+  <path class="ar ar-a" d="M250,535 H360" marker-end="url(#f3a)"/>
+  <rect class="st" x="360" y="513" width="220" height="56" rx="8"/>
+  <text class="bi" x="470" y="533" text-anchor="middle">✓ 引用能在本句里找到</text>
+  <text class="bi" x="470" y="549" text-anchor="middle">→ 新建任务 T4『C罗退役』</text>
+  <text class="bs" x="470" y="563" text-anchor="middle">第 3 次尝试，终于成功</text>
+  <path class="ar ar-c" d="M580,541 H690" marker-end="url(#f3c)"/>
+  <rect class="st" x="690" y="513" width="240" height="64" rx="8"/>
+  <text class="bi" x="810" y="533" text-anchor="middle">10:35:31 查询完成</text>
+  <text class="bi" x="810" y="549" text-anchor="middle">10:35:53 结果播报 ✓</text>
+  <text class="bs" x="810" y="563" text-anchor="middle">你终于听到了答案</text>
+</svg>
+<figcaption><b>图 3 · C罗 查询的完整时序。</b>红色 = 出问题的步骤，绿色 = 最终成功的路径。注意 10:34:29 那一步：你说的明明是催促（好话），对系统却意味着「交接班」——而交接班的第一动作就是掐断还在跑的 C罗 路由。</figcaption>
+</figure>
+
+<h3>2.2 因果链：四个环节，环环相扣</h3>
+
+<figure>
+<svg viewBox="0 0 1120 230" role="img" aria-label="因果链：接地检查拖慢路由、交接班先掐后判、催促句无法通过接地检查、查询错挂到天气任务，四环相扣导致前两次查询蒸发">
+  <defs>
+    <marker id="f4w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+    <marker id="f4n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-n"/></marker>
+  </defs>
+  <path class="ar ar-w" d="M240,84 H300" marker-end="url(#f4w)"/>
+  <text class="lab" x="270" y="76" text-anchor="middle">因此</text>
+  <path class="ar ar-w" d="M520,84 H580" marker-end="url(#f4w)"/>
+  <text class="lab" x="550" y="76" text-anchor="middle">因此</text>
+  <path class="ar ar-w" d="M800,84 H860" marker-end="url(#f4w)"/>
+  <text class="lab" x="830" y="76" text-anchor="middle">于是</text>
+
+  <rect class="bx-warn" x="20" y="40" width="220" height="88" rx="8"/>
+  <text class="bt2" x="130" y="64" text-anchor="middle">A｜路由被拖慢一倍</text>
+  <text class="bs" x="130" y="84" text-anchor="middle">接地检查失败 → 整轮重来</text>
+  <text class="bs" x="130" y="100" text-anchor="middle">5 秒 → 10.5 秒</text>
+
+  <rect class="bx-warn" x="300" y="40" width="220" height="88" rx="8"/>
+  <text class="bt2" x="410" y="64" text-anchor="middle">B｜9.3 秒后你说了下一句</text>
+  <text class="bs" x="410" y="84" text-anchor="middle">交接班『先掐后判』</text>
+  <text class="bs" x="410" y="100" text-anchor="middle">把还在跑的路由掐死</text>
+
+  <rect class="bx-warn" x="580" y="40" width="220" height="88" rx="8"/>
+  <text class="bt2" x="690" y="64" text-anchor="middle">C｜『你快去查吧』缺字眼</text>
+  <text class="bs" x="690" y="84" text-anchor="middle">接地检查过不了 →</text>
+  <text class="bs" x="690" y="100" text-anchor="middle">路由自我放弃（无操作）</text>
+
+  <rect class="bx-warn" x="860" y="40" width="220" height="88" rx="8"/>
+  <text class="bt2" x="970" y="64" text-anchor="middle">D｜『去查了吗』挂错任务</text>
+  <text class="bs" x="970" y="84" text-anchor="middle">只剩旧任务可挑 → T1 天气</text>
+  <text class="bs" x="970" y="100" text-anchor="middle">→ 重播北京天气</text>
+
+  <rect class="bx2" x="20" y="160" width="1060" height="48" rx="8"/>
+  <text class="bs" x="550" y="182" text-anchor="middle">结果：前两次查询凭空蒸发；直到你把整件事原话复述（第 3 次），任务才建成。</text>
+  <text class="bs" x="550" y="198" text-anchor="middle">「反复问了几次才去查」的真相：不是模型不听话，是前两次的指令分别被掐断和自我放弃。</text>
+</svg>
+<figcaption><b>图 4 · 问题一的因果链。</b>A 和 B 相互咬合：A 把路由拖到 10.5 秒，B 在 9.3 秒处把它掐断——只要路由正常速度（5 秒），或你的下一句晚来 2 秒，都不会出事。</figcaption>
+</figure>
+
+<p>四个环节展开说：</p>
+<ul>
+  <li><b>A（为什么慢）：</b>路由器第一次判读时，引用抄了上一句的『你先不要说了嗯』，接地检查不通过，整轮重来。这一下把路由耗时从 5 秒拖到 10.5 秒。<em>没有这一下，查询早就返回了。</em></li>
+  <li><b>B（为什么被掐）：</b>你 9.3 秒后说了『你快去查吧』，触发交接班；交接班<b>先</b>掐断在途路由、<b>后</b>才判断「9.3 秒 &gt; 8 秒，是新话题」。等它想落地 C罗 的查询时，路由已经死了，什么都没剩下。落地机制只救「已返回」的计划，救不了「在路上」的。</li>
+  <li><b>C（为什么催促救不回来）：</b>『你快去查吧』本身没有 C罗 相关字眼，路由器给不出能通过接地检查的引用——它不知道「引用留空就能通过」这条活路，于是第二次直接放弃（输出无操作）。</li>
+  <li><b>D（为什么变成重播天气）：</b>『哎，你去查了吗』被理解为「查询任务」，但 C罗 任务不存在，只能从面板上的旧任务里挑——挑中了最早的 T1 北京天气。「查询任务」的动作等于「把结果再播一遍」，而且规则允许重播「已播报过」的任务。于是 10:34:52 天气又来了一遍。<em>对比：「取消任务」有防误触守卫（必须点名或明确说取消），「查询任务」没有对称的守卫——这就是不对称造成的误伤。</em></li>
+</ul>
+
+<h3>2.3 为什么第三遍成功了</h3>
+<p>10:35:18 你说「那个刚刚那个C罗国家队退役的事，你去查了吗？」——这句话<b>自带完整复述</b>，路由器引用『那个刚刚那个c罗国家队退役的事』能在<b>本句</b>里找到，接地检查通过，任务 T4 顺利建成，10:35:31 查完，10:35:53 播报。<b>也就是说，只有当你的话里字面带着查询内容时，这条路才走得通；一切指代前文的说法都会卡死。</b>这是结构性问题，不是运气问题。</p>
+
+<!-- ================================================================ -->
+<h2 id="s3"><span class="no">三</span>问题二：「结果马上就到」复读机</h2>
+
+<h3>3.1 先看播报的状态机（打断之后发生了什么）</h3>
+<p>10:33:35 你问过「今天热火跟国王队的比赛打得怎么样」，系统建了任务 T3，查完的结论是「没找到比赛结果」（一段道歉说明）。10:34:10 这段播报被你打断——从这一刻起，T3 进入了一个微妙的状态：</p>
+
+<figure>
+<svg viewBox="0 0 1020 400" role="img" aria-label="播报状态机：播完为已播报；播放中被打断为播报被打断终态，永不自动重播，唯一复活路径是你主动再问起；而任务面板把被打断仍算作待播报">
+  <defs>
+    <marker id="f5c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-c"/></marker>
+    <marker id="f5w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+    <marker id="f5n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-n"/></marker>
+  </defs>
+  <path class="ar ar-c" d="M180,188 H240" marker-end="url(#f5c)"/>
+  <path class="ar ar-c" d="M380,185 H440" marker-end="url(#f5c)"/>
+  <path class="ar ar-c" d="M560,175 H600 V118 H640" marker-end="url(#f5c)"/>
+  <text class="lab-c" x="585" y="150" text-anchor="middle">播完</text>
+  <path class="ar ar-w" d="M560,195 H600 V262 H640" marker-end="url(#f5w)"/>
+  <text class="lab-w" x="585" y="240" text-anchor="middle">你插话</text>
+  <!-- 复活路径 -->
+  <path class="ar ar-c dash" d="M640,262 H500 V210" marker-end="url(#f5c)"/>
+  <text class="lab-c" x="560" y="254" text-anchor="middle">你主动再问起（唯一复活路径）</text>
+  <!-- 已播报的重播路径（问题一 D 环） -->
+  <path class="ar ar-n dash" d="M640,118 H310 V210" marker-end="url(#f5n)"/>
+  <text class="lab" x="460" y="108" text-anchor="middle">被点名『再查/再说』→ 重播（问题一的天气重播走的就是这条）</text>
+
+  <rect class="bx" x="30" y="160" width="150" height="56" rx="8"/>
+  <text class="bt2" x="105" y="184" text-anchor="middle">任务完成</text>
+  <text class="bs" x="105" y="202" text-anchor="middle">（查到结果）</text>
+
+  <rect class="bx" x="240" y="160" width="140" height="50" rx="8"/>
+  <text class="bi" x="310" y="182" text-anchor="middle">生成播报文本</text>
+  <text class="bs" x="310" y="198" text-anchor="middle">进播报队列</text>
+
+  <rect class="bx" x="440" y="160" width="120" height="50" rx="8"/>
+  <text class="bi" x="500" y="182" text-anchor="middle">正在播放</text>
+  <text class="bs" x="500" y="198" text-anchor="middle">（说给你听）</text>
+
+  <rect class="st" x="640" y="90" width="150" height="56" rx="8"/>
+  <text class="bi" x="715" y="114" text-anchor="middle">播完 → 已播报</text>
+  <text class="bs" x="715" y="132" text-anchor="middle">面板：已交付 ✓</text>
+
+  <rect class="bx-warn" x="640" y="230" width="170" height="64" rx="8"/>
+  <text class="bi" x="725" y="252" text-anchor="middle">播放中被你打断</text>
+  <text class="bi" x="725" y="268" text-anchor="middle">→ 播报被打断</text>
+  <text class="bs" x="725" y="284" text-anchor="middle">终态：永不自动重播</text>
+  <text class="lab-w" x="725" y="316" text-anchor="middle">但任务面板仍把它算作『结果待播报』</text>
+  <text class="lab-w" x="725" y="332" text-anchor="middle">← 两个部件理解相反（问题二的根源）</text>
+
+  <rect class="bx2" x="30" y="320" width="460" height="64" rx="8"/>
+  <text class="bs" x="260" y="342" text-anchor="middle">同一次打断，因标记时机不同，可能落在两个不同状态：</text>
+  <text class="bs" x="260" y="360" text-anchor="middle">T1 天气重播被打断 → 仍标『已播报』（没引发复读）</text>
+  <text class="bs" x="260" y="376" text-anchor="middle">T3 比赛结果被打断 → 标『播报被打断』（引发复读）</text>
+</svg>
+<figcaption><b>图 5 · 播报状态机。</b>关键在右下角红框：「播报被打断」被播报泵当作<b>终态</b>——它认为你说过了「不想听」，永远不会再自动播；而任务面板判断「是否已交付」时<b>只认『已播报』</b>，于是 T3 在面板上显示「已完成、结果待播报」。同一个状态，两个部件给出了相反的理解。</figcaption>
+</figure>
+
+<h3>3.2 死循环是怎么转起来的</h3>
+
+<figure>
+<svg viewBox="0 0 840 720" role="img" aria-label="死循环：T3播报被打断是终态永不重播，任务面板显示待播报，提示词要求承诺马上到，闲聊模型每轮承诺，你再说一句话又触发下一轮">
+  <defs>
+    <marker id="f6t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+    <marker id="f6w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+  </defs>
+  <!-- 循环箭头 -->
+  <path class="ar ar-t" d="M540,90 H695 V300" marker-end="url(#f6t)"/>
+  <text class="lab-t" x="620" y="82" text-anchor="middle">每轮注入任务清单</text>
+  <path class="ar ar-t" d="M695,364 V570 H540" marker-end="url(#f6t)"/>
+  <text class="lab-t" x="703" y="470" text-anchor="start">要求承诺</text>
+  <path class="ar ar-t" d="M310,572 H140 V364" marker-end="url(#f6t)"/>
+  <text class="lab-t" x="225" y="564" text-anchor="middle">口头承诺</text>
+  <path class="ar ar-t" d="M140,300 V90 H310" marker-end="url(#f6t)"/>
+  <text class="lab-t" x="132" y="195" text-anchor="end">你再说一句（哪怕拜拜）</text>
+  <!-- 中心 → 面板 -->
+  <path class="ar ar-w dash" d="M425,300 V120" marker-end="url(#f6w)"/>
+  <text class="lab-w" x="433" y="210" text-anchor="start">状态永远不变成『已播报』</text>
+  <text class="lab-w" x="425" y="390" text-anchor="middle">承诺永远兑现不了 ✕</text>
+  <text class="lab-w" x="425" y="406" text-anchor="middle">→ 每一轮都重复承诺</text>
+
+  <rect class="bx" x="310" y="60" width="230" height="60" rx="8"/>
+  <text class="bt2" x="425" y="84" text-anchor="middle">任务面板</text>
+  <text class="bs" x="425" y="102" text-anchor="middle">只认『已播报』才算交付</text>
+  <text class="bs" x="425" y="114" text-anchor="middle">→ T3 显示『结果待播报』</text>
+
+  <rect class="bx" x="570" y="300" width="250" height="64" rx="8"/>
+  <text class="bt2" x="695" y="324" text-anchor="middle">闲聊提示词里写着</text>
+  <text class="bs" x="695" y="342" text-anchor="middle">『待播报的任务，要告诉</text>
+  <text class="bs" x="695" y="356" text-anchor="middle">用户结果马上就到』</text>
+
+  <rect class="bx" x="310" y="540" width="230" height="64" rx="8"/>
+  <text class="bt2" x="425" y="564" text-anchor="middle">闲聊模型</text>
+  <text class="bs" x="425" y="582" text-anchor="middle">每轮都说一遍</text>
+  <text class="bs" x="425" y="596" text-anchor="middle">『结果马上就到』</text>
+
+  <rect class="bx" x="30" y="300" width="220" height="64" rx="8"/>
+  <text class="bt2" x="140" y="324" text-anchor="middle">你</text>
+  <text class="bs" x="140" y="342" text-anchor="middle">听到承诺，继续等待</text>
+  <text class="bs" x="140" y="356" text-anchor="middle">（然后说了下一句话）</text>
+
+  <rect class="bx-warn" x="310" y="300" width="230" height="64" rx="8"/>
+  <text class="bt2" x="425" y="324" text-anchor="middle">T3『热火国王比赛』</text>
+  <text class="bs" x="425" y="342" text-anchor="middle">播报被打断（终态）</text>
+  <text class="bs" x="425" y="356" text-anchor="middle">播报泵永不自动重播</text>
+
+  <rect class="bx2" x="330" y="624" width="490" height="64" rx="8"/>
+  <text class="bs" x="575" y="646" text-anchor="middle">加重因素：『拜拜』不在纯应答词吸收名单里</text>
+  <text class="bs" x="575" y="662" text-anchor="middle">（名单只有 嗯/啊/好/对…），每声拜拜都触发</text>
+  <text class="bs" x="575" y="678" text-anchor="middle">完整闲聊 → 10:36:18–44 连续复读了四遍</text>
+</svg>
+<figcaption><b>图 6 · 「结果马上就到」死循环。</b>中心是 T3 的终态；循环每转一圈，你就听到一次「马上就到」。这个环没有任何一步会自己停下来——只要你还说话，它就一直转。</figcaption>
+</figure>
+
+<p>对照当天的实际对话，这个环肉眼可见地转了起来：</p>
+<table>
+  <tr><th>时间</th><th>你说</th><th>闲聊模型回</th></tr>
+  <tr><td>10:35:03</td><td>（打断天气重播后）</td><td>「那咱们等会儿系统那边播报完比赛结果，咱们再聊聊别的……」<br><em>← 复读从这里开始</em></td></tr>
+  <tr><td>10:35:34</td><td>「你给我讲个笑话吧」</td><td>「行啊，那我先歇口气，等会儿系统把结果播报出来咱们再看。对了，你平时喜欢听这种体育新闻还是更爱听笑话？」</td></tr>
+  <tr><td>10:36:19</td><td>「好的好的，行行好，拜拜」</td><td>「行行好，那我先歇会儿等会儿系统把结果播报出来咱们再看。对了，你平时喜欢听这种体育新闻还是更爱听笑话？」</td></tr>
+  <tr><td>10:36:31</td><td>「有点离谱了，好，拜拜，拜拜」</td><td>「没事没事，那你先歇会儿，结果马上就到。」</td></tr>
+  <tr><td>10:36:38</td><td>「嗯，呃，拜拜拜拜」</td><td>「好嘞，结果马上就到，你稍等哈。」</td></tr>
+  <tr><td>10:36:44</td><td>「嗯，好的好的，拜拜」</td><td>「没问题，结果马上就到，你稍等哈。」</td></tr>
+</table>
+
+<div class="note warn">
+<b>两个讽刺的细节：</b>① T3 的「结果」其实是一段<b>「没查到比赛结果」的道歉</b>——就算补播了，也没有你期待的比赛比分；② 此时 C罗 的结果（T4）其实已经在 10:35:53 正常播完了，复读承诺的始终是那个<b>永远不会来</b>的热火国王比赛结果。
+</div>
+
+<h3>3.3 你的猜测对了一半</h3>
+<p>你怀疑「是不是因为打断了播报，导致播报状态是未播报」——<b>方向完全正确，确实是打断引起的</b>。但精确地说不是「状态卡在未播报、等着重播」，而是三个部件对同一次打断给了三种相互矛盾的反应：</p>
+<ul>
+  <li><b>播报泵</b>认为：打断 = 你不想听了 → 终态，永不自动重播（它不欠你）；</li>
+  <li><b>任务面板</b>认为：没播完就不算「已播报」→ 显示「结果待播报」（它认为欠着你）；</li>
+  <li><b>闲聊提示词</b>认为：待播报的任务要主动承诺「马上就到」（它替系统许愿）。</li>
+</ul>
+<p>「欠着但永远不还，还每轮都保证马上还」——这就是复读的全部机制。修复也必须从消除这个矛盾入手，只堵任何一头都会复发。</p>
+
+<!-- ================================================================ -->
+<h2 id="s4"><span class="no">四</span>两个问题的共同本质</h2>
+<table>
+  <tr><th></th><th>问题一（查询蒸发）</th><th>问题二（复读）</th></tr>
+  <tr><td><b>顺序/状态矛盾</b></td><td>交接班「先掐断、后判断」，落地救不了在途路由</td><td>终态 vs 待播报：两个部件对同一状态的判定标准不一致</td></tr>
+  <tr><td><b>守卫不对称</b></td><td>「取消任务」有防误触守卫，「查询任务」没有 → 误重播天气</td><td>「查询」是唯一的复活路径，但闲聊承诺无权触发它 → 承诺无法兑现</td></tr>
+  <tr><td><b>指代性话语无出路</b></td><td>『你快去查吧』过不了接地检查（不知道可留空）</td><td>『拜拜』不被吸收为纯应答 → 每声都触发完整闲聊，复读被放大四倍</td></tr>
+</table>
+<p>一句话总结：<b>系统里几个各自合理的局部规则，在「打断 + 指代 + 快速连续说话」这三个真实对话的日常现象上，组合出了互相矛盾的行为。</b>单独看每个规则都没错——这正是需要成套修、而不是哪里堵哪里的原因。</p>
+
+<!-- ================================================================ -->
+<h2 id="s5"><span class="no">五</span>修复方向（讨论稿，尚未动代码）</h2>
+
+<p>按对应根因列出五个方向。②③④⑤我认为基本没有争议、建议全上；<b>①需要你拍板</b>，因为它有一个真实的代价要权衡。</p>
+
+<table>
+  <tr><th>#</th><th>改什么</th><th>治哪一环</th><th>代价 / 风险</th></tr>
+  <tr>
+    <td><b>①</b></td>
+    <td>交接班「先掐后判」改为「先判再掐」：判定为<b>新话题（&gt;8 秒）</b>时，给在途路由一个<b>有界等待</b>（比如最多 5 秒），等它返回就正常落地播报；超时才掐断。≤8 秒的合并场景维持现状（立即掐断合并）。</td>
+    <td>A+B（查询蒸发的主因）</td>
+    <td>等待期间路由器被占用，紧跟着的新查询要排队，最坏多等 5 秒。等待上限设几秒（3 / 5）待定。</td>
+  </tr>
+  <tr>
+    <td><b>②</b></td>
+    <td>路由提示词/示例补一条：「当前句里找不到原文时，<b>引用留空</b>，不要从历史里抄」。</td>
+    <td>A+C（路由不再被拖慢一倍；催促句不再自我放弃）</td>
+    <td>几乎没有；需回归测试确认不会诱发乱引用。</td>
+  </tr>
+  <tr>
+    <td><b>③</b></td>
+    <td>给「查询任务」加上与「取消任务」同款的防误触守卫：要么话语里点名了任务，要么是明确的状态问句；「已播报过」的任务默认不重播，除非明确要求「再说一遍」。</td>
+    <td>D（天气误重播）</td>
+    <td>「状态问句」的判定粒度需要定：完全交给路由模型判断，还是只认点名式查询。</td>
+  </tr>
+  <tr>
+    <td><b>④</b></td>
+    <td>面板与状态机对齐：「播报被打断」在面板上显示为「播报被打断，想听再说一声」，<b>不再算『待播报』</b>；提示词纪律同步改（被打断 ≠ 欠着）。</td>
+    <td>E+F（死循环的两个对角，根治）</td>
+    <td>几乎没有；属于改文案和判定。</td>
+  </tr>
+  <tr>
+    <td><b>⑤</b></td>
+    <td>承诺降频：「马上就到」只在明确的状态问句时说；把「拜拜 / 再见」加入纯应答吸收名单。</td>
+    <td>G（复读放大器）</td>
+    <td>几乎没有；治标，需配合④才治本。</td>
+  </tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 1120 340" role="img" aria-label="修复方向一的前后对比：现状是新话到来立即掐断在途路由导致查询蒸发；方案是判定新话题后给在途路由最多5秒有界等待，返回则落地播报">
+  <defs>
+    <marker id="f7w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-w"/></marker>
+    <marker id="f7t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-t"/></marker>
+    <marker id="f7c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-c"/></marker>
+  </defs>
+  <!-- 左：现状 -->
+  <rect class="grp" x="20" y="20" width="520" height="300" rx="10"/>
+  <text class="bt2" x="280" y="44" text-anchor="middle">现状</text>
+  <path class="ar ar-t" d="M210,95 H270" marker-end="url(#f7t)"/>
+  <path class="ar ar-w" d="M510,95 H520" marker-end="url(#f7w)"/>
+  <rect class="bx" x="50" y="70" width="160" height="50" rx="8"/>
+  <text class="bi" x="130" y="92" text-anchor="middle">新的一句话到来</text>
+  <text class="bs" x="130" y="108" text-anchor="middle">（上一句路由还在跑）</text>
+  <rect class="bx-warn" x="270" y="70" width="240" height="60" rx="8"/>
+  <text class="bi" x="390" y="92" text-anchor="middle">立即掐断在途路由 ✕</text>
+  <text class="bs" x="390" y="108" text-anchor="middle">（先掐，后判断话题）</text>
+  <text class="lab-w" x="280" y="176" text-anchor="middle">无论接下来判出什么话题，</text>
+  <text class="lab-w" x="280" y="192" text-anchor="middle">被掐的路由都没了 →</text>
+  <text class="lab-w" x="280" y="208" text-anchor="middle">查询凭空蒸发（当天 C罗 那次）</text>
+  <!-- 右：方案① -->
+  <rect class="grp" x="560" y="20" width="540" height="300" rx="10"/>
+  <text class="bt2" x="830" y="44" text-anchor="middle">方案①（待定）</text>
+  <path class="ar ar-t" d="M760,95 H810" marker-end="url(#f7t)"/>
+  <path class="ar ar-t" d="M930,130 V170" marker-end="url(#f7t)"/>
+  <text class="lab-t" x="938" y="155" text-anchor="start">是</text>
+  <path class="ar ar-t" d="M810,100 H775 V300 H810" marker-end="url(#f7t)"/>
+  <text class="lab" x="768" y="200" text-anchor="end">否（≤8秒）</text>
+  <rect class="bx" x="600" y="70" width="160" height="50" rx="8"/>
+  <text class="bi" x="680" y="92" text-anchor="middle">新的一句话到来</text>
+  <text class="bs" x="680" y="108" text-anchor="middle">（同上）</text>
+  <rect class="bx2" x="810" y="70" width="240" height="60" rx="8"/>
+  <text class="bi" x="930" y="92" text-anchor="middle">间隔 &gt; 8 秒？</text>
+  <text class="bs" x="930" y="108" text-anchor="middle">（判定是不是新话题，先判再掐）</text>
+  <rect class="st" x="810" y="170" width="240" height="64" rx="8"/>
+  <text class="bi" x="930" y="192" text-anchor="middle">给在途路由最多 5 秒</text>
+  <text class="bi" x="930" y="208" text-anchor="middle">（有界等待，不掐断）</text>
+  <text class="bs" x="930" y="224" text-anchor="middle">返回 → 落地播报 ✓</text>
+  <text class="lab" x="930" y="252" text-anchor="middle">等待超时才掐断；等待期间</text>
+  <text class="lab" x="930" y="268" text-anchor="middle">新查询最多排队 5 秒</text>
+  <rect class="bx2" x="810" y="275" width="240" height="36" rx="8"/>
+  <text class="bs" x="930" y="297" text-anchor="middle">≤ 8 秒：照旧立即掐断并合并</text>
+</svg>
+<figcaption><b>图 7 · 方向①的前后对比。</b>左：现在的顺序（先掐后判）。右：改为先判断话题，新话题给在途路由一个有界等待。需要你权衡的就是右边那条「等待期间新查询最多排队 5 秒」的代价。</figcaption>
+</figure>
+
+<div class="note good">
+<b>需要你拍板的两件事：</b><br>
+① 方向①要不要上？有界等待的上限设几秒（3 秒 / 5 秒）？<br>
+② 方向③里「状态问句」的判定粒度：完全交给路由模型判断（灵活但可能误判），还是只认点名式查询（保守但『你去查了吗』这类泛指会被拒答）？<br>
+定了这两个，②③④⑤加上①我就一次改完、跑回归、记日志。
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s6"><span class="no">附</span>证据索引</h2>
+<table>
+  <tr><th>结论</th><th>出处</th></tr>
+  <tr><td>C罗 路由被掐断，10.5 秒白跑，任务未建</td><td>会话数据库 route_log 第 21 条：<code>error="router exception: cancelled"</code>，<code>latency 10520ms</code>；requests 表 req-15 终态 <code>registered</code></td></tr>
+  <tr><td>两次接地失败引用的都是历史原话</td><td>日志 10:34:25 / 10:34:34：<code>repair 0/1 after: evidence quote not grounded</code>（引用内容分别是『你先不要说了嗯』和 C罗 原句）</td></tr>
+  <tr><td>交接班「先掐后判」的顺序</td><td><code>agent/frontend_adapter.py</code> 交接班逻辑：先置 abandoned / 停路，再计算 8 秒窗口</td></tr>
+  <tr><td>第三次整句复述建任务成功</td><td>route_log 第 27 条：<code>create_task『C罗退役』</code>；T4 于 10:35:31 完成、10:35:53 播报（deliveries：<code>played_confirmed</code>）</td></tr>
+  <tr><td>天气误重播</td><td>route_log 第 23 条：<code>get_task T1</code>（引用『你去查了吗』，通过检查）；播报始于 10:34:52</td></tr>
+  <tr><td>「已播报过」的任务允许被查询重开</td><td><code>agent/store.py</code> 可重开状态名单包含 <code>played_confirmed</code></td></tr>
+  <tr><td>T3 播报被打断成终态</td><td>deliveries 表：T3 → <code>interrupted_partial</code>@10:34:10；<code>agent/delivery.py</code> 注释「终态，不自动重播」</td></tr>
+  <tr><td>面板把被打断算作『待播报』</td><td><code>agent/store.py</code> 面板生成：只有 <code>played_confirmed</code> 算已交付</td></tr>
+  <tr><td>每轮承诺的提示词纪律</td><td><code>agent/context.py</code>：「已完成、结果待播报的任务，简短告诉用户结果马上就到」</td></tr>
+  <tr><td>四声拜拜触发四次完整闲聊</td><td>日志 10:36:18 / 10:36:29 / 10:36:37 / 10:36:43 四个定稿话轮，各跟一条「结果马上就到」类回复；<code>_ACK_RE</code> 应答词名单不含「拜拜/再见」</td></tr>
+</table>
+
+</div>
+</body>
+</html>
