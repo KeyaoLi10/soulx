@@ -515,7 +515,7 @@ import urllib.parse as _urlparse
 from dataclasses import dataclass, field as _dcfield
 from zoneinfo import ZoneInfo as _ZoneInfo
 
-# balldontlie 体育数据（agent/bdl.py，2026-11-09）：拉取 + webhook 推送。
+# balldontlie 体育数据（agent/bdl.py，2026-11-09）：API 拉取。
 # bdl.py 只在函数内延迟 import agent.tools（ToolResult），无循环依赖。
 from agent import bdl as _bdl
 
@@ -887,9 +887,6 @@ NEW_TOOL_EXECUTORS = {
     "sports_games": lambda args, call_id="": _bdl.sports_games(
         args.get("sport") or "nba", args.get("date") or "",
         args.get("team") or "", call_id=call_id),
-    "sports_events": lambda args, call_id="": _bdl.sports_events(
-        int(args.get("count") or 20), args.get("sport") or "",
-        call_id=call_id),
 }
 
 NEW_TOOL_SCHEMAS = [
@@ -1004,34 +1001,6 @@ NEW_TOOL_SCHEMAS = [
                         "type": "string",
                         "description": "filter by team name/abbr "
                                        "(Chinese ok); empty = all teams",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sports_events",
-            "description": (
-                "Read recent game events pushed in real time by the "
-                "balldontlie webhook (game started / game ended with "
-                "final scores). Local and instant — when the user asks "
-                "about a game that may have been played in the last few "
-                "hours ('那场比赛打完了吗/比分多少'), check this first, "
-                "then sports_games."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "count": {
-                        "type": "integer",
-                        "description": "max events to return, default 20",
-                    },
-                    "sport": {
-                        "type": "string",
-                        "description": "optional filter, e.g. nba",
                     },
                 },
                 "required": [],

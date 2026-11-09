@@ -80,7 +80,6 @@ from clients.vad_client import TurnTaking
 from clients.pvad_client import PVADSession
 from modules.utils.backchannel_utils import check_backchannel
 from agent.runtime import AgentRuntime, AGENT_SYSTEM_ADDON, FAST_TOOLS
-from agent import bdl as agent_bdl
 from frc_engine import FrcEngine, services_available as frc_services_available
 
 # agent-runtime V2 发布开关（手册 §19）：legacy（默认——行为与今天完全
@@ -1220,10 +1219,7 @@ def _make_agent_v2(session, client_id, mode=None):
         """闲聊路（voice lane）生成器：任务面板注入 + generate_with_history。
         与路由路并行，adapter 在 grace 门后消费流式上口（方案 B：走
         :6007 /chat——表达轮基础设施全复用，流式/句级 TTS/Elva 人设/
-        打断/历史回写都现成）。面板读失败不拦说话（空面板照常闲聊）。
-        balldontlie webhook 推送：用户关注过的比赛刚结束 → 追加一次性
-        提示（每事件每会话只注入一次，_bdl_announced 闭包去重——复读
-        教训：2026-11-09「结果马上就到」死循环）。"""
+        打断/历史回写都现成）。面板读失败不拦说话（空面板照常闲聊）。"""
         settings = dict(session.settings)
         try:
             panel = runtime.store.task_panel_rows(client_id)
@@ -1232,17 +1228,6 @@ def _make_agent_v2(session, client_id, mode=None):
                              client_id[:8])
             panel = []
         extra_context = agent_context.render_chitchat_context(panel)
-        try:
-            bdl_note = agent_bdl.take_game_notes(
-                [f"{r.get('goal', '')} {r.get('label', '')}"
-                 for r in panel],
-                _bdl_announced)
-            if bdl_note:
-                extra_context = ((extra_context + "\n\n" + bdl_note)
-                                 if extra_context else bdl_note)
-        except Exception:  # noqa: BLE001
-            logger.exception("[%s][v2] bdl game note failed",
-                             client_id[:8])
         return llm.generate_with_history(
             client_id, stop_event=stop_event,
             system_prompt=settings.get("system_prompt") or None,
@@ -1251,8 +1236,6 @@ def _make_agent_v2(session, client_id, mode=None):
             extra_context=extra_context)
 
     plan_router = PlanRouter()
-    # balldontlie webhook 比赛结束提示的会话级去重（见 _chitchat_fn）
-    _bdl_announced = set()
 
     def _router_fn(sid, text, snap, stop_event=None):
         # runtime.submit_request 的路由回调：完整 §7.1 快照 + 严格计划。
@@ -2592,23 +2575,6 @@ def _audio_retention_cleanup():
 
 
 # ---------------------------------------------------------------------------
-# balldontlie webhook 接收端（2026-11-09）。注册在 balldontlie 控制台的
-# URL 应指向本服务的公网地址（内网穿透/tailscale/https 代理）+ 该路径；
-# 两个路径等价，方便注册时二选一。验签/去重/入环逻辑在 agent/bdl.py。
-# ---------------------------------------------------------------------------
-
-@app.post("/webhook/balldontlie")
-@app.post("/webhook")
-async def balldontlie_webhook(request: Request):
-    raw = await request.body()
-    status, msg = agent_bdl.ingest_webhook(
-        raw,
-        request.headers.get("x-bdl-webhook-timestamp", ""),
-        request.headers.get("x-bdl-webhook-signature", ""),
-        event_id_header=request.headers.get("x-bdl-webhook-id", ""))
-    if status != 200:
-        logger.info("[bdl-webhook] rejected %s: %s", status, msg)
-    return JSONResponse(status_code=status, content={"status": msg})
 
 
 def _logs_api_key() -> str:
