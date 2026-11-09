@@ -161,6 +161,23 @@ TURN_ENGINES = ("soulx", "frc")
 AGENT_RUNTIME_MODES = ("legacy", "shadow", "enforce")
 
 
+def pin_env_runtime_mode(clean: dict) -> dict:
+    """env 钉死的 AGENT_RUNTIME_MODE 不被任何 UI 回推改写（就地修改）。
+
+    2026-11-09 实机事故：该不变量此前只在加载/落盘路径
+    （load/save_ui_default_overrides）生效，漏了 _merge_session_settings
+    的会话内合并路径——前端 onopen 的全量设置回推携带 Runtime select
+    的 DOM 默认值 legacy，一次浏览器连接就把 enforce 会话（及部署
+    意图）静默翻回 legacy，话轮全走旧路、V2 路由/任务面板一概不生效。
+    env 未钉死时 UI 实时切换照常可用。
+    """
+    env_mode = os.environ.get("AGENT_RUNTIME_MODE")
+    if (env_mode in AGENT_RUNTIME_MODES
+            and clean.get("agent_runtime_mode") not in (None, env_mode)):
+        clean.pop("agent_runtime_mode", None)
+    return clean
+
+
 def sanitize_updates(data) -> dict:
     """Validate + clamp a partial settings payload from the web UI.
 

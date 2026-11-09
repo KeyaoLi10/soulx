@@ -72,6 +72,12 @@ let reconnectTimer = null;
 let heartbeatTimer = null;
 let lastServerMsgTime = Date.now();
 let loadingConfirmedOnce = false;
+// 首连是否已收到 connect_ack（服务端生效设置已恢复进 UI）。在它之前
+// UI 控件还全是 DOM 默认值——此时回推全量设置会用默认值压垮持久化
+// 的前端默认（2026-11-09 实机事故：Runtime select 的 DOM 默认 legacy
+// 每次刷新页面都把 enforce 会话静默翻回 legacy）。只有重连（此前
+// 已被 connect_ack 同步过、UI 持有用户真实状态）才需要回推。
+let settingsSyncedByAck = false;
 
 function setConnState(state, label) {
   const pill = document.getElementById('connPill');
@@ -102,8 +108,12 @@ function connectSocket() {
     }
     if (ttsNode) ttsNode.port.postMessage({ type: 'abort' });
     // A reconnect means a brand-new server session: settings (persona, TTS
-    // params...) were reset server-side. Re-apply whatever the UI holds.
-    sendCurrentSettings();
+    // params...) were reset server-side. Re-apply whatever the UI holds —
+    // but ONLY once the UI actually holds the user's state: on the first
+    // open of a page load the controls are still DOM defaults and pushing
+    // them would clobber the persisted frontend defaults (connect_ack is
+    // what restores the UI; pushing before it reverses that sync).
+    if (settingsSyncedByAck) sendCurrentSettings();
   };
 
   socket.onclose = () => {
@@ -910,6 +920,9 @@ function sendConfig(partial) {
 // settings, including the persisted frontend defaults) ---
 function applyServerSettings(s) {
   if (!s || typeof s !== 'object') return;
+  // connect_ack 已把服务端生效设置恢复进 UI——从此刻起 UI 持有的才是
+  // 用户真实状态，重连时的 sendCurrentSettings 回推才安全（见 onopen）。
+  settingsSyncedByAck = true;
   const set = (el, v) => { if (el && v !== undefined && v !== null) el.value = v; };
   if (s.system_prompt) settingsEls.persona.value = s.system_prompt;
   set(settingsEls.ttsEngine, s.tts_engine);

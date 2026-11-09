@@ -121,7 +121,8 @@ from pvad_gate import (
 # thread does the blocking ECAPA work.
 from pvad_stream import PvadStreamGate, stream_gate_active, stream_gate_filter
 from settings import (Config, DEFAULT_SETTINGS, TTS_ENGINE, sanitize_updates,
-                      save_ui_default_updates, UI_DEFAULT_OVERRIDES)
+                      save_ui_default_updates, UI_DEFAULT_OVERRIDES,
+                      pin_env_runtime_mode)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -1745,6 +1746,15 @@ def _merge_session_settings(session, data: dict, persist: bool = False) -> dict:
     清洗后的键值同时落盘为后续会话默认值。测试脚本/未知客户端不带
     标志，只改本会话，不污染持久化默认。"""
     clean = sanitize_updates(data)
+    # env 钉死的 AGENT_RUNTIME_MODE 不被 UI 回推改写（2026-11-09 实机
+    # 事故：文档承诺的不变量只在落盘/加载路径生效，会话内合并漏设防，
+    # 前端 onopen 全量回推把 enforce 会话静默翻回 legacy）
+    if "agent_runtime_mode" in clean:
+        wanted = clean.get("agent_runtime_mode")
+        pin_env_runtime_mode(clean)
+        if "agent_runtime_mode" not in clean:
+            logger.info("agent_runtime_mode update to %r dropped: pinned "
+                        "by AGENT_RUNTIME_MODE env", wanted)
 
     if clean.get("turn_engine") not in (None, session.settings.get("turn_engine")):
         # engine switch mid-session: drop any half-finished FRC
