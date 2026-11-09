@@ -53,6 +53,11 @@ DLV_SUPPRESSED = "suppressed"
 DLV_RETRY_EXHAUSTED = "retry_exhausted"
 # 播放证据分级：当前只有服务端估计（手册 §13.4），ACK 是 P5 可选项
 DLV_PLAYED_CONFIRMED = "played_confirmed"
+# 闲聊路已在创建轮亲口说出的内容（窄版 voiced-by-lane，2026-11-09）：
+# 任务创建轮闲聊路活跃 + 完成的 run 零工具调用 + 该任务首个 run ——
+# 内容是模型自产（笑话/寒暄类），闲聊路面板可见即等同已播报，
+# 结果泵不再插入。见 scheduler 入队点判定。
+DLV_VOICED_BY_LANE = "voiced_by_lane"
 
 # 回执 outcome（手册 §13.1）
 RC_ACCEPTED = "accepted"

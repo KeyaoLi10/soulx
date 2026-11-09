@@ -18,12 +18,15 @@ worker 在模型调用前/工具前后/发布结果前检查（§9.3 的 runner 
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from typing import Callable, Optional
 
 from agent import contracts as C
 from agent import store as S
+
+logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 0.5
 MAX_RUNNING_PER_SESSION = 2
@@ -304,6 +307,23 @@ class TaskScheduler:
                 pass
         if out == "fenced":
             return  # 审计已写，不再安排交付
+        # 窄版 voiced-by-lane（2026-11-09，三条件详见 store 块注释）：
+        # 创建轮闲聊路亲口说过 + 本 run 零工具调用 + 首个 run 的完成
+        # 结果是慢脑自产内容（笑话/寒暄类），闲聊路面板可见即等同已
+        # 播报——泵不再入队（事故：T4 笑话挂"待播报"1 分 54 秒逼出
+        # "是不是重复啦"幻觉）。抑制在入队时刻而非泵领取时刻：显式
+        # 重播（get_task 重开）路径不受影响。失败/待输入照常走泵。
+        if state == C.EXEC_COMPLETED and self.store.result_voiced_by_lane(
+                session_id, task_id, run_id):
+            dlv = self.store.record_delivery(
+                session_id, "result", task_id=task_id, revision=revision,
+                run_id=run_id)
+            self.store.set_delivery_state(dlv, C.DLV_VOICED_BY_LANE)
+            logger.info(
+                "[%s] result voiced by lane: %s (creation turn voiced, "
+                "run used no tools) — delivery pump skipped",
+                session_id, task_id)
+            return
         # 结果交付入 outbox（delivery.py 消费）
         if state in (C.EXEC_COMPLETED, C.EXEC_FAILED,
                      C.EXEC_WAITING_INPUT):

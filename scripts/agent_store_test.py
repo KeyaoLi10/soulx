@@ -400,6 +400,66 @@ check("empty heard text ignored",
           "SELECT COUNT(*) c FROM events WHERE type='delivery_heard'"
       ).fetchone()["c"] == n_heard)
 
+# ---- 窄版 voiced-by-lane（2026-11-09）--------------------------------------
+# 标记面（creation_voiced 事件，幂等）+ 判别器（零工具 + 首 run）+
+# 状态机（pending→voiced_by_lane 合法、终态、重开白名单、面板 delivered）
+SID6 = "sess-vbl"
+db.ensure_session(SID6)
+rv = db.register_request(SID6, "讲个笑话", source_commit_id="v0",
+                         engine_epoch="web-1")
+res = db.commit_plan(SID6, rv, plan([create("讲笑话", ref="L1",
+                                            goal="讲个笑话")]))
+tj = res.bindings["L1"]
+check("creation_voiced not yet marked",
+      not db.task_creation_voiced(SID6, tj))
+db.record_creation_voiced(SID6, [tj])
+db.record_creation_voiced(SID6, [tj])
+check("record_creation_voiced idempotent",
+      db.task_creation_voiced(SID6, tj)
+      and len([e for e in db.events_for_task(SID6, tj, limit=50)
+               if e["type"] == "creation_voiced"]) == 1)
+runj = db.create_run(SID6, tj, 1)
+tokj = db.lease_run(runj)
+check("zero-tool first run qualifies as voiced by lane",
+      db.result_voiced_by_lane(SID6, tj, runj))
+db.append_event(SID6, "tool_call", task_id=tj, revision=1, run_id=runj,
+                payload={"tool": "web_search"})
+check("tool-using run does not qualify",
+      not db.result_voiced_by_lane(SID6, tj, runj)
+      and db.run_tool_count(runj) == 1)
+check("empty run_id is conservatively False",
+      not db.result_voiced_by_lane(SID6, tj, None))
+db.finish_run(SID6, tj, 1, runj, tokj, C.EXEC_COMPLETED,
+              result_summary="从前有座山")
+# rerun/amend 后 run 数 >1：不再判 voiced_by_lane（防误杀重执行）
+rva = db.register_request(SID6, "再讲个别的", source_commit_id="v1",
+                          engine_epoch="web-1")
+db.commit_plan(SID6, rva, plan([
+    {"op": "amend_task", "target_task_id": tj, "expected_revision": 1,
+     "patch": {"detail_level": "high"}}]))
+runj2 = db.create_run(SID6, tj, 2)
+check("second run breaks first-run condition",
+      db.task_run_count(SID6, tj) == 2
+      and not db.result_voiced_by_lane(SID6, tj, runj2))
+# 状态机：pending -> voiced_by_lane 合法；终态不可迁出；重开白名单含它
+dv = db.record_delivery(SID6, "result", task_id=tj, revision=1, run_id=runj)
+db.set_delivery_state(dv, C.DLV_VOICED_BY_LANE)
+check("pending -> voiced_by_lane legal",
+      db.delivery_row(dv)["state"] == C.DLV_VOICED_BY_LANE)
+try:
+    db.set_delivery_state(dv, C.DLV_SENDING)
+    back = False
+except S.StoreError:
+    back = True
+check("voiced_by_lane is terminal", back)
+db._reopen_delivery(dv)
+check("voiced_by_lane reopenable for explicit replay",
+      db.delivery_row(dv)["state"] == C.DLV_PENDING)
+db.set_delivery_state(dv, C.DLV_VOICED_BY_LANE)
+rows = {r["task_id"]: r for r in db.task_panel_rows(SID6)}
+check("panel delivered counts voiced_by_lane",
+      rows[tj]["delivered"] is True, str(rows.get(tj)))
+
 # ---- route log --------------------------------------------------------------
 db.log_route(SID5, ro, "shadow", snapshot={"tasks": 2}, plan_json=None,
              parse_ok=False, error="timeout", latency_ms=42)

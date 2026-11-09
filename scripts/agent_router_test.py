@@ -321,6 +321,27 @@ check("B14 history trimmed to 6",
       any("u9" in c for c in sent_users)
       and not any("u0" in c and len(c) == 2 for c in sent_users))
 
+# B14b 路由历史瘦身（2026-11-09 事故：route 10 把"讲个笑话"建成任务——
+# 最近 6 条共享 LLM 历史清一色任务形轮次（assistant 应承 + user 侧结果
+# note 全文），先验压过硬规则"闲聊请求 direct"）。只喂 user 侧真人
+# 原话；assistant 与 [系统提示：…] note 全部剔除
+tr, calls = _mk_transport([_tool_call_result(GOOD_PLAN)])
+hist = [
+    {"role": "user", "content": "帮我查北京天气"},
+    {"role": "assistant", "content": "好嘞，我这就去查。"},
+    {"role": "user", "content": "[系统提示：后台任务 T1（查天气）已完成，"
+                                "以下是真实结果——\n北京晴。]"},
+    {"role": "user", "content": "帮我讲个笑话"},
+]
+PlanRouter(transport=tr).route(SNAP, "讲个笑话", history=hist)
+msgs = calls[0]["messages"]
+check("B14b router history diet: user-only, no notes",
+      any(m.get("content") == "帮我讲个笑话" for m in msgs)
+      and any(m.get("content") == "帮我查北京天气" for m in msgs)
+      and not any(m.get("content") == "好嘞，我这就去查。" for m in msgs)
+      and not any("以下是真实结果" in (m.get("content") or "") for m in msgs),
+      str([m.get("content", "")[:20] for m in msgs]))
+
 # B15 证据引用接地（2026-11-06 enforce 实测：连续多轮引用同一句历史话）
 STALE_PLAN = json.dumps({
     "schema_version": 1, "operations": [
@@ -588,6 +609,35 @@ rr = PlanRouter(transport=tr).route(GT_SNAP2, "哎，你去查了吗？")
 check("B33 get_task on completed-but-unheard passes",
       rr.ok and rr.attempts == 1, rr.to_log())
 
+# B34 interrupted_partial 也算"已了结"（2026-11-09 锚定事故补全：T4
+# 讲笑话播报被打断挂着 interrupted_partial，"你刚刚数到几了"被 get_task
+# 锚上 → 重排出第二个笑话）。泛泛追问修复换目标；话题点名/重播词放行
+GT_SNAP3 = json.loads(json.dumps(GT_SNAP))
+GT_SNAP3["recent_terminal"][0]["delivered"] = False
+GT_SNAP3["recent_terminal"][0]["interrupted"] = True
+tr, calls = _mk_transport([_tool_call_result(GET_DELIVERED),
+                           _tool_call_result(GET_RUNNING)])
+rr = PlanRouter(transport=tr).route(GT_SNAP3, "哎，你去查了吗？")
+check("B34 interrupted_partial target repaired away",
+      rr.ok and rr.attempts == 2
+      and rr.plan.operations[0].target_task_id == "T4", rr.to_log())
+tr, calls = _mk_transport([_tool_call_result(GET_WEATHER_EMPTYQ)])
+rr = PlanRouter(transport=tr).route(GT_SNAP3, "北京天气怎么样了？")
+check("B34b topic-named get_task on interrupted passes",
+      rr.ok and rr.attempts == 1, rr.to_log())
+tr, calls = _mk_transport([_tool_call_result(GET_WEATHER_EMPTYQ)])
+rr = PlanRouter(transport=tr).route(GT_SNAP3, "再讲一遍北京天气。")
+check("B34c replay word on interrupted passes",
+      rr.ok and rr.attempts == 1, rr.to_log())
+# B34d before_audio（interrupted 标志为 False）不拦：一字没出声，
+# 追问重排合法——快照里只有 interrupted_partial 才标 interrupted
+GT_SNAP4 = json.loads(json.dumps(GT_SNAP3))
+GT_SNAP4["recent_terminal"][0]["interrupted"] = False
+tr, calls = _mk_transport([_tool_call_result(GET_DELIVERED)])
+rr = PlanRouter(transport=tr).route(GT_SNAP4, "哎，你去查了吗？")
+check("B34d interrupted_before_audio still passes",
+      rr.ok and rr.attempts == 1, rr.to_log())
+
 # ==== C. context.build_router_snapshot ======================================
 
 tmp = tempfile.mkdtemp(prefix="agent_router_ctx_")
@@ -672,6 +722,36 @@ snap3 = CT.build_router_snapshot(store, "s1", "查了吗")
 _t1 = [t for t in snap3["recent_terminal"] if t["task_id"] == "T1"][0]
 check("C10b played_confirmed marks terminal delivered",
       _t1.get("delivered") is True, str(_t1))
+
+# C11 interrupted_partial 标志（仅 partial，不含 before_audio——一字
+# 没出声时追问重排合法）；voiced_by_lane 计入 delivered（2026-11-09）
+store._conn.execute(
+    "UPDATE deliveries SET state=? WHERE delivery_id=?",
+    (C.DLV_INTERRUPTED_PARTIAL, _did))
+store._conn.commit()
+snap4 = CT.build_router_snapshot(store, "s1", "刚才说到哪了")
+_t1 = [t for t in snap4["recent_terminal"] if t["task_id"] == "T1"][0]
+check("C11 interrupted_partial flags terminal interrupted",
+      _t1.get("interrupted") is True and _t1.get("delivered") is False,
+      str(_t1))
+store._conn.execute(
+    "UPDATE deliveries SET state=? WHERE delivery_id=?",
+    (C.DLV_VOICED_BY_LANE, _did))
+store._conn.commit()
+snap5 = CT.build_router_snapshot(store, "s1", "查了吗")
+_t1 = [t for t in snap5["recent_terminal"] if t["task_id"] == "T1"][0]
+check("C11b voiced_by_lane counts as delivered, not interrupted",
+      _t1.get("delivered") is True and _t1.get("interrupted") is False,
+      str(_t1))
+store._conn.execute(
+    "UPDATE deliveries SET state=? WHERE delivery_id=?",
+    (C.DLV_INTERRUPTED_BEFORE_AUDIO, _did))
+store._conn.commit()
+snap6 = CT.build_router_snapshot(store, "s1", "查了吗")
+_t1 = [t for t in snap6["recent_terminal"] if t["task_id"] == "T1"][0]
+check("C11c before_audio not flagged interrupted",
+      _t1.get("interrupted") is False and _t1.get("delivered") is False,
+      str(_t1))
 
 store.close()
 

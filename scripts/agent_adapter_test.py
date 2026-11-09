@@ -785,7 +785,12 @@ def _ctl_chitchat(stop_event):
 
 
 rt, ad, st = make_env(tmp, [CREATE_PLAN, CANCEL_PLAN, GET_PLAN, GET_PLAN],
-                      chitchat_impl=_ctl_chitchat)
+                      chitchat_impl=_ctl_chitchat,
+                      runner=lambda s, c, p: (
+                          p("tool_call", {"tool": "web_search"}) or {
+                              "type": "completed",
+                              "payload": {"summary": "北京晴", "facts": [],
+                                          "sources": [], "outcome": "complete"}}))
 rt_ref[0] = rt
 st["can_deliver"] = False            # 结果压 outbox：交付行尚未创建
 ad.handle_utterance("查一下骑士队的比赛")
@@ -1034,10 +1039,11 @@ check("29c4 execution progress not injected",
 
 rt, ad, st = make_env(
     tmp, [CREATE_PLAN, GET_PLAN], chitchat_impl=_std_chitchat,
-    runner=lambda s, c, p: {"type": "completed",
-                            "payload": {"summary": "晴转多云十五度",
-                                        "facts": [], "sources": [],
-                                        "outcome": "complete"}})
+    runner=lambda s, c, p: (
+        p("tool_call", {"tool": "web_search"}) or {
+            "type": "completed",
+            "payload": {"summary": "晴转多云十五度", "facts": [],
+                        "sources": [], "outcome": "complete"}}))
 rt_ref[0] = rt
 ad.handle_utterance("查一下北京天气")
 ok = wait(lambda: any("晴转多云" in str(x) for x in st["speak_calls"]))
@@ -1208,6 +1214,69 @@ _release34e.set()
 ok = wait(lambda: rt.store.task_row("s1", "T1") is not None)
 check("34f slow inflight route still lands via its own grace", ok)
 
+
+# ==== 场景 35：窄版 voiced-by-lane 端到端（2026-11-09 讲笑话事故）==========
+# 创建轮闲聊路开口应承 + run 零工具 + 首 run → 结果标 voiced_by_lane：
+# 泵不插播（事故：T4 笑话在面板挂"待播报"1 分 54 秒，闲聊路只能调和
+# 矛盾 → "刚才那个笑话是不是重复啦"）；话题点名但无重播词 → "already"
+# 只报状态；显式重播词 → 从 completed 事件合成 deliver、泵兑现
+JOKE_PLAN = plan_json([{"op": "create_task", "local_ref": "L1",
+                        "label": "讲笑话", "goal": "讲个笑话",
+                        "evidence": {"quote": "讲个笑话"}}],
+                      reply_mode="receipts")
+rt, ad, st = make_env(
+    tmp, [JOKE_PLAN, GET_PLAN, GET_PLAN], chitchat_impl=_std_chitchat,
+    runner=lambda s, c, p: {"type": "completed",
+                            "payload": {"summary": "从前有座山，山里有座庙。",
+                                        "facts": [], "sources": [],
+                                        "outcome": "complete"}})
+rt_ref[0] = rt
+ad.handle_utterance("给我讲个笑话")
+ok = wait(lambda: rt.store.task_row("s1", "T1") is not None
+          and rt.store.task_row("s1", "T1")["execution_status"]
+          == C.EXEC_COMPLETED)
+check("35 joke task completes without pump (voiced by lane)", ok)
+time.sleep(0.3)
+for _ in range(6):
+    rt.delivery.pump()
+    time.sleep(0.05)
+check("35b pump never inserts the joke",
+      not any("从前有座山" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+row = rt.store._conn.execute(
+    "SELECT state FROM deliveries WHERE session_id='s1' AND kind='result' "
+    "AND task_id='T1' ORDER BY rowid DESC LIMIT 1").fetchone()
+check("35c delivery state voiced_by_lane",
+      row is not None and row["state"] == C.DLV_VOICED_BY_LANE,
+      str(dict(row) if row else None))
+rows = rt.store.task_panel_rows("s1")
+check("35d panel no longer baits with 待播报",
+      rows[0]["delivered"] is True and rows[0]["interrupted"] is False,
+      str(rows[0]))
+# 话题点名 + 无重播词：结果已由闲聊路说过 → "already"，不重排不重播
+ad.handle_utterance("那个笑话讲得怎么样了")
+ok = wait(lambda: _committed_count(rt) >= 2)
+check("35e topic-named status ask commits", ok)
+time.sleep(0.3)
+for _ in range(6):
+    rt.delivery.pump()
+    time.sleep(0.05)
+check("35f status ask does not replay voiced-by-lane result",
+      not any("从前有座山" in str(x) for x in st["speak_calls"]),
+      str(st["speak_calls"]))
+# 显式重播词：合成 deliver、重开交付行、泵兑现（单一出口纪律）
+ad.handle_utterance("再讲一遍那个笑话")
+ok = wait(lambda: _committed_count(rt) >= 3)
+check("35g explicit replay commits", ok)
+ok = wait(lambda: any("从前有座山" in str(x) for x in st["speak_calls"]))
+check("35h explicit replay speaks via pump (synthesized payload)", ok,
+      str(st["speak_calls"]))
+row = rt.store._conn.execute(
+    "SELECT state FROM deliveries WHERE session_id='s1' AND kind='result' "
+    "AND task_id='T1' ORDER BY rowid DESC LIMIT 1").fetchone()
+check("35i delivery reopened then played_confirmed",
+      row is not None and row["state"] == C.DLV_PLAYED_CONFIRMED,
+      str(dict(row) if row else None))
 
 # ==== 场景 9：close 释放 ====================================================
 rt, ad, st = make_env(tmp, [])

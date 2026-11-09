@@ -675,6 +675,8 @@ class AgentRuntimeV2:
                                      entry["plan"],
                                      plan_version=entry["version"])
         self._cut_speech_for_cancels(session_id, res)
+        if chitchat_spoke and not res.replayed:
+            self._mark_creation_voiced(session_id, res)
         texts = self._receipt_texts(session_id, res,
                                     chitchat_spoke=chitchat_spoke)
         # plan 一并带回：adapter 需要 reply_mode/direct_question 决定
@@ -716,12 +718,33 @@ class AgentRuntimeV2:
                                      plan,
                                      plan_version=entry["version"])
         self._cut_speech_for_cancels(session_id, res)
+        if chitchat_spoke and not res.replayed:
+            self._mark_creation_voiced(session_id, res)
         texts = self._receipt_texts(session_id, res,
                                     chitchat_spoke=chitchat_spoke)
         logger.info("[%s] land_pending: committed stale plan for req %s",
                     session_id[:8], entry["request_id"])
         return {"result": res, "texts": texts, "plan": plan,
                 "request_id": entry["request_id"]}
+
+    def _mark_creation_voiced(self, session_id, res):
+        """窄版 voiced-by-lane 的标记面（2026-11-09）：闲聊路在本轮已
+        开口（commit/land 传 chitchat_spoke）时，把本轮建出的任务记
+        creation_voiced；scheduler 完成路径再叠加"零工具 + 首 run"
+        判定后抑制泵播。只标本轮 ACCEPTED 的 create/followup——被拒
+        的操作 task_id 不可信。失败只记日志：标记缺失的后果是结果
+        照常走泵（保守方向）。"""
+        try:
+            tids = [r.task_id for r in res.receipts
+                    if r.op in ("create_task", "followup_task")
+                    and r.outcome == _C.RC_ACCEPTED and r.task_id]
+            if tids:
+                self.store.record_creation_voiced(session_id, tids)
+                logger.info("[%s] creation voiced marked: %s",
+                            session_id[:8], ",".join(tids))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[%s] creation_voiced mark failed: %s",
+                           session_id[:8], e)
 
     def _cut_speech_for_cancels(self, session_id, res):
         """§9.2 第三层的声音面（2026-11-09 e2e 取消竞态）。

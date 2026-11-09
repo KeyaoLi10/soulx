@@ -176,7 +176,8 @@ CREATE TABLE IF NOT EXISTS route_log(
 # 交付状态机（手册 §5.3）
 _DLV_TRANSITIONS = {
     C.DLV_PENDING: {C.DLV_RENDERING, C.DLV_SENDING, C.DLV_SUPPRESSED,
-                    C.DLV_FAILED, C.DLV_RETRY_EXHAUSTED},
+                    C.DLV_FAILED, C.DLV_RETRY_EXHAUSTED,
+                    C.DLV_VOICED_BY_LANE},
     # rendering->pending：静默掐死重试（一个字没播，重新渲染重试）
     C.DLV_RENDERING: {C.DLV_SENDING, C.DLV_SUPPRESSED, C.DLV_FAILED,
                       C.DLV_PENDING, C.DLV_RETRY_EXHAUSTED},
@@ -193,10 +194,13 @@ _DLV_TRANSITIONS = {
 # 所以"已听到"（played_confirmed/sent_unconfirmed）也必须可重开——
 # 用户说"再讲一遍"时唯一能说话的就是交付泵。在途
 # （pending/rendering/sending）不重排：结果会自然到达。
+# voiced_by_lane 同理可重开：抑制只是"泵不再自动插播"，显式重播
+# （get_task + 重播词）必须照常走泵（2026-11-09 窄版 voiced-by-lane）。
 _DLV_REOPEN_FROM = frozenset({
     C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
     C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED,
-    C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED})
+    C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED,
+    C.DLV_VOICED_BY_LANE})
 
 
 class StoreError(Exception):
@@ -389,6 +393,62 @@ class AgentStore:
                                task_id=task_id,
                                payload={"heard": heard[:400]})
 
+    # ------------------------------------------- 窄版 voiced-by-lane（2026-11-09）
+    # 事故（session d5626227）：路由把"讲个笑话"建成任务 T4，慢脑零工具
+    # 自产另一个笑话，结果在面板挂"待播报"1 分 54 秒（泵让路），闲聊路
+    # 只能调和矛盾 → "刚才那个笑话是不是重复啦"。根修：创建轮闲聊路
+    # 亲口说过（chitchat_spoke）+ 完成 run 零工具调用 + 该任务首个 run
+    # 三条件同时成立时，结果视为"闲聊路已播报"（voiced_by_lane），
+    # 泵不再入队。零工具是判别器：天气/体育类查询必带工具，照常走泵；
+    # "chitchat spoke" 单独不是干净信号（应承也是 speech）。首 run 条件
+    # 防 rerun/amend（第二次执行必带上下文）被误杀。
+
+    def record_creation_voiced(self, session_id, task_ids):
+        """commit/land 成功且闲聊路本轮已开口时，由 runtime 批量标记。
+        幂等：每任务只写一条 creation_voiced 事件。"""
+        with self._tx():
+            for tid in task_ids or []:
+                if not tid:
+                    continue
+                seen = self._conn.execute(
+                    "SELECT 1 FROM events WHERE session_id=? AND task_id=? "
+                    "AND type='creation_voiced' LIMIT 1",
+                    (session_id, tid)).fetchone()
+                if seen is None:
+                    self._append_event(session_id, "creation_voiced",
+                                       task_id=tid)
+
+    def task_creation_voiced(self, session_id, task_id):
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM events WHERE session_id=? AND task_id=? "
+                "AND type='creation_voiced' LIMIT 1",
+                (session_id, task_id)).fetchone() is not None
+
+    def run_tool_count(self, run_id):
+        """该 run 实际执行的工具数（slow_brain 的 tool_call 事件，
+        scheduler 经 progress_cb 落 events 表——tool_calls 表是
+        未接线的预留 schema，不是数据源）。"""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) AS c FROM events WHERE run_id=? AND "
+                "type='tool_call'", (run_id,)).fetchone()["c"]
+
+    def task_run_count(self, session_id, task_id):
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) AS c FROM runs WHERE session_id=? AND "
+                "task_id=?", (session_id, task_id)).fetchone()["c"]
+
+    def result_voiced_by_lane(self, session_id, task_id, run_id):
+        """scheduler 完成路径的合并判定（三条件见上方块注释）。
+        run_id 为空（异常路径）直接判 False——保守：照常走泵。"""
+        if not run_id:
+            return False
+        return (self.task_creation_voiced(session_id, task_id)
+                and self.run_tool_count(run_id) == 0
+                and self.task_run_count(session_id, task_id) == 1)
+
     def task_panel_rows(self, session_id):
         """前端任务面板只读视图（V2）：任务 + 最近进度/结果 + 结果是否
         已完整播出。供 adapter 的 UI 泵轮询——读侧专用，不进控制平面。"""
@@ -424,7 +484,10 @@ class AgentStore:
                     "session_id=? AND kind='result' AND task_id IS NOT NULL "
                     "ORDER BY rowid", (session_id,)).fetchall():
                 dstate[d["task_id"]] = d["state"]
-            delivered = {tid: st == C.DLV_PLAYED_CONFIRMED
+            # voiced_by_lane 也算"已播报"：创建轮闲聊路亲口说过（面板可见
+            # 即等同送达，2026-11-09 窄版 voiced-by-lane）
+            delivered = {tid: st in (C.DLV_PLAYED_CONFIRMED,
+                                     C.DLV_VOICED_BY_LANE)
                          for tid, st in dstate.items()}
             # 播报被打断/没送出去（打断是终态，泵不自动重播）：面板与
             # 闲聊路据此不再渲染"结果待播报"（2026-11-09 复读事故——
@@ -984,11 +1047,12 @@ class AgentStore:
         白名单（在途状态）时静默不动。"""
         self._conn.execute(
             "UPDATE deliveries SET state=?, retries=0, updated_at=? "
-            "WHERE delivery_id=? AND state IN (?,?,?,?,?,?)",
+            "WHERE delivery_id=? AND state IN (?,?,?,?,?,?,?)",
             (C.DLV_PENDING, self._now(), delivery_id,
              C.DLV_INTERRUPTED_PARTIAL, C.DLV_INTERRUPTED_BEFORE_AUDIO,
              C.DLV_RETRY_EXHAUSTED, C.DLV_SUPPRESSED,
-             C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED))
+             C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED,
+             C.DLV_VOICED_BY_LANE))
 
     def _request_wants_replay(self, request_id):
         """get_task 重播意图（2026-11-09）：本轮原文含"再讲一遍"类显式
@@ -1011,10 +1075,11 @@ class AgentStore:
         False=不重排。
         在途交付（outbox 未消费 / delivery pending-rendering-sending）会让
         结果自然到达，不重排；已听到（played_confirmed /
-        sent_unconfirmed）只在显式重播意图（replay=True，"再讲一遍"类）
-        或结果从未完整播出（打断/重试耗尽——用户没听过）时重排——结果
-        播报的唯一出口是交付泵，用户"再讲一遍"只能由它兑现（2026-11-07
-        单一出口重构）。"""
+        sent_unconfirmed，含 voiced_by_lane——创建轮闲聊路亲口说过，
+        2026-11-09 窄版 voiced-by-lane）只在显式重播意图（replay=True，
+        "再讲一遍"类）或结果从未完整播出（打断/重试耗尽——用户没听过）
+        时重排——结果播报的唯一出口是交付泵，用户"再讲一遍"只能由它
+        兑现（2026-11-07 单一出口重构）。"""
         task_id = t["task_id"]
         for row in self._conn.execute(
                 "SELECT payload_json FROM outbox WHERE session_id=? AND "
@@ -1030,7 +1095,8 @@ class AgentStore:
             "AND kind='result' AND task_id=? ORDER BY rowid DESC LIMIT 1",
             (session_id, task_id)).fetchone()
         if dlv is not None and dlv["state"] in (C.DLV_PLAYED_CONFIRMED,
-                                                C.DLV_SENT_UNCONFIRMED) \
+                                                C.DLV_SENT_UNCONFIRMED,
+                                                C.DLV_VOICED_BY_LANE) \
                 and not replay:
             return "already"
         if dlv is not None and dlv["state"] not in _DLV_REOPEN_FROM:
@@ -1048,7 +1114,28 @@ class AgentStore:
                 src = p
                 break
         if src is None:
-            return False   # 无可重播的结果记录（如测试直改任务状态）
+            if dlv is None or dlv["state"] != C.DLV_VOICED_BY_LANE:
+                return False   # 无可重播的结果记录（如测试直改任务状态）
+            # voiced_by_lane 的结果从未入过队（泵在入队时刻就被跳过）：
+            # 从 completed 事件合成 deliver payload。run_id/revision 必须
+            # 与交付行一致——泵侧 record_delivery 的身份去重才能落到
+            # 刚被重开的这一行上（2026-11-09 窄版 voiced-by-lane）
+            ev = self._conn.execute(
+                "SELECT revision, run_id, payload_json FROM events WHERE "
+                "session_id=? AND task_id=? AND type='completed' "
+                "ORDER BY seq DESC LIMIT 1",
+                (session_id, task_id)).fetchone()
+            if ev is None:
+                return False
+            try:
+                ep = json.loads(ev["payload_json"])
+            except (ValueError, TypeError):
+                ep = {}
+            src = {"kind": "result", "task_id": task_id,
+                   "revision": ev["revision"], "run_id": ev["run_id"],
+                   "outcome": C.EXEC_COMPLETED,
+                   "summary": str(ep.get("summary", "")),
+                   "label": t["label"], "payload": ep.get("detail") or {}}
         if dlv is not None:
             self._reopen_delivery(dlv["delivery_id"])
         # 用户显式追问 = 重新要这个结果：清掉改口标记，否则交付泵的
@@ -1092,7 +1179,7 @@ class AgentStore:
     _ALL_DLV_STATES = frozenset(_DLV_TRANSITIONS) | {
         C.DLV_PLAYED_CONFIRMED, C.DLV_INTERRUPTED_PARTIAL,
         C.DLV_INTERRUPTED_BEFORE_AUDIO, C.DLV_SUPPRESSED,
-        C.DLV_RETRY_EXHAUSTED}
+        C.DLV_RETRY_EXHAUSTED, C.DLV_VOICED_BY_LANE}
 
     def set_delivery_state(self, delivery_id, state):
         if state not in self._ALL_DLV_STATES:

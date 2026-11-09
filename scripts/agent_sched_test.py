@@ -367,7 +367,75 @@ check("per-session running cap respected",
       seen_running["max"] <= rt10.scheduler.max_running,
       f"max concurrent = {seen_running['max']}")
 
-for r in (rt, rt2, rt3, rt4, rt5, rt6, rt7, rt9, rt10):
+# ==== 场景 11：窄版 voiced-by-lane（2026-11-09）============================
+# commit 带 chitchat_spoke=True（创建轮闲聊路已开口）+ 完成 run 零工具 +
+# 首 run → 结果直接标 voiced_by_lane：不入 deliver outbox、泵不出声、
+# 面板 delivered。带工具的 run / 创建轮没开口 / 失败照常入队走泵。
+
+
+def joke_runner(snapshot, cancel_event, progress_cb):
+    return {"type": "completed",
+            "payload": {"summary": "从前有座山，山里有座庙……",
+                        "facts": [], "sources": [], "outcome": "complete"}}
+
+
+def search_runner(snapshot, cancel_event, progress_cb):
+    progress_cb("tool_call", {"tool": "web_search"})
+    return {"type": "completed",
+            "payload": {"summary": "北京晴，12 度",
+                        "facts": [], "sources": [], "outcome": "complete"}}
+
+
+def _deliver_count(rt, sid):
+    with rt.store._lock:
+        return rt.store._conn.execute(
+            "SELECT COUNT(*) AS c FROM outbox WHERE session_id=? AND "
+            "kind='deliver'", (sid,)).fetchone()["c"]
+
+
+# 11a 事故形态：讲笑话任务，闲聊路已开口，run 零工具 → 泵被跳过
+rt11, st11 = make_runtime(tmp, joke_runner, [])
+rt11.router = lambda sid, text, snap: plan_json([
+    {"op": "create_task", "local_ref": "L1", "label": "讲笑话",
+     "goal": "讲个笑话"}])
+rt11.submit_request("s11", "给我讲个笑话", source_commit_id="c1")
+rt11.commit_pending("s11", chitchat_spoke=True)
+ok = pump(rt11, lambda: rt11.store.task_row("s11", "T1")[
+    "execution_status"] == C.EXEC_COMPLETED)
+check("11a joke task completes", ok)
+ok = pump(rt11, lambda: _dlv_state(rt11, "s11") == C.DLV_VOICED_BY_LANE)
+check("11b zero-tool result marked voiced_by_lane", ok,
+      str(_dlv_state(rt11, "s11")))
+check("11c no deliver outbox enqueued",
+      _deliver_count(rt11, "s11") == 0)
+check("11d pump never speaks", not st11["speak_calls"],
+      str(st11["speak_calls"]))
+check("11e panel row delivered",
+      rt11.store.task_panel_rows("s11")[0]["delivered"] is True)
+
+# 11f 对照：同类任务但 run 带工具（查询类）→ 照常入队走泵
+rt11f, st11f = make_runtime(tmp, search_runner, [True])
+rt11f.router = lambda sid, text, snap: plan_json([
+    {"op": "create_task", "local_ref": "L1", "label": "查天气",
+     "goal": "查北京天气"}])
+rt11f.submit_request("s11f", "帮我查北京天气", source_commit_id="c1")
+rt11f.commit_pending("s11f", chitchat_spoke=True)
+ok = pump(rt11f, lambda: len(st11f["speak_calls"]) > 0)
+check("11f tool-using result still delivered by pump", ok,
+      str(st11f["speak_calls"]))
+
+# 11g 对照：创建轮闲聊路没开口（chitchat_spoke=False）→ 零工具也走泵
+rt11g, st11g = make_runtime(tmp, joke_runner, [True])
+rt11g.router = lambda sid, text, snap: plan_json([
+    {"op": "create_task", "local_ref": "L1", "label": "讲笑话",
+     "goal": "讲个笑话"}])
+rt11g.submit_request("s11g", "给我讲个笑话", source_commit_id="c1")
+rt11g.commit_pending("s11g")          # 默认 chitchat_spoke=False
+ok = pump(rt11g, lambda: len(st11g["speak_calls"]) > 0)
+check("11g unvoiced creation turn still pumps", ok,
+      str(st11g["speak_calls"]))
+
+for r in (rt, rt2, rt3, rt4, rt5, rt6, rt7, rt9, rt10, rt11, rt11f, rt11g):
     r.scheduler.stop()
     r.delivery.stop()
     r.store.close()

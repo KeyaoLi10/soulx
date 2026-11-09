@@ -40,10 +40,13 @@ _DELIVER_LEASE_TTL_S = 300.0
 # 已终态处置的交付状态：重复 deliver 项见到即收尾，不重渲染不重播。
 # sending 也算——它只在开口之后才写入（rc True/False 两分支都是先播
 # 完才落 sending），遗留 sending 必属"上一 attempt 语音已出"的崩溃残留。
+# voiced_by_lane 同理（2026-11-09 窄版 voiced-by-lane）：创建轮闲聊路
+# 已亲口说过、泵被跳过的结果，重复 deliver 项直接收尾。
 _DLV_ALREADY_HANDLED = frozenset({
     C.DLV_SENDING, C.DLV_SENT_UNCONFIRMED, C.DLV_PLAYED_CONFIRMED,
     C.DLV_SUPPRESSED, C.DLV_INTERRUPTED_PARTIAL,
-    C.DLV_INTERRUPTED_BEFORE_AUDIO, C.DLV_RETRY_EXHAUSTED})
+    C.DLV_INTERRUPTED_BEFORE_AUDIO, C.DLV_RETRY_EXHAUSTED,
+    C.DLV_VOICED_BY_LANE})
 
 
 class DeliveryManager:

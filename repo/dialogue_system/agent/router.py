@@ -316,8 +316,11 @@ def _get_task_target_ungrounded(plan: C.Plan, snapshot: dict,
     满足——
     ① 本轮话语没提到该任务（label 二元字组不命中：用户提任务必然带
     话题词，与取消守卫同一判定）；
-    ② 任务已了结（终态且结果已完整播报/已取消播报——没有可等的东西，
-    泛泛的"查了吗"不该落到它头上）；
+    ② 任务已了结（终态且结果已完整播报/已取消播报/播报被打断——没有
+    可等的东西，泛泛的"查了吗"不该落到它头上。interrupted_partial 是
+    "用户已听过一部分"的开放环：错锚事故里路由 get_task T4 把闲聊路
+    已答对的"数到七"重排成第二个笑话，故与 delivered/suppressed 同列
+    已了结，2026-11-09 补全）；
     ③ 本轮没有重播意图（"再讲一遍"类是显式重播，任意目标合法）。
     未完成 / 结果还没完整播出的目标放行：泛泛追问的天然落点（事故
     正解：C罗在途、天气已播，"你去查了吗"该指 C罗）。快照外的 id
@@ -344,7 +347,8 @@ def _get_task_target_ungrounded(plan: C.Plan, snapshot: dict,
         if t.get("execution_status") not in ("completed", "failed",
                                              "canceled", "superseded"):
             continue   # 未完成：泛泛追问的合法落点
-        if not t.get("delivered") and not t.get("suppressed"):
+        if not t.get("delivered") and not t.get("suppressed") \
+                and not t.get("interrupted"):
             continue   # 结果未完整播出：追问该触发重播
         label = (_norm_text(t.get("label") or "")
                  or _norm_text(t.get("goal") or ""))[:40]
@@ -403,9 +407,19 @@ class PlanRouter:
         started = time.monotonic()
         messages = [{"role": "system", "content": ROUTER_SYSTEM_PROMPT}]
         messages += FEW_SHOTS
+        # 路由历史瘦身（2026-11-09 事故：route 10 把"讲个笑话"建成 T4
+        # 任务——最近 6 条共享 LLM 历史清一色任务形轮次（assistant 应承
+        # +user 侧结果 note 全文），先验压过了硬规则"闲聊请求 direct"）。
+        # 只喂 user 侧真人原话：指代消解（"它/那个任务"）靠用户自己说过
+        # 的话 + 快照 label 足够；assistant 应承与 [系统提示：…] 结果
+        # note 会制造"这轮也该建任务"的形先验，全部剔除。
         for h in (history or [])[-self.max_history_turns:]:
-            if h.get("role") in ("user", "assistant") and h.get("content"):
-                messages.append({"role": h["role"], "content": h["content"]})
+            if h.get("role") != "user":
+                continue
+            content = str(h.get("content") or "").strip()
+            if not content or content.startswith("[系统提示："):
+                continue
+            messages.append({"role": "user", "content": content})
         messages.append({"role": "user",
                          "content": render_snapshot_message(snapshot,
                                                             user_text)})

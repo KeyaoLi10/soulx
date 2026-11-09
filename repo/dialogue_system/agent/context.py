@@ -83,9 +83,17 @@ def build_router_snapshot(store, session_id: str, user_text: str,
                 # get_task 目标守卫（2026-11-09）：已完整播报/已取消播报
                 # 的任务，泛泛追问（无话题词、无重播词）不得指向它
                 "delivered": dstates.get(t["task_id"]) in (
-                    C.DLV_PLAYED_CONFIRMED, C.DLV_SENT_UNCONFIRMED),
+                    C.DLV_PLAYED_CONFIRMED, C.DLV_SENT_UNCONFIRMED,
+                    C.DLV_VOICED_BY_LANE),
                 "suppressed": bool(t["cancel_intent"])
                 or dstates.get(t["task_id"]) == C.DLV_SUPPRESSED,
+                # 播报被打断且用户已听到一部分（2026-11-09 residual 补全）：
+                # interrupted_partial 的任务对用户是"开放环"——泛泛追问
+                # 落上去会触发错误重排（错锚事故：路由 get_task T4 把闲聊
+                # 路已答对的"数到七"重排成第二个笑话）。before_audio 不标：
+                # 一字未出声，追问重排合法
+                "interrupted": dstates.get(t["task_id"])
+                == C.DLV_INTERRUPTED_PARTIAL,
             })
 
     # 焦点（§7.5）：确定性推导——最近创建的活跃任务；无活跃任务则为空。

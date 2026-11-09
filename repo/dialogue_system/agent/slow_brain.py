@@ -220,6 +220,9 @@ class SlowBrain:
                     observation = round_cache[cache_key]
                 else:
                     t_tool = time.monotonic()
+                    # 专用工具事件（2026-11-09 窄版 voiced-by-lane 的
+                    # 判别器：run 是否用过工具数这个事件，不数别的）
+                    emit({"type": "tool_call", "tool": name})
                     emit({"type": "progress", "desc": _describe_call(name, args)})
                     observation = agent_tools.execute_tool(name, args)
                     logger.info("[slowbrain %s] tool %s(%.40s) %.1fs -> %d chars",
@@ -522,6 +525,9 @@ def make_v2_runner(base_url=SLOW_LLM_BASE):
                     }}
                 t_tool = time.monotonic()
                 desc = _describe_call(name, args)
+                # 专用工具事件（2026-11-09 窄版 voiced-by-lane 的判别器：
+                # run 是否用过工具数这个事件，不数 progress）
+                progress_cb("tool_call", {"tool": name})
                 progress_cb("progress", {"desc": desc})
                 tr = agent_tools_v2.execute_tool_v2(
                     name, args, call_id=f"{task_id}-s{step}-c{ci}")
