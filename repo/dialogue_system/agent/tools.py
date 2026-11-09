@@ -515,6 +515,10 @@ import urllib.parse as _urlparse
 from dataclasses import dataclass, field as _dcfield
 from zoneinfo import ZoneInfo as _ZoneInfo
 
+# balldontlie 体育数据（agent/bdl.py，2026-11-09）：拉取 + webhook 推送。
+# bdl.py 只在函数内延迟 import agent.tools（ToolResult），无循环依赖。
+from agent import bdl as _bdl
+
 # ---- 统一工具返回（手册 §11）---------------------------------------------
 
 
@@ -879,6 +883,13 @@ NEW_TOOL_EXECUTORS = {
         args.get("timezone") or "Asia/Shanghai", call_id=call_id),
     "calculate": lambda args, call_id="": calculate(
         args.get("expression", ""), call_id=call_id),
+    # balldontlie（agent/bdl.py）：体育比赛专用数据源
+    "sports_games": lambda args, call_id="": _bdl.sports_games(
+        args.get("sport") or "nba", args.get("date") or "",
+        args.get("team") or "", call_id=call_id),
+    "sports_events": lambda args, call_id="": _bdl.sports_events(
+        int(args.get("count") or 20), args.get("sport") or "",
+        call_id=call_id),
 }
 
 NEW_TOOL_SCHEMAS = [
@@ -958,6 +969,72 @@ NEW_TOOL_SCHEMAS = [
                                    "description": "expression to evaluate"},
                 },
                 "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sports_games",
+            "description": (
+                "Query official schedules, scores and results for "
+                "basketball/american-football/baseball games (NBA, NFL, "
+                "MLB) from the balldontlie API. For ANY question about "
+                "game scores, results, or what games are on, use this "
+                "FIRST instead of web_search — web search is unreliable "
+                "for same-day scores. date is a UTC date (YYYY-MM-DD); "
+                "games played in the Chinese evening are usually on the "
+                "PREVIOUS UTC date, so query both today and yesterday "
+                "when unsure. team accepts Chinese or English "
+                "(e.g. '热火', 'heat', 'lakers')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sport": {
+                        "type": "string", "enum": ["nba", "nfl", "mlb"],
+                        "description": "default nba",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "UTC date YYYY-MM-DD; empty = "
+                                       "today + yesterday (UTC)",
+                    },
+                    "team": {
+                        "type": "string",
+                        "description": "filter by team name/abbr "
+                                       "(Chinese ok); empty = all teams",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sports_events",
+            "description": (
+                "Read recent game events pushed in real time by the "
+                "balldontlie webhook (game started / game ended with "
+                "final scores). Local and instant — when the user asks "
+                "about a game that may have been played in the last few "
+                "hours ('那场比赛打完了吗/比分多少'), check this first, "
+                "then sports_games."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "max events to return, default 20",
+                    },
+                    "sport": {
+                        "type": "string",
+                        "description": "optional filter, e.g. nba",
+                    },
+                },
+                "required": [],
             },
         },
     },

@@ -198,7 +198,8 @@ check("failure never fake success", "search_unavailable" in
 # ---- 注册表与 python_repl 开关 ----------------------------------------------
 names = {s["function"]["name"] for s in T.NEW_TOOL_SCHEMAS}
 check("default v2 toolset", names == {"web_search", "fetch_page",
-                                      "get_datetime", "calculate"}, names)
+                                      "get_datetime", "calculate",
+                                      "sports_games", "sports_events"}, names)
 check("python_repl off by default", "python_repl" not in names)
 r = T.execute_tool_v2("calculate", {"expression": "6*7"})
 check("execute_tool_v2 works", r.status == "ok" and r.data == "42")

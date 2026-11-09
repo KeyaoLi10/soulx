@@ -32,3 +32,6 @@ nohup.out
 apikey.txt
 *tavily*
 logs_key.txt
+
+# balldontlie API key / webhook secret (never commit)
+*balldont*
