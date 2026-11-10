@@ -1001,6 +1001,24 @@ check("28b acks with panel tasks absorbed (no route, no chitchat)",
 check("28c absorbed ack releases commit-time gen flag",
       501 in st["gen_releases"] and 502 in st["gen_releases"],
       str(st["gen_releases"]))
+# 28d（2026-11-10 承诺语域事故）：封闭应答词表——"了解了/我知道了"类
+# 真应答此前逃过纯字符类吸收，被迫进闲聊路对已播报任务强制作答
+# （会话 c41a43ce 02:29 连环承诺）。混合实词的句子不得吸收。
+ad.handle_utterance("嗯，好的，了解了。", gen_sn=503)
+ad.handle_utterance("嗯，好的好的，我知道了。", gen_sn=504)
+time.sleep(0.4)
+check("28d closed ack words absorbed (no route, no chitchat)",
+      st["router_calls"] == routes_before
+      and chitchat_starts["n"] == chats_before,
+      f"routes={st['router_calls']}/{routes_before} "
+      f"chats={chitchat_starts['n']}/{chats_before}")
+check("28d2 word-list acks release gen flag",
+      503 in st["gen_releases"] and 504 in st["gen_releases"],
+      str(st["gen_releases"]))
+ad.handle_utterance("我知道了，那你继续说。", gen_sn=505)
+ok = wait(lambda: st["router_calls"] == routes_before + 1)
+check("28d3 ack mixed with content still routes", ok,
+      f"routes={st['router_calls']}/{routes_before}")
 
 # 29 单一出口（2026-11-07 复播事故根修）：闲聊路面板注入不含结果原文
 # （render_chitchat_context），结果首播/重播全走交付泵；get_task 对已
@@ -1013,8 +1031,13 @@ ctx = agent_context.render_chitchat_context([
 ])
 check("29 chitchat context hides undelivered result text",
       "晴转多云" not in ctx and "结果待播报" in ctx, ctx[:200])
-check("29b chitchat context marks delivered, hides its result text",
-      "开拓者" not in ctx and "结果已播报过" in ctx, ctx[:200])
+# 29b（2026-11-10 湖人反向提问事故后语义升级）：已完整播报的闭环任务
+# 行整行不注入——零结果内容的"已完成，结果已播报过"读起来恰似悬而未
+# 决的请求，闲聊路对它只有反向追问/承诺话术两种坏动作。结果文本当然
+# 更不出现；用户真要追问走路由 get_task 重开白名单。
+check("29b delivered completed row not injected at all",
+      "开拓者" not in ctx and "查湖人比赛" not in ctx
+      and "结果已播报过" not in ctx, ctx[:200])
 
 # 29b2-29b3：interrupted 渲染（2026-11-09 复读事故：被打断的播报被当
 # "结果待播报"，模型无限承诺"马上到"却永不兑现——晚九修了 suppressed

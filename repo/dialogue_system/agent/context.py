@@ -184,9 +184,24 @@ def render_chitchat_context(panel_rows, max_tasks: int = 8):
     被打断的未播出部分）绝不注入：结果的首播/重播全部走交付泵。
     唯一例外是"用户实际听到部分"（delivery_heard）——那是用户耳朵
     里已经有的内容，暴露它只会让模型答得更准，不会造成复播。
-    max_tasks 限界防止长会话把面板撑爆 prompt。"""
+    max_tasks 限界防止长会话把面板撑爆 prompt。
+
+    【已播报闭环行不注入（2026-11-10 湖人反向提问 + 承诺语域两事故
+    根修）】completed 且已完整播报（含 voiced_by_lane）、未取消、未
+    被打断的任务行整行跳过：单一出口纪律下这行零结果内容，读起来
+    恰似悬而未决的请求，闲聊路对它只有两种坏动作——反向追问用户
+    （"湖人队今天有比赛吗"是系统自己问出来的）或给出承诺话术。
+    用户真要追问，走路由 get_task 重开白名单（played_confirmed 必
+    重播），能力不丢。suppressed/interrupted 行保留：语义仍开放，
+    各有事故防线。此过滤只影响闲聊渲染，UI 面板泵与 ack 吸收的
+    _panel_has_tasks 仍看全量行（task_panel_rows 不动）。"""
     lines = []
     for r in (panel_rows or [])[:max_tasks]:
+        if (r.get("execution_status") == "completed"
+                and r.get("delivered")
+                and not r.get("suppressed")
+                and not r.get("interrupted")):
+            continue                      # 已播报的闭环话题：不进闲聊面板
         st = _CHITCHAT_STATUS_ZH.get(r.get("execution_status"),
                                      r.get("execution_status", ""))
         bits = ["- {}「{}」{}".format(
